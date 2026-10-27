@@ -25,6 +25,10 @@ export class TikTokClient {
     this.handler = handler;
   }
 
+  public getConnected(): boolean {
+    return this.client !== null;
+  }
+
   public async connect(): Promise<void> {
     if (!this.username) {
       console.warn('[TikTokClient] No TIKTOK_USERNAME set. Skipping live connection.');

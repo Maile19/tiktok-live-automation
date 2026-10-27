@@ -1,0 +1,17 @@
+[Unit]
+Description=TikTok Live Automation Engine with Polya AI Isolation
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tiktok-live-automation
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=5s
+MemoryMax=512M
+CPUQuota=50%
+Environment=PORT=3000
+
+[Install]
+WantedBy=multi-user.target

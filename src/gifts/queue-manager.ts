@@ -47,4 +47,8 @@ export class QueueManager {
   public getQueueLength(): number {
     return this.queue.length;
   }
+
+  public size(): number {
+    return this.queue.length;
+  }
 }
