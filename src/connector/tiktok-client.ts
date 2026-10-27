@@ -36,36 +36,49 @@ export class TikTokClient {
     }
 
     const { TikTokLiveConnection } = await import('tiktok-live-connector');
-    this.client = new TikTokLiveConnection(this.username, {});
+    
+    const attemptConnect = async () => {
+      try {
+        this.client = new TikTokLiveConnection(this.username, {});
 
-    this.client.on('gift', (data: any) => {
-      if (!this.handler) return;
+        this.client.on('gift', (data: any) => {
+          if (!this.handler) return;
 
-      if (data.repeatType === 1 && data.repeatEnd === 0) {
-        return;
+          if (data.repeatType === 1 && data.repeatEnd === 0) {
+            return;
+          }
+
+          const event: NormalizedGiftEvent = {
+            id: `${data.id || Date.now()}-${Date.now()}`,
+            userId: String(data.userId || data.user?.id || ''),
+            giftId: String(data.giftId),
+            giftName: data.giftName || data.gift?.name || '',
+            repeatCount: data.repeatCount || 1,
+            timestamp: Date.now(),
+          };
+
+          this.handler(event);
+        });
+
+        this.client.on('disconnect', () => {
+          console.warn('[TikTokClient] Disconnected from LIVE. Reconnecting in 10s...');
+          this.client = null;
+          setTimeout(attemptConnect, 10000);
+        });
+
+        this.client.on('error', (err: Error) => {
+          console.error('[TikTokClient] Error:', err.message);
+        });
+
+        await this.client.connect();
+        console.log(`[TikTokClient] Connected to @${this.username}`);
+      } catch (err: any) {
+        console.warn(`[TikTokClient] Account @${this.username} offline or connection failed (${err.message}). Retrying in 15s...`);
+        this.client = null;
+        setTimeout(attemptConnect, 15000);
       }
+    };
 
-      const event: NormalizedGiftEvent = {
-        id: `${data.id || Date.now()}-${Date.now()}`,
-        userId: String(data.userId || data.user?.id || ''),
-        giftId: String(data.giftId),
-        giftName: data.giftName || data.gift?.name || '',
-        repeatCount: data.repeatCount || 1,
-        timestamp: Date.now(),
-      };
-
-      this.handler(event);
-    });
-
-    this.client.on('disconnect', () => {
-      console.warn('[TikTokClient] Disconnected from LIVE.');
-    });
-
-    this.client.on('error', (err: Error) => {
-      console.error('[TikTokClient] Error:', err.message);
-    });
-
-    await this.client.connect();
-    console.log(`[TikTokClient] Connected to @${this.username}`);
+    await attemptConnect();
   }
 }

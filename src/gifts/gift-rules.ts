@@ -25,8 +25,19 @@ export class GiftRulesEngine {
     }
   }
 
-  public validateGift(giftId: string): GiftConfig | null {
-    return this.gifts[giftId] || null;
+  public validateGift(giftId: string, giftName?: string): GiftConfig | null {
+    if (this.gifts[giftId]) {
+      return this.gifts[giftId];
+    }
+    if (giftName) {
+      const lowerName = giftName.toLowerCase().trim();
+      for (const id of Object.keys(this.gifts)) {
+        if (this.gifts[id].name.toLowerCase().trim() === lowerName) {
+          return this.gifts[id];
+        }
+      }
+    }
+    return null;
   }
 
   public isDuplicate(userId: string, giftId: string, timestamp: number): boolean {

@@ -1,5 +1,25 @@
 {
   "gifts": {
+    "5655": {
+      "name": "Rose",
+      "video": "gift-01.mp4",
+      "durationMs": 10000
+    },
+    "5879": {
+      "name": "Doughnut",
+      "video": "gift-02.mp4",
+      "durationMs": 10000
+    },
+    "5658": {
+      "name": "Perfume",
+      "video": "gift-03.mp4",
+      "durationMs": 10000
+    },
+    "5656": {
+      "name": "I love you",
+      "video": "gift-04.mp4",
+      "durationMs": 10000
+    },
     "gift_01_id": {
       "name": "Gift A",
       "video": "gift-01.mp4",
