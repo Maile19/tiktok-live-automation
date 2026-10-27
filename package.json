@@ -1,0 +1,26 @@
+{
+  "name": "tiktok-live-automation",
+  "version": "1.0.0",
+  "description": "TikTok LIVE Gift to OBS automation engine with Polya AI isolation",
+  "main": "dist/app.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/app.js",
+    "dev": "ts-node src/app.ts",
+    "test": "jest"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "obs-websocket-js": "^5.0.6",
+    "tiktok-live-connector": "^2.5.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "@types/ws": "^8.5.10",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}

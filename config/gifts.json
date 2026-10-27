@@ -1,0 +1,24 @@
+{
+  "gifts": {
+    "gift_01_id": {
+      "name": "Gift A",
+      "video": "gift-01.mp4",
+      "durationMs": 10000
+    },
+    "gift_02_id": {
+      "name": "Gift B",
+      "video": "gift-02.mp4",
+      "durationMs": 10000
+    },
+    "gift_03_id": {
+      "name": "Gift C",
+      "video": "gift-03.mp4",
+      "durationMs": 10000
+    },
+    "gift_04_id": {
+      "name": "Gift D",
+      "video": "gift-04.mp4",
+      "durationMs": 10000
+    }
+  }
+}
