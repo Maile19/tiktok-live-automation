@@ -8,6 +8,7 @@ import email.parser
 import subprocess
 import threading
 import time
+import http.cookies
 
 PORT = 8088
 BASE_DIR = "/home/ubuntu/tiktok-live-automation"
@@ -165,9 +166,138 @@ def fetch_tiktok_stream_key():
     return rtmp_url, stream_key, json_data
 
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
+    def check_auth(self):
+        client_ip = self.client_address[0]
+        if client_ip in ["127.0.0.1", "::1", "localhost"]:
+            return True
+            
+        cookie_header = self.headers.get("Cookie")
+        if cookie_header:
+            c = http.cookies.SimpleCookie(cookie_header)
+            if "auth_token" in c and c["auth_token"].value == "verified_191919":
+                return True
+        return False
+
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
         
+        if parsed_url.path == '/logout':
+            self.send_response(303)
+            self.send_header('Set-Cookie', 'auth_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT')
+            self.send_header('Location', '/')
+            self.end_headers()
+            return
+
+        if not self.check_auth() and parsed_url.path not in ['/login', '/health']:
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            login_html = """<!DOCTYPE html>
+            <html>
+                <head>
+                    <meta charset="utf-8">
+                    <title>Login - TikTok Live Dashboard</title>
+                    <style>
+                        @keyframes shine {
+                            0% { background-position: 0% 0%; }
+                            50% { background-position: 100% 100%; }
+                            100% { background-position: 0% 0%; }
+                        }
+                        @keyframes spin-around {
+                            0% { transform: translateZ(0) rotate(0deg); }
+                            100% { transform: translateZ(0) rotate(360deg); }
+                        }
+                        @keyframes floating {
+                            0%, 100% { transform: translateY(0px); }
+                            50% { transform: translateY(-6px); }
+                        }
+                        .shine-border-card {
+                            position: relative;
+                            border-radius: 16px;
+                            background: #121216;
+                            padding: 30px;
+                            border: 1px solid #27272a;
+                            overflow: hidden;
+                            animation: floating 4s ease-in-out infinite;
+                            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.6), 0 0 20px rgba(160, 124, 254, 0.15);
+                        }
+                        .shine-border-card::before {
+                            content: "";
+                            position: absolute;
+                            inset: 0;
+                            border-radius: inherit;
+                            padding: 2px;
+                            background-image: radial-gradient(transparent, transparent, #A07CFE, #FE8FB5, #FFBE7B, transparent, transparent);
+                            background-size: 300% 300%;
+                            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+                            -webkit-mask-composite: xor;
+                            mask-composite: exclude;
+                            animation: shine 14s infinite linear;
+                            pointer-events: none;
+                        }
+                        .shimmer-btn {
+                            --spread: 90deg;
+                            --shimmer-color: #ffffff;
+                            --radius: 100px;
+                            --speed: 3s;
+                            --cut: 1.5px;
+                            --bg: rgba(15, 15, 20, 0.95);
+                            position: relative;
+                            z-index: 0;
+                            display: inline-flex;
+                            align-items: center;
+                            justify-content: center;
+                            overflow: hidden;
+                            white-space: nowrap;
+                            cursor: pointer;
+                            border: 1px solid rgba(255, 255, 255, 0.12);
+                            border-radius: var(--radius);
+                            background: var(--bg);
+                            color: #ffffff;
+                            padding: 12px 24px;
+                            font-weight: 600;
+                            font-size: 14px;
+                            transform: translateZ(0);
+                            transition: transform 0.3s ease-in-out, box-shadow 0.3s ease-in-out;
+                            box-shadow: inset 0 -8px 10px #ffffff1f;
+                            width: 100%;
+                            text-decoration: none;
+                        }
+                        .shimmer-btn:hover {
+                            box-shadow: inset 0 -6px 10px #ffffff3f;
+                        }
+                        .shimmer-btn::before {
+                            content: "";
+                            position: absolute;
+                            inset: calc(var(--cut) * -1);
+                            z-index: -1;
+                            border-radius: inherit;
+                            background: conic-gradient(from calc(270deg - (var(--spread) / 2)), transparent 0, var(--shimmer-color) var(--spread), transparent var(--spread));
+                            animation: spin-around var(--speed) infinite linear;
+                        }
+                        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f11; color: #f1f1f3; margin: 0; display: flex; align-items: center; justify-content: center; height: 100vh; }
+                        .login-container { width: 100%; max-width: 380px; padding: 20px; box-sizing: border-box; }
+                        input[type="password"] { width: 100%; background: #0f0f11; color: #25f4ee; border: 1px solid #3f3f46; padding: 12px; border-radius: 8px; font-size: 16px; box-sizing: border-box; margin-bottom: 20px; text-align: center; letter-spacing: 2px; }
+                        h2 { color: #fff; text-align: center; margin-top: 0; margin-bottom: 20px; }
+                    </style>
+                </head>
+                <body>
+                    <div class="login-container">
+                        <div class="shine-border-card">
+                            <h2>TikTok Live Dashboard</h2>
+                            <p style="color: #a1a1aa; font-size: 13px; text-align: center; margin-bottom: 20px;">Masukkan password akses sistem (191919)</p>
+                            <form action="/login" method="POST">
+                                <input type="password" name="password" placeholder="••••••" required autofocus />
+                                <button type="submit" class="shimmer-btn" style="--shimmer-color: #25f4ee; --bg: rgba(37, 244, 238, 0.15);">Masuk Dashboard</button>
+                            </form>
+                        </div>
+                    </div>
+                </body>
+            </html>
+            """
+            self.wfile.write(login_html.encode('utf-8'))
+            return
+
         if parsed_url.path == '/' or parsed_url.path == '/index.html':
             self.send_response(200)
             self.send_header("Content-type", "text/html; charset=utf-8")
@@ -180,14 +310,18 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             live_color = "#34c759" if is_live else "#ff3b30"
             live_text = "AKTIF & STREAMING (Lightweight FFmpeg)" if is_live else "OFFLINE"
             
-            online_class_live = "online" if is_live else ""
             live_status_html = f"""
-            <div class="shine-border-card {online_class_live}">
-                <h3 style="margin-top:0;">Status Live: <span style="color:{live_color};">{live_text}</span></h3>
+            <div class="floating-bar">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <div style="width: 10px; height: 10px; border-radius: 50%; background: {live_color}; box-shadow: 0 0 8px {live_color};"></div>
+                    <span style="font-weight: bold; color: #fff;">Status Live: <span style="color: {live_color};">{live_text}</span></span>
+                </div>
+                <div>
+                    {f"<span style='color:#aaa; font-size:12px; margin-right:15px;'>RTMP: {stream_metadata.get('rtmpUrl', '')}</span>" if is_live else ""}
+                    <a href="/logout" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.15); padding: 6px 14px; font-size: 12px;">Logout</a>
+                </div>
+            </div>
             """
-            if is_live:
-                live_status_html += f"<p style='color:#aaa; font-size:13px; margin-bottom:0;'>RTMP Server: {stream_metadata.get('rtmpUrl', 'N/A')}</p>"
-            live_status_html += "</div>"
 
             gift_config = load_gift_config()
             video_slots_html = ""
@@ -228,12 +362,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 if i >= 2:
                     current_gift = gift_config.get(str(i), "rose")
                     video_slots_html += f"""
-                    <div style='margin-top:10px; border-top:1px solid #27272a; padding-top:10px;'>
-                        <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;'>
-                            <span style='font-size:13px; color:#25f4ee;'>Konfigurasi Pemicu Gift (Slot {i}):</span>
-                            <span style='font-size:12px; color:#a1a1aa;'>Gift Terpilih ID: <b>{current_gift}</b></span>
-                        </div>
-                        <iframe src="/gift-selector?slot={i}" style="width:100%; height:140px; border:1px solid #3f3f46; border-radius:6px; background:#0f0f11;" scrolling="yes"></iframe>
+                    <div style='margin-top:10px; border-top:1px solid #27272a; padding-top:10px; display:flex; justify-content:space-between; align-items:center;'>
+                        <span style='font-size:13px; color:#25f4ee;'>Konfigurasi Pemicu Gift (Slot {i}) — Terpilih: <b>{current_gift}</b></span>
+                        <button type="button" class="shimmer-btn" style="--shimmer-color: #25f4ee; --bg: rgba(37, 244, 238, 0.15); padding: 6px 14px; font-size: 12px;" onclick="openGiftModal({i})">Pilih Gift</button>
                     </div>
                     """
                 video_slots_html += "</div>"
@@ -253,14 +384,20 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             0% {{ transform: translateZ(0) rotate(0deg); }}
                             100% {{ transform: translateZ(0) rotate(360deg); }}
                         }}
+                        @keyframes floating {{
+                            0%, 100% {{ transform: translateY(0px); }}
+                            50% {{ transform: translateY(-6px); }}
+                        }}
                         .shine-border-card {{
                             position: relative;
-                            border-radius: 12px;
+                            border-radius: 16px;
                             background: #121216;
-                            padding: 20px;
-                            margin-bottom: 25px;
+                            padding: 25px;
+                            margin-bottom: 30px;
                             border: 1px solid #27272a;
                             overflow: hidden;
+                            animation: floating 4s ease-in-out infinite;
+                            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.6), 0 0 20px rgba(160, 124, 254, 0.12);
                         }}
                         .shine-border-card::before {{
                             content: "";
@@ -279,6 +416,21 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         .shine-border-card.online::before {{
                             animation: shine 5s infinite linear;
                             padding: 2.5px;
+                        }}
+                        .floating-bar {{
+                            position: sticky;
+                            top: 12px;
+                            z-index: 999;
+                            backdrop-filter: blur(12px);
+                            background: rgba(18, 18, 22, 0.85);
+                            border: 1px solid rgba(255, 255, 255, 0.12);
+                            border-radius: 12px;
+                            padding: 12px 20px;
+                            display: flex;
+                            justify-content: space-between;
+                            align-items: center;
+                            margin-bottom: 25px;
+                            box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 15px rgba(160, 124, 254, 0.1);
                         }}
                         .shimmer-btn {{
                             --spread: 90deg;
@@ -324,11 +476,49 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             animation: spin-around var(--speed) infinite linear;
                         }}
                         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f11; color: #f1f1f3; margin: 0; padding: 20px; }}
-                        .container {{ max-width: 850px; margin: 0 auto; background: #18181b; padding: 30px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); border: 1px solid #27272a; }}
+                        .container {{ max-width: 850px; margin: 0 auto; background: #18181b; padding: 30px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); border: 1px solid #27272a; }}
                         h1, h2, h3 {{ color: #fff; }}
                         hr {{ border: 0; border-top: 1px solid #27272a; margin: 25px 0; }}
                         textarea {{ width: 100%; background: #0f0f11; color: #25f4ee; border: 1px solid #3f3f46; padding: 12px; border-radius: 6px; font-family: monospace; resize: vertical; box-sizing: border-box; }}
                         pre {{ background: #0f0f11; padding: 15px; border-radius: 6px; color: #25f4ee; overflow-x: auto; font-size: 13px; border: 1px solid #3f3f46; text-align: left; }}
+                        
+                        /* Modal Overlay */
+                        .modal-overlay {{
+                            position: fixed;
+                            inset: 0;
+                            background: rgba(0, 0, 0, 0.75);
+                            backdrop-filter: blur(8px);
+                            z-index: 1000;
+                            display: none;
+                            align-items: center;
+                            justify-content: center;
+                            padding: 20px;
+                        }}
+                        .modal-content {{
+                            background: #18181b;
+                            border: 1px solid #3f3f46;
+                            border-radius: 16px;
+                            width: 100%;
+                            max-width: 500px;
+                            max-height: 85vh;
+                            overflow: hidden;
+                            display: flex;
+                            flex-direction: column;
+                            box-shadow: 0 20px 40px rgba(0,0,0,0.8);
+                            animation: floating 4s ease-in-out infinite;
+                        }}
+                        .modal-header {{
+                            padding: 15px 20px;
+                            border-bottom: 1px solid #27272a;
+                            display: flex;
+                            justify-content: space-between;
+                            align-items: center;
+                        }}
+                        .modal-body {{
+                            padding: 20px;
+                            overflow-y: auto;
+                            max-height: calc(85vh - 70px);
+                        }}
                     </style>
                     <script>
                         function validateUpload(form) {{
@@ -344,6 +534,17 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             }}
                             return true;
                         }}
+                        function openGiftModal(slot) {{
+                            const modal = document.getElementById('giftModal');
+                            const iframe = document.getElementById('giftIframe');
+                            iframe.src = '/gift-selector?slot=' + slot;
+                            modal.style.display = 'flex';
+                        }}
+                        function closeGiftModal() {{
+                            const modal = document.getElementById('giftModal');
+                            modal.style.display = 'none';
+                            location.reload();
+                        }}
                     </script>
                 </head>
                 <body>
@@ -357,7 +558,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                         {live_status_html}
 
-                        <div class="shine-border-card">
+                        <div class="shine-border-card" style="animation-delay: 1s;">
                             <h3 style="margin-top:0;">Manajemen Video & Pemicu Gift (Slot 1 - 5)</h3>
                             <p style="color: #a1a1aa; font-size: 13px;">Format wajib <b>.webm</b>. Slot 1 standby loop, Slot 2 s.d. 5 reaktif terhadap gift TikTok.</p>
                             <div>
@@ -379,12 +580,25 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             </form>
                         </div>
 
-                        <div class="shine-border-card">
+                        <div class="shine-border-card" style="animation-delay: 2s;">
                             <h3 style="margin-top:0;">Update Cookies JSON</h3>
                             <form action="/save-cookies" method="POST">
                                 <textarea name="cookies" rows="6" placeholder="Paste array cookies JSON di sini..."></textarea><br/><br/>
                                 <button type="submit" class="shimmer-btn" style="--shimmer-color: #25f4ee; --bg: rgba(37, 244, 238, 0.15);">Simpan Cookies</button>
                             </form>
+                        </div>
+                    </div>
+
+                    <!-- Floating Modal for Gift Selector -->
+                    <div id="giftModal" class="modal-overlay">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h3 style="margin:0; font-size:16px; color:#25f4ee;">Pilih Pemicu Gift TikTok</h3>
+                                <button type="button" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.2); padding: 4px 12px; font-size: 12px;" onclick="closeGiftModal()">Tutup ✕</button>
+                            </div>
+                            <div class="modal-body">
+                                <iframe id="giftIframe" style="width:100%; height:320px; border:none; background:transparent;" scrolling="yes"></iframe>
+                            </div>
                         </div>
                     </div>
                 </body>
@@ -409,17 +623,17 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 idr_formatted = f"Rp {g['idr']:,}".replace(",", ".")
                 
                 gifts_rows += f"""
-                <label class="gift-item" style="display:flex; align-items:center; justify-content:space-between; padding:8px 12px; margin:4px 0; border-radius:8px; width:100%; box-sizing:border-box; border:1px solid; {bg_sel} cursor:pointer; text-align:left; transition: background 0.2s ease, border-color 0.2s ease;">
-                    <div style="display:flex; align-items:center; gap:10px;">
-                        <span style="font-size:20px;">{g['icon']}</span>
+                <label class="gift-item" style="display:flex; align-items:center; justify-content:space-between; padding:10px 14px; margin:6px 0; border-radius:8px; width:100%; box-sizing:border-box; border:1px solid; {bg_sel} cursor:pointer; text-align:left; transition: background 0.2s ease, border-color 0.2s ease;">
+                    <div style="display:flex; align-items:center; gap:12px;">
+                        <span style="font-size:24px;">{g['icon']}</span>
                         <div>
-                            <div style="color:#fff; font-size:13px; font-weight:bold;">{g['name']}</div>
-                            <div style="color:#a1a1aa; font-size:11px;">{g['coins']} Koin</div>
+                            <div style="color:#fff; font-size:14px; font-weight:bold;">{g['name']}</div>
+                            <div style="color:#a1a1aa; font-size:12px;">{g['coins']} Koin</div>
                         </div>
                     </div>
                     <div style="text-align:right; display:flex; align-items:center; gap:12px;">
-                        <span style="color:#34c759; font-size:12px; font-weight:bold;">{idr_formatted}</span>
-                        <input type="radio" name="gift_id" value="{g['id']}" {is_sel} onchange="saveGift('{slot}', '{g['id']}')" />
+                        <span style="color:#34c759; font-size:13px; font-weight:bold;">{idr_formatted}</span>
+                        <input type="radio" name="gift_id" value="{g['id']}" {is_sel} onchange="saveGift('{slot}', '{g['id']}')" style="transform: scale(1.2); cursor: pointer;" />
                     </div>
                 </label>
                 """
@@ -433,7 +647,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             background: #22222c !important;
                             border-color: #a07cfe !important;
                         }}
-                        body {{ font-family: sans-serif; background: #0f0f11; color: #fff; margin: 0; padding: 10px; }}
+                        body {{ font-family: sans-serif; background: #0f0f11; color: #fff; margin: 0; padding: 0; }}
                         ::-webkit-scrollbar {{ width: 6px; }}
                         ::-webkit-scrollbar-thumb {{ background: #3f3f46; border-radius: 3px; }}
                     </style>
@@ -448,7 +662,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     </script>
                 </head>
                 <body>
-                    <div style="font-size:12px; color:#25f4ee; margin-bottom:8px; font-weight:bold;">Pilih Pemicu Gift & Estimasi Pendapatan:</div>
                     {gifts_rows}
                 </body>
             </html>
@@ -499,6 +712,29 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         parsed_url = urllib.parse.urlparse(self.path)
         
+        if parsed_url.path == '/login':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            parsed = urllib.parse.parse_qs(body)
+            password = parsed.get('password', [''])[0]
+            if password == "191919":
+                self.send_response(303)
+                self.send_header('Set-Cookie', 'auth_token=verified_191919; Path=/; Max-Age=604800; HttpOnly')
+                self.send_header('Location', '/')
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"<html><body style='background:#0f0f11; color:#ff3b30; text-align:center; padding-top:50px; font-family:sans-serif;'><h2>Password Salah!</h2><br/><a href='/' style='color:#25f4ee;'>Coba Lagi</a></body></html>")
+            return
+
+        if not self.check_auth():
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b"Unauthorized")
+            return
+
         if parsed_url.path == '/upload-video':
             try:
                 content_type = self.headers.get('Content-Type', '')
