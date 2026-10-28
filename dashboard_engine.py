@@ -13,6 +13,7 @@ import http.cookies
 PORT = 8088
 BASE_DIR = "/home/ubuntu/tiktok-live-automation"
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.json")
+ACCOUNT_CONFIG_FILE = os.path.join(BASE_DIR, "account_config.json")
 VIDEOS_DIR = os.path.join(BASE_DIR, "uploads", "videos")
 CONFIG_FILE = os.path.join(BASE_DIR, "gift_config.json")
 
@@ -43,6 +44,19 @@ GIFTS_CATALOG = [
     {"id": "whale", "name": "Audacious Whale", "coins": 21500, "idr": 5375000, "icon": "🐳"},
     {"id": "yacht", "name": "Falcon / Yacht", "coins": 5000, "idr": 1250000, "icon": "🛥️"}
 ]
+
+def load_account_config():
+    if os.path.exists(ACCOUNT_CONFIG_FILE):
+        try:
+            with open(ACCOUNT_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"username": ""}
+
+def save_account_config(cfg):
+    with open(ACCOUNT_CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2)
 
 def load_gift_config():
     if os.path.exists(CONFIG_FILE):
@@ -129,7 +143,7 @@ def start_ffmpeg_stream(rtmp_url, stream_key):
 
 def fetch_tiktok_stream_key():
     if not os.path.exists(COOKIES_FILE):
-        raise Exception("cookies.json belum tersedia. Silakan upload atau paste cookies terlebih dahulu.")
+        raise Exception("cookies.json belum tersedia. Silakan isi konfigurasi akun dan cookies terlebih dahulu.")
 
     with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
         cookies = json.load(f)
@@ -303,9 +317,15 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-type", "text/html; charset=utf-8")
             self.end_headers()
             
+            account_cfg = load_account_config()
+            tiktok_username = account_cfg.get("username", "").strip()
             cookies_exist = os.path.exists(COOKIES_FILE)
-            cookie_status = "<span style='color:#34c759; font-weight:bold;'>✓ Cookies.json Aktif & Tersedia</span>" if cookies_exist else "<span style='color:#ff3b30; font-weight:bold;'>✗ Cookies.json Belum Ada (Wajib Upload/Paste)</span>"
             
+            if tiktok_username:
+                account_status_banner = f"<div style='background: rgba(52, 199, 89, 0.15); border: 1px solid #34c759; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; color: #34c759; font-weight: bold;'>✅ Akun Terhubung: @{tiktok_username.lstrip('@')}</div>"
+            else:
+                account_status_banner = f"<div style='background: rgba(255, 59, 48, 0.15); border: 1px solid #ff3b30; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; color: #ff3b30; font-weight: bold;'>⚠️ Akun TikTok Belum Dikonfigurasi — Silakan isi konfigurasi akun di bawah sebelum memulai Live</div>"
+
             is_live = get_ffmpeg_pid() is not None
             live_color = "#34c759" if is_live else "#ff3b30"
             live_text = "AKTIF & STREAMING (Lightweight FFmpeg)" if is_live else "OFFLINE"
@@ -344,7 +364,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         <input type="hidden" name="slot" value="{i}" />
                         <span style="color:#a1a1aa; font-size:12px;">Format .webm</span>
                         <input type="file" name="videofile" accept="video/webm" style="color:#aaa; font-size:12px;" />
-                        <button type="submit" class="shimmer-btn" style="padding:6px 14px; font-size:12px;">Upload</button>
+                        <button type="submit" class="modern-btn btn-upload" style="padding:6px 14px; font-size:12px;">Upload</button>
                     </form>
                     """
 
@@ -364,10 +384,19 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     video_slots_html += f"""
                     <div style='margin-top:10px; border-top:1px solid #27272a; padding-top:10px; display:flex; justify-content:space-between; align-items:center;'>
                         <span style='font-size:13px; color:#25f4ee;'>Konfigurasi Pemicu Gift (Slot {i}) — Terpilih: <b>{current_gift}</b></span>
-                        <button type="button" class="shimmer-btn" style="--shimmer-color: #25f4ee; --bg: rgba(37, 244, 238, 0.15); padding: 6px 14px; font-size: 12px;" onclick="openGiftModal({i})">Pilih Gift</button>
+                        <button type="button" class="modern-btn btn-gift" style="padding: 6px 14px; font-size: 12px;" onclick="openGiftModal({i})">Pilih Gift</button>
                     </div>
                     """
                 video_slots_html += "</div>"
+
+            # Load existing cookies content for textarea
+            cookies_content = ""
+            if cookies_exist:
+                try:
+                    with open(COOKIES_FILE, 'r', encoding='utf-8') as cf:
+                        cookies_content = cf.read()
+                except Exception:
+                    pass
 
             html = f"""<!DOCTYPE html>
             <html>
@@ -475,11 +504,41 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             background: conic-gradient(from calc(270deg - (var(--spread) / 2)), transparent 0, var(--shimmer-color) var(--spread), transparent var(--spread));
                             animation: spin-around var(--speed) infinite linear;
                         }}
+                        
+                        /* Modern Static Buttons (Upload & Gift) without shimmer animation */
+                        .modern-btn {{
+                            display: inline-flex;
+                            align-items: center;
+                            justify-content: center;
+                            cursor: pointer;
+                            border-radius: 8px;
+                            font-weight: 600;
+                            font-size: 13px;
+                            color: #ffffff;
+                            border: 1px solid rgba(255, 255, 255, 0.15);
+                            transition: background 0.2s ease, border-color 0.2s ease;
+                            text-decoration: none;
+                        }}
+                        .btn-upload {{
+                            background: #1e293b;
+                        }}
+                        .btn-upload:hover {{
+                            background: #334155;
+                            border-color: rgba(255, 255, 255, 0.3);
+                        }}
+                        .btn-gift {{
+                            background: #2e1065;
+                        }}
+                        .btn-gift:hover {{
+                            background: #4c1d95;
+                            border-color: rgba(255, 255, 255, 0.3);
+                        }}
+
                         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f11; color: #f1f1f3; margin: 0; padding: 20px; }}
                         .container {{ max-width: 850px; margin: 0 auto; background: #18181b; padding: 30px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); border: 1px solid #27272a; }}
                         h1, h2, h3 {{ color: #fff; }}
                         hr {{ border: 0; border-top: 1px solid #27272a; margin: 25px 0; }}
-                        textarea {{ width: 100%; background: #0f0f11; color: #25f4ee; border: 1px solid #3f3f46; padding: 12px; border-radius: 6px; font-family: monospace; resize: vertical; box-sizing: border-box; }}
+                        input[type="text"], textarea {{ width: 100%; background: #0f0f11; color: #25f4ee; border: 1px solid #3f3f46; padding: 12px; border-radius: 6px; font-family: monospace; resize: vertical; box-sizing: border-box; }}
                         pre {{ background: #0f0f11; padding: 15px; border-radius: 6px; color: #25f4ee; overflow-x: auto; font-size: 13px; border: 1px solid #3f3f46; text-align: left; }}
                         
                         /* Modal Overlay */
@@ -534,6 +593,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             }}
                             return true;
                         }}
+                        function validateStartLive() {{
+                            const username = "{tiktok_username}";
+                            if (!username) {{
+                                alert("Peringatan: Akun TikTok belum dikonfigurasi! Harap isi Username TikTok dan simpan konfigurasi akun terlebih dahulu.");
+                                return false;
+                            }}
+                            return true;
+                        }}
                         function openGiftModal(slot) {{
                             const modal = document.getElementById('giftModal');
                             const iframe = document.getElementById('giftIframe');
@@ -553,10 +620,25 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         <p>Arsitektur Ringan & Stabil (5 Slot Video .webm & Pemicu Gift)</p>
                         
                         <div style="margin: 15px 0;">
-                            {cookie_status}
+                            {account_status_banner}
                         </div>
 
                         {live_status_html}
+
+                        <!-- Konfigurasi Akun TikTok Panel -->
+                        <div class="shine-border-card" style="animation-delay: 0.5s;">
+                            <h3 style="margin-top:0;">Konfigurasi Akun TikTok</h3>
+                            <p style="color: #a1a1aa; font-size: 13px;">Masukkan Username TikTok (contoh: @username) dan Cookies JSON Anda.</p>
+                            <form action="/save-account-config" method="POST">
+                                <label style="display: block; font-size: 13px; font-weight: bold; margin-bottom: 6px; color: #fff;">Username TikTok:</label>
+                                <input type="text" name="username" value="{tiktok_username}" placeholder="@username_tiktok" required /><br/><br/>
+                                
+                                <label style="display: block; font-size: 13px; font-weight: bold; margin-bottom: 6px; color: #fff;">Cookies JSON (cookies.json):</label>
+                                <textarea name="cookies" rows="5" placeholder="Paste array cookies JSON di sini..." required>{cookies_content}</textarea><br/><br/>
+                                
+                                <button type="submit" class="shimmer-btn" style="--shimmer-color: #25f4ee; --bg: rgba(37, 244, 238, 0.15);">Save Konfigurasi Akun</button>
+                            </form>
+                        </div>
 
                         <div class="shine-border-card" style="animation-delay: 1s;">
                             <h3 style="margin-top:0;">Manajemen Video & Pemicu Gift (Slot 1 - 5)</h3>
@@ -569,7 +651,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         <hr/>
                         <h3>Kontrol Live Streaming</h3>
                         <div style="display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px;">
-                            <form action="/start-stream" method="POST" style="margin:0;">
+                            <form action="/start-stream" method="POST" style="margin:0;" onsubmit="return validateStartLive();">
                                 <button type="submit" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.15);">Start Live (Ambil RTMP & Push Video)</button>
                             </form>
                             <form action="/stop-stream" method="POST" style="margin:0;">
@@ -577,14 +659,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             </form>
                             <form action="/simulate-gift" method="POST" style="margin:0;">
                                 <button type="submit" class="shimmer-btn" style="--shimmer-color: #34c759; --bg: rgba(52, 199, 89, 0.15);">Simulate Gift Event</button>
-                            </form>
-                        </div>
-
-                        <div class="shine-border-card" style="animation-delay: 2s;">
-                            <h3 style="margin-top:0;">Update Cookies JSON</h3>
-                            <form action="/save-cookies" method="POST">
-                                <textarea name="cookies" rows="6" placeholder="Paste array cookies JSON di sini..."></textarea><br/><br/>
-                                <button type="submit" class="shimmer-btn" style="--shimmer-color: #25f4ee; --bg: rgba(37, 244, 238, 0.15);">Simpan Cookies</button>
                             </form>
                         </div>
                     </div>
@@ -735,6 +809,33 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(b"Unauthorized")
             return
 
+        if parsed_url.path == '/save-account-config':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            parsed = urllib.parse.parse_qs(body)
+            username = parsed.get('username', [''])[0].strip()
+            cookies_raw = parsed.get('cookies', [''])[0].strip()
+            
+            try:
+                # Save account config
+                save_account_config({"username": username})
+                
+                # Save cookies if provided
+                if cookies_raw:
+                    parsed_json = json.loads(cookies_raw)
+                    with open(COOKIES_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(parsed_json, f, indent=2)
+                        
+                self.send_response(303)
+                self.send_header('Location', '/')
+                self.end_headers()
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2>Gagal Menyimpan Konfigurasi: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
+            return
+
         if parsed_url.path == '/upload-video':
             try:
                 content_type = self.headers.get('Content-Type', '')
@@ -770,27 +871,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Location', '/')
             self.end_headers()
             
-        elif parsed_url.path == '/save-cookies':
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode('utf-8')
-            parsed = urllib.parse.parse_qs(body)
-            cookies_raw = parsed.get('cookies', [''])[0]
-            try:
-                parsed_json = json.loads(cookies_raw)
-                with open(COOKIES_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(parsed_json, f, indent=2)
-                self.send_response(200)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2>Cookies berhasil disimpan!</h2><br/><a href='/' style='color:#25f4ee; font-size:16px;'>Kembali ke Dashboard</a></body></html>")
-            except Exception as e:
-                self.send_response(400)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2>Format JSON tidak valid: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
-                
         elif parsed_url.path == '/start-stream':
             try:
+                account_cfg = load_account_config()
+                if not account_cfg.get("username", "").strip():
+                    raise Exception("Akun TikTok belum dikonfigurasi! Harap simpan konfigurasi akun terlebih dahulu.")
+                    
                 rtmp_url, stream_key, raw_resp = fetch_tiktok_stream_key()
                 start_ffmpeg_stream(rtmp_url, stream_key)
                 
@@ -803,6 +889,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     <body style='background:#0f0f11; color:#fff; text-align:center; padding-top:40px; font-family:sans-serif;'>
                         <h2 style='color:#34c759;'>Live Streaming Berhasil Dimulai!</h2>
                         <div style='background:#18181b; padding:20px; display:inline-block; border-radius:8px; text-align:left; border:1px solid #27272a; max-width:650px;'>
+                            <p><b>Akun TikTok:</b> <span style='color:#25f4ee;'>@{account_cfg.get("username")}</span></p>
                             <p><b>RTMP Server:</b> <span style='color:#25f4ee;'>{rtmp_url}</span></p>
                             <p><b>Stream Key:</b> <span style='color:#25f4ee;'>{stream_key[:10]}...</span></p>
                             <p><b>Engine Status:</b> <span style='color:#34c759;'>FFmpeg Lightweight Stream Active (PID: {get_ffmpeg_pid()})</span></p>
