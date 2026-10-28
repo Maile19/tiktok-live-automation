@@ -405,11 +405,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             gifts_rows = ""
             for g in GIFTS_CATALOG:
                 is_sel = "checked" if g["id"] == current_selected else ""
-                bg_sel = "background:#22252a; border-color:#25f4ee;" if g["id"] == current_selected else "background:#121215; border-color:#27272a;"
+                bg_sel = "background:#22222c; border-color:#a07cfe;" if g["id"] == current_selected else "background:#16161d; border-color:rgba(255, 255, 255, 0.12);"
                 idr_formatted = f"Rp {g['idr']:,}".replace(",", ".")
                 
                 gifts_rows += f"""
-                <label class="shimmer-btn" style="display:flex; align-items:center; justify-content:space-between; padding:8px 12px; margin:4px 0; border-radius:8px; width:100%; box-sizing:border-box; {bg_sel} cursor:pointer; text-align:left;">
+                <label class="gift-item" style="display:flex; align-items:center; justify-content:space-between; padding:8px 12px; margin:4px 0; border-radius:8px; width:100%; box-sizing:border-box; border:1px solid; {bg_sel} cursor:pointer; text-align:left; transition: background 0.2s ease, border-color 0.2s ease;">
                     <div style="display:flex; align-items:center; gap:10px;">
                         <span style="font-size:20px;">{g['icon']}</span>
                         <div>
@@ -429,39 +429,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 <head>
                     <meta charset="utf-8">
                     <style>
-                        @keyframes spin-around {{
-                            0% {{ transform: translateZ(0) rotate(0deg); }}
-                            100% {{ transform: translateZ(0) rotate(360deg); }}
-                        }}
-                        .shimmer-btn {{
-                            --spread: 90deg;
-                            --shimmer-color: #ffffff;
-                            --radius: 8px;
-                            --speed: 3s;
-                            --cut: 1px;
-                            --bg: rgba(18, 18, 22, 0.95);
-                            position: relative;
-                            z-index: 0;
-                            display: flex;
-                            align-items: center;
-                            justify-content: space-between;
-                            overflow: hidden;
-                            cursor: pointer;
-                            border: 1px solid rgba(255, 255, 255, 0.12);
-                            color: #ffffff;
-                            transition: transform 0.2s ease, box-shadow 0.2s ease;
-                        }}
-                        .shimmer-btn:hover {{
-                            border-color: #25f4ee;
-                        }}
-                        .shimmer-btn::before {{
-                            content: "";
-                            position: absolute;
-                            inset: calc(var(--cut) * -1);
-                            z-index: -1;
-                            border-radius: inherit;
-                            background: conic-gradient(from calc(270deg - (var(--spread) / 2)), transparent 0, var(--shimmer-color) var(--spread), transparent var(--spread));
-                            animation: spin-around var(--speed) infinite linear;
+                        .gift-item:hover {{
+                            background: #22222c !important;
+                            border-color: #a07cfe !important;
                         }}
                         body {{ font-family: sans-serif; background: #0f0f11; color: #fff; margin: 0; padding: 10px; }}
                         ::-webkit-scrollbar {{ width: 6px; }}
