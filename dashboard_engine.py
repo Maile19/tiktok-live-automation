@@ -201,16 +201,16 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 if os.path.exists(filepath):
                     size_mb = round(os.path.getsize(filepath) / (1024*1024), 2)
                     file_status_ui = f"""
-                    <span style='color:#34c759;'><b>{filename}</b> ({size_mb} MB)</span>
-                    <a href='/delete-video?name={filename}' style='background:#ff3b30; color:#fff; padding:5px 12px; border-radius:4px; text-decoration:none; font-size:12px;'>Hapus</a>
+                    <span style='color:#34c759; margin-right:10px;'><b>{filename}</b> ({size_mb} MB)</span>
+                    <a href='/delete-video?name={filename}' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:6px 14px; font-size:12px; text-decoration:none;'>Hapus</a>
                     """
                 else:
                     file_status_ui = f"""
                     <form action="/upload-video" method="POST" enctype="multipart/form-data" style='display:flex; align-items:center; gap:10px; margin:0;' onsubmit="return validateUpload(this);">
                         <input type="hidden" name="slot" value="{i}" />
-                        <span style="color:#a1a1aa; font-size:12px;">Upload video berekstensi .webm</span>
+                        <span style="color:#a1a1aa; font-size:12px;">Format .webm</span>
                         <input type="file" name="videofile" accept="video/webm" style="color:#aaa; font-size:12px;" />
-                        <button type="submit" style="background:#25f4ee; color:#000; border:none; padding:5px 12px; font-weight:bold; cursor:pointer; border-radius:4px; font-size:12px;">Upload</button>
+                        <button type="submit" class="shimmer-btn" style="padding:6px 14px; font-size:12px;">Upload</button>
                     </form>
                     """
 
@@ -221,7 +221,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             <span style='font-size:15px; font-weight:bold; color:#fff;'>Slot {i}</span>
                             <span style='font-size:12px; color:#888; margin-left:10px;'>({slot_desc})</span>
                         </div>
-                        <div>{file_status_ui}</div>
+                        <div style="display:flex; align-items:center;">{file_status_ui}</div>
                     </div>
                 """
                 
@@ -248,6 +248,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             0% {{ background-position: 0% 0%; }}
                             50% {{ background-position: 100% 100%; }}
                             100% {{ background-position: 0% 0%; }}
+                        }}
+                        @keyframes spin-around {{
+                            0% {{ transform: translateZ(0) rotate(0deg); }}
+                            100% {{ transform: translateZ(0) rotate(360deg); }}
                         }}
                         .shine-border-card {{
                             position: relative;
@@ -276,16 +280,54 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             animation: shine 5s infinite linear;
                             padding: 2.5px;
                         }}
+                        .shimmer-btn {{
+                            --spread: 90deg;
+                            --shimmer-color: #ffffff;
+                            --radius: 100px;
+                            --speed: 3s;
+                            --cut: 1.5px;
+                            --bg: rgba(15, 15, 20, 0.95);
+                            position: relative;
+                            z-index: 0;
+                            display: inline-flex;
+                            align-items: center;
+                            justify-content: center;
+                            overflow: hidden;
+                            white-space: nowrap;
+                            cursor: pointer;
+                            border: 1px solid rgba(255, 255, 255, 0.12);
+                            border-radius: var(--radius);
+                            background: var(--bg);
+                            color: #ffffff;
+                            padding: 10px 22px;
+                            font-weight: 600;
+                            font-size: 13px;
+                            transform: translateZ(0);
+                            transition: transform 0.3s ease-in-out, box-shadow 0.3s ease-in-out;
+                            box-shadow: inset 0 -8px 10px #ffffff1f;
+                            text-decoration: none;
+                        }}
+                        .shimmer-btn:hover {{
+                            box-shadow: inset 0 -6px 10px #ffffff3f;
+                        }}
+                        .shimmer-btn:active {{
+                            transform: translateY(1px);
+                            box-shadow: inset 0 -4px 6px #ffffff5f;
+                        }}
+                        .shimmer-btn::before {{
+                            content: "";
+                            position: absolute;
+                            inset: calc(var(--cut) * -1);
+                            z-index: -1;
+                            border-radius: inherit;
+                            background: conic-gradient(from calc(270deg - (var(--spread) / 2)), transparent 0, var(--shimmer-color) var(--spread), transparent var(--spread));
+                            animation: spin-around var(--speed) infinite linear;
+                        }}
                         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f11; color: #f1f1f3; margin: 0; padding: 20px; }}
                         .container {{ max-width: 850px; margin: 0 auto; background: #18181b; padding: 30px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); border: 1px solid #27272a; }}
                         h1, h2, h3 {{ color: #fff; }}
                         hr {{ border: 0; border-top: 1px solid #27272a; margin: 25px 0; }}
-                        .btn {{ padding: 12px 24px; font-weight: bold; cursor: pointer; border-radius: 6px; border: none; font-size: 15px; transition: opacity 0.2s; text-decoration: none; display: inline-block; }}
-                        .btn:hover {{ opacity: 0.9; }}
-                        .btn-start {{ background: #ffb800; color: #000; }}
-                        .btn-stop {{ background: #ff3b30; color: #fff; }}
-                        .btn-sim {{ background: #34c759; color: #fff; }}
-                        textarea {{ width: 100%; background: #0f0f11; color: #25f4ee; border: 1px solid #3f3f46; padding: 12px; border-radius: 6px; font-family: monospace; resize: vertical; }}
+                        textarea {{ width: 100%; background: #0f0f11; color: #25f4ee; border: 1px solid #3f3f46; padding: 12px; border-radius: 6px; font-family: monospace; resize: vertical; box-sizing: border-box; }}
                         pre {{ background: #0f0f11; padding: 15px; border-radius: 6px; color: #25f4ee; overflow-x: auto; font-size: 13px; border: 1px solid #3f3f46; text-align: left; }}
                     </style>
                     <script>
@@ -327,13 +369,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         <h3>Kontrol Live Streaming</h3>
                         <div style="display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px;">
                             <form action="/start-stream" method="POST" style="margin:0;">
-                                <button type="submit" class="btn btn-start">Start Live (Ambil RTMP & Push Video)</button>
+                                <button type="submit" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.15);">Start Live (Ambil RTMP & Push Video)</button>
                             </form>
                             <form action="/stop-stream" method="POST" style="margin:0;">
-                                <button type="submit" class="btn btn-stop">Stop Live (Matikan Stream)</button>
+                                <button type="submit" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.15);">Stop Live (Matikan Stream)</button>
                             </form>
                             <form action="/simulate-gift" method="POST" style="margin:0;">
-                                <button type="submit" class="btn btn-sim">Simulate Gift Event</button>
+                                <button type="submit" class="shimmer-btn" style="--shimmer-color: #34c759; --bg: rgba(52, 199, 89, 0.15);">Simulate Gift Event</button>
                             </form>
                         </div>
 
@@ -341,7 +383,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             <h3 style="margin-top:0;">Update Cookies JSON</h3>
                             <form action="/save-cookies" method="POST">
                                 <textarea name="cookies" rows="6" placeholder="Paste array cookies JSON di sini..."></textarea><br/><br/>
-                                <button type="submit" class="btn" style="background: #25f4ee; color: #000;">Simpan Cookies</button>
+                                <button type="submit" class="shimmer-btn" style="--shimmer-color: #25f4ee; --bg: rgba(37, 244, 238, 0.15);">Simpan Cookies</button>
                             </form>
                         </div>
                     </div>
@@ -367,7 +409,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 idr_formatted = f"Rp {g['idr']:,}".replace(",", ".")
                 
                 gifts_rows += f"""
-                <label style="display:flex; align-items:center; justify-content:space-between; padding:8px 12px; margin:4px 0; border-radius:6px; border:1px solid; {bg_sel} cursor:pointer;">
+                <label class="shimmer-btn" style="display:flex; align-items:center; justify-content:space-between; padding:8px 12px; margin:4px 0; border-radius:8px; width:100%; box-sizing:border-box; {bg_sel} cursor:pointer; text-align:left;">
                     <div style="display:flex; align-items:center; gap:10px;">
                         <span style="font-size:20px;">{g['icon']}</span>
                         <div>
@@ -387,6 +429,40 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 <head>
                     <meta charset="utf-8">
                     <style>
+                        @keyframes spin-around {{
+                            0% {{ transform: translateZ(0) rotate(0deg); }}
+                            100% {{ transform: translateZ(0) rotate(360deg); }}
+                        }}
+                        .shimmer-btn {{
+                            --spread: 90deg;
+                            --shimmer-color: #ffffff;
+                            --radius: 8px;
+                            --speed: 3s;
+                            --cut: 1px;
+                            --bg: rgba(18, 18, 22, 0.95);
+                            position: relative;
+                            z-index: 0;
+                            display: flex;
+                            align-items: center;
+                            justify-content: space-between;
+                            overflow: hidden;
+                            cursor: pointer;
+                            border: 1px solid rgba(255, 255, 255, 0.12);
+                            color: #ffffff;
+                            transition: transform 0.2s ease, box-shadow 0.2s ease;
+                        }}
+                        .shimmer-btn:hover {{
+                            border-color: #25f4ee;
+                        }}
+                        .shimmer-btn::before {{
+                            content: "";
+                            position: absolute;
+                            inset: calc(var(--cut) * -1);
+                            z-index: -1;
+                            border-radius: inherit;
+                            background: conic-gradient(from calc(270deg - (var(--spread) / 2)), transparent 0, var(--shimmer-color) var(--spread), transparent var(--spread));
+                            animation: spin-around var(--speed) infinite linear;
+                        }}
                         body {{ font-family: sans-serif; background: #0f0f11; color: #fff; margin: 0; padding: 10px; }}
                         ::-webkit-scrollbar {{ width: 6px; }}
                         ::-webkit-scrollbar-thumb {{ background: #3f3f46; border-radius: 3px; }}
@@ -528,7 +604,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             <pre style='background:#0f0f11; padding:10px; color:#25f4ee; overflow-x:auto; font-size:12px;'>{json.dumps(raw_resp, indent=2)}</pre>
                         </div>
                         <br/><br/>
-                        <a href='/' style='color:#25f4ee; font-size:16px; text-decoration:none; background:#27272a; padding:10px 20px; border-radius:6px;'>Kembali ke Dashboard</a>
+                        <a href='/' class='shimmer-btn' style='color:#25f4ee; text-decoration:none;'>Kembali ke Dashboard</a>
                     </body>
                 </html>
                 """
