@@ -180,9 +180,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             live_color = "#34c759" if is_live else "#ff3b30"
             live_text = "AKTIF & STREAMING (Lightweight FFmpeg)" if is_live else "OFFLINE"
             
-            live_status_html = f"<div style='background:#1c1c1e; padding:15px; border-radius:8px; border:1px solid {live_color}; margin-bottom:20px;'><h3>Status Live: <span style='color:{live_color};'>{live_text}</span></h3>"
+            online_class_live = "online" if is_live else ""
+            live_status_html = f"""
+            <div class="shine-border-card {online_class_live}">
+                <h3 style="margin-top:0;">Status Live: <span style="color:{live_color};">{live_text}</span></h3>
+            """
             if is_live:
-                live_status_html += f"<p style='color:#aaa; font-size:13px;'>RTMP Server: {stream_metadata.get('rtmpUrl', 'N/A')}</p>"
+                live_status_html += f"<p style='color:#aaa; font-size:13px; margin-bottom:0;'>RTMP Server: {stream_metadata.get('rtmpUrl', 'N/A')}</p>"
             live_status_html += "</div>"
 
             gift_config = load_gift_config()
@@ -240,6 +244,38 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     <meta charset="utf-8">
                     <title>TikTok Live Lightweight Dashboard</title>
                     <style>
+                        @keyframes shine {{
+                            0% {{ background-position: 0% 0%; }}
+                            50% {{ background-position: 100% 100%; }}
+                            100% {{ background-position: 0% 0%; }}
+                        }}
+                        .shine-border-card {{
+                            position: relative;
+                            border-radius: 12px;
+                            background: #121216;
+                            padding: 20px;
+                            margin-bottom: 25px;
+                            border: 1px solid #27272a;
+                            overflow: hidden;
+                        }}
+                        .shine-border-card::before {{
+                            content: "";
+                            position: absolute;
+                            inset: 0;
+                            border-radius: inherit;
+                            padding: 2px;
+                            background-image: radial-gradient(transparent, transparent, #A07CFE, #FE8FB5, #FFBE7B, transparent, transparent);
+                            background-size: 300% 300%;
+                            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+                            -webkit-mask-composite: xor;
+                            mask-composite: exclude;
+                            animation: shine 14s infinite linear;
+                            pointer-events: none;
+                        }}
+                        .shine-border-card.online::before {{
+                            animation: shine 5s infinite linear;
+                            padding: 2.5px;
+                        }}
                         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f11; color: #f1f1f3; margin: 0; padding: 20px; }}
                         .container {{ max-width: 850px; margin: 0 auto; background: #18181b; padding: 30px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); border: 1px solid #27272a; }}
                         h1, h2, h3 {{ color: #fff; }}
@@ -279,11 +315,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                         {live_status_html}
 
-                        <hr/>
-                        <h3>Manajemen Video & Pemicu Gift (Slot 1 - 5)</h3>
-                        <p style="color: #a1a1aa; font-size: 13px;">Format wajib <b>.webm</b>. Slot 1 standby loop, Slot 2 s.d. 5 reaktif terhadap gift TikTok.</p>
-                        <div>
-                            {video_slots_html}
+                        <div class="shine-border-card">
+                            <h3 style="margin-top:0;">Manajemen Video & Pemicu Gift (Slot 1 - 5)</h3>
+                            <p style="color: #a1a1aa; font-size: 13px;">Format wajib <b>.webm</b>. Slot 1 standby loop, Slot 2 s.d. 5 reaktif terhadap gift TikTok.</p>
+                            <div>
+                                {video_slots_html}
+                            </div>
                         </div>
 
                         <hr/>
@@ -300,12 +337,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             </form>
                         </div>
 
-                        <hr/>
-                        <h3>Update Cookies JSON</h3>
-                        <form action="/save-cookies" method="POST">
-                            <textarea name="cookies" rows="6" placeholder="Paste array cookies JSON di sini..."></textarea><br/><br/>
-                            <button type="submit" class="btn" style="background: #25f4ee; color: #000;">Simpan Cookies</button>
-                        </form>
+                        <div class="shine-border-card">
+                            <h3 style="margin-top:0;">Update Cookies JSON</h3>
+                            <form action="/save-cookies" method="POST">
+                                <textarea name="cookies" rows="6" placeholder="Paste array cookies JSON di sini..."></textarea><br/><br/>
+                                <button type="submit" class="btn" style="background: #25f4ee; color: #000;">Simpan Cookies</button>
+                            </form>
+                        </div>
                     </div>
                 </body>
             </html>
