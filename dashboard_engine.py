@@ -649,8 +649,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         </div>
 
                         <hr/>
-                        <h3>Kontrol Live Streaming</h3>
-                        <div style="display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px;">
+                        <h3 style="text-align: center;">Kontrol Live Streaming</h3>
+                        <div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 14px; margin: 0 auto; text-align: center; margin-bottom: 20px;">
                             <form action="/start-stream" method="POST" style="margin:0;" onsubmit="return validateStartLive();">
                                 <button type="submit" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.15);">Start Live (Ambil RTMP & Push Video)</button>
                             </form>
