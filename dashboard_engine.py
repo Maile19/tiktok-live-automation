@@ -18,12 +18,15 @@ import threading
 import time
 import http.cookies
 import shutil
+import asyncio
+import websockets
 from PIL import Image, ImageDraw, ImageFont
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-PORT = 8088
+PORT = int(os.environ.get("PORT", 8089))
+WS_PORT = int(os.environ.get("WS_PORT", 8086))
 BASE_DIR = "/home/ubuntu/tiktok-live-automation"
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.json")
 ACCOUNT_CONFIG_FILE = os.path.join(BASE_DIR, "account_config.json")
@@ -618,6 +621,12 @@ def check_has_audio(filepath):
         return True
 
 streaming_process = None
+dual_screen_active = False
+dual_screen_ws_client = None
+
+def is_dual_screen_active():
+    global dual_screen_active, streaming_process
+    return dual_screen_active and streaming_process is not None and streaming_process.poll() is None
 stream_metadata = {
     "active": False,
     "rtmpUrl": "",
@@ -1279,6 +1288,150 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
         stream_metadata["currentVideo"] = os.path.basename(video_path)
         save_stream_metadata()
 
+def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
+    global streaming_process, stream_metadata
+    stop_ffmpeg_stream(close_tiktok_room=False)
+    time.sleep(0.5)
+
+    if not rtmp_url:
+        rtmp_url = stream_metadata.get("rtmpUrl", "")
+    if not stream_key:
+        stream_key = stream_metadata.get("rawStreamKey", "")
+    if not room_id:
+        room_id = stream_metadata.get("roomId", "")
+
+    if not rtmp_url or not stream_key:
+        print("[DualScreen] Stream RTMP URL atau Stream Key belum tersedia.")
+        return None
+
+    clean_rtmp = rtmp_url.rstrip('/')
+    destination = f"{clean_rtmp}/{stream_key}"
+
+    cmd = [
+        "ffmpeg",
+        "-nostats",
+        "-loglevel", "warning",
+        "-re",
+        "-i", "pipe:0",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-b:v", "1500k",
+        "-maxrate", "1500k",
+        "-bufsize", "3000k",
+        "-pix_fmt", "yuv420p",
+        "-g", "60",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-f", "flv",
+        destination
+    ]
+
+    vpn_cfg = load_vpn_config()
+    should_use_vpn = vpn_cfg.get("auto_vpn", True) and is_wireproxy_running()
+    ffmpeg_env = os.environ.copy()
+    if should_use_vpn:
+        ffmpeg_env["ALL_PROXY"] = "socks5h://127.0.0.1:40000"
+        ffmpeg_env["all_proxy"] = "socks5h://127.0.0.1:40000"
+        ffmpeg_env["HTTP_PROXY"] = "http://127.0.0.1:40001"
+        ffmpeg_env["HTTPS_PROXY"] = "http://127.0.0.1:40001"
+        ffmpeg_env["http_proxy"] = "http://127.0.0.1:40001"
+        ffmpeg_env["https_proxy"] = "http://127.0.0.1:40001"
+        if os.path.exists(PROXYCHAINS_CONF):
+            cmd = ["proxychains4", "-q", "-f", PROXYCHAINS_CONF] + cmd
+
+    rotate_ffmpeg_log_if_needed()
+    print(f"[StreamingEngine - DualScreen] Starting ffmpeg stdin push to TikTok: {' '.join(cmd[:12])}...")
+
+    with stream_lock:
+        err_sink = subprocess.DEVNULL
+        try:
+            ffmpeg_log_fp = open(FFMPEG_LOG_FILE, "a", encoding="utf-8")
+            ffmpeg_log_fp.write(f"\n--- [FFmpeg Dual-Screen Stream Start: {time.strftime('%Y-%m-%d %H:%M:%S')}] ---\n")
+            ffmpeg_log_fp.write(f"Command: {' '.join(cmd)}\n")
+            if should_use_vpn:
+                ffmpeg_log_fp.write("Network: Cloudflare WARP SOCKS5 Tunnel (127.0.0.1:40000)\n")
+            ffmpeg_log_fp.flush()
+            err_sink = ffmpeg_log_fp
+        except Exception as log_err:
+            print(f"[StreamingEngine] Warning: cannot open {FFMPEG_LOG_FILE}: {log_err}")
+            err_sink = subprocess.DEVNULL
+
+        streaming_process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=err_sink,
+            env=ffmpeg_env
+        )
+
+        if err_sink and err_sink != subprocess.DEVNULL:
+            try:
+                err_sink.close()
+            except Exception:
+                pass
+
+        stream_metadata["active"] = True
+        stream_metadata["startTime"] = time.time()
+        stream_metadata["rtmpUrl"] = rtmp_url
+        stream_metadata["streamKey"] = stream_key[:10] + "..." if stream_key else ""
+        stream_metadata["rawStreamKey"] = stream_key
+        stream_metadata["roomId"] = room_id
+        stream_metadata["currentSlot"] = 1
+        stream_metadata["currentVideo"] = "Dual-Screen Live (Canvas + Cam)"
+        save_stream_metadata()
+        return streaming_process
+
+async def ws_stream_handler(websocket):
+    global dual_screen_active, dual_screen_ws_client, streaming_process
+    print("[DualScreen WS] Klien terhubung ke WebSocket stream pipe.")
+    dual_screen_ws_client = websocket
+    dual_screen_active = True
+
+    if streaming_process is None or streaming_process.poll() is not None:
+        start_dual_screen_ffmpeg_stream()
+
+    try:
+        async for message in websocket:
+            if isinstance(message, bytes):
+                if streaming_process and streaming_process.poll() is None and streaming_process.stdin:
+                    try:
+                        streaming_process.stdin.write(message)
+                        streaming_process.stdin.flush()
+                    except (BrokenPipeError, OSError) as pe:
+                        print(f"[DualScreen WS] Pipe write error: {pe}")
+                        break
+            elif isinstance(message, str):
+                try:
+                    payload = json.loads(message)
+                    if payload.get("action") == "stop":
+                        break
+                except Exception:
+                    pass
+    except websockets.exceptions.ConnectionClosed:
+        print("[DualScreen WS] Klien WebSocket terputus.")
+    finally:
+        dual_screen_active = False
+        dual_screen_ws_client = None
+        print("[DualScreen WS] Sesi WebSocket streaming dual-screen selesai.")
+
+def start_websocket_server():
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        async def _main():
+            async with websockets.serve(ws_stream_handler, "127.0.0.1", WS_PORT, max_size=10*1024*1024):
+                print(f"[DualScreen WS] WebSocket Server aktif di ws://127.0.0.1:{WS_PORT}")
+                await asyncio.Future()
+        try:
+            loop.run_until_complete(_main())
+        except Exception as e:
+            print(f"[DualScreen WS] Error menjalankan WebSocket server: {e}")
+
+    ws_thread = threading.Thread(target=_run, daemon=True, name="DualScreenWS")
+    ws_thread.start()
+
 TIKTOK_GIFT_ID_MAP = {
     "5655": "rose",
     "5827": "ice_cream",
@@ -1420,6 +1573,21 @@ def play_slot(slot_num, source_info=None):
 
     is_standby = (slot_num == 1)
     
+    if is_dual_screen_active():
+        print(f"[DualScreen] switch_to_video_slot({slot_num}) dipanggil dalam mode Dual-Screen. Mengubah currentSlot tanpa restart FFmpeg.")
+        stream_metadata["currentSlot"] = slot_num
+        stream_metadata["currentVideo"] = os.path.basename(slot_video_path) if slot_video_path else f"Slot {slot_num}"
+        save_stream_metadata()
+        if not is_standby:
+            duration = get_video_duration(slot_video_path)
+            print(f"[DualScreen Queue] Memutar Slot {slot_num} ({os.path.basename(slot_video_path)}), durasi: {duration:.2f}s")
+            def _slot_timer(expected_slot):
+                sleep_time = max(1.0, duration - 0.5)
+                time.sleep(sleep_time)
+                on_slot_finished(expected_slot)
+            threading.Thread(target=_slot_timer, args=(slot_num,), daemon=True).start()
+        return True
+
     try:
         start_ffmpeg_stream(
             rtmp_url=stream_metadata.get("rtmpUrl"),
@@ -2858,6 +3026,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}
 
                                 if (data.success) {{
+                                    if (typeof triggerDualScreenSlot === 'function') triggerDualScreenSlot(slot, data.giftName);
                                     showSimStatus(data.message || ('Simulasi Slot ' + slot + ' diterima!'), true, data.queued);
                                 }} else {{
                                     showSimStatus(data.message || 'Gagal memicu simulasi', false, false);
@@ -2902,6 +3071,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         btn.style.borderColor = '';
                                     }}, 2500);
                                 }}
+                                if (typeof triggerDualScreenSlot === 'function') triggerDualScreenSlot(1, 'Standby Loop');
                                 showSimStatus('Antrean dikosongkan. Kembali ke Standby Loop (Slot 1).', true, false);
                                 if (typeof syncListenerStatus === 'function') syncListenerStatus();
                             }})
@@ -2918,6 +3088,431 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             }});
                         }}
                         setInterval(syncListenerStatus, 3000);
+
+                        // --- Dual-Screen Live Studio (Client-Side Canvas Compositing - Opsi A) ---
+                        let isDualScreenActive = false;
+                        let dualMediaStream = null;
+                        let dualAudioCtx = null;
+                        let dualAudioDest = null;
+                        let dualMicGain = null;
+                        let dualCatAudioSource = null;
+                        let dualCanvasStream = null;
+                        let dualMediaRecorder = null;
+                        let dualStreamWs = null;
+                        let dualIsStreaming = false;
+                        let dualCurrentSlot = 1;
+                        let dualIsMirror = true;
+                        let dualIsMicMuted = false;
+                        let dualAnimFrame = null;
+                        let dualSlotTimeout = null;
+
+                        function initDualScreenStudio() {{
+                            const canvas = document.getElementById('dualCompositeCanvas');
+                            if (!canvas) return;
+
+                            if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
+                                navigator.mediaDevices.enumerateDevices().then(devices => {{
+                                    const camSelect = document.getElementById('cameraSourceSelect');
+                                    const micSelect = document.getElementById('micSourceSelect');
+                                    if (camSelect) camSelect.innerHTML = '<option value="">Default Kamera</option>';
+                                    if (micSelect) micSelect.innerHTML = '<option value="">Default Mikrofon</option>';
+                                    let camCount = 0;
+                                    let micCount = 0;
+                                    devices.forEach(d => {{
+                                        if (d.kind === 'videoinput') {{
+                                            camCount++;
+                                            const opt = document.createElement('option');
+                                            opt.value = d.deviceId;
+                                            opt.text = d.label || ('Kamera ' + camCount);
+                                            if (camSelect) camSelect.appendChild(opt);
+                                        }} else if (d.kind === 'audioinput') {{
+                                            micCount++;
+                                            const opt = document.createElement('option');
+                                            opt.value = d.deviceId;
+                                            opt.text = d.label || ('Mikrofon ' + micCount);
+                                            if (micSelect) micSelect.appendChild(opt);
+                                        }}
+                                    }});
+                                }}).catch(err => console.warn('enumerateDevices error:', err));
+                            }}
+
+                            startCanvasLoop();
+                        }}
+
+                        function startCanvasLoop() {{
+                            const canvas = document.getElementById('dualCompositeCanvas');
+                            if (!canvas) return;
+                            const ctx = canvas.getContext('2d');
+                            const catVid = document.getElementById('dualCatVideo');
+                            const camVid = document.getElementById('dualCamVideo');
+
+                            function draw() {{
+                                ctx.fillStyle = '#0a0a0f';
+                                ctx.fillRect(0, 0, 720, 1280);
+
+                                // 1. Draw Cat Video (Top 0..640)
+                                if (catVid && catVid.readyState >= 2) {{
+                                    const vW = catVid.videoWidth || 720;
+                                    const vH = catVid.videoHeight || 640;
+                                    const scale = Math.max(720 / vW, 640 / vH);
+                                    const drawW = vW * scale;
+                                    const drawH = vH * scale;
+                                    const drawX = (720 - drawW) / 2;
+                                    const drawY = (640 - drawH) / 2;
+                                    ctx.save();
+                                    ctx.beginPath();
+                                    ctx.rect(0, 0, 720, 640);
+                                    ctx.clip();
+                                    ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
+                                    ctx.restore();
+                                }} else {{
+                                    ctx.fillStyle = '#14141c';
+                                    ctx.fillRect(0, 0, 720, 640);
+                                    ctx.fillStyle = '#888';
+                                    ctx.font = 'bold 22px sans-serif';
+                                    ctx.textAlign = 'center';
+                                    ctx.fillText('🐱 Video Kucing (Standby)', 360, 320);
+                                }}
+
+                                // 2. Draw Host Camera (Bottom 640..1280)
+                                if (camVid && camVid.readyState >= 2) {{
+                                    const cW = camVid.videoWidth || 720;
+                                    const cH = camVid.videoHeight || 640;
+                                    const scale = Math.max(720 / cW, 640 / cH);
+                                    const drawW = cW * scale;
+                                    const drawH = cH * scale;
+                                    const drawX = (720 - drawW) / 2;
+                                    const drawY = 640 + (640 - drawH) / 2;
+                                    ctx.save();
+                                    ctx.beginPath();
+                                    ctx.rect(0, 640, 720, 640);
+                                    ctx.clip();
+                                    if (dualIsMirror) {{
+                                        ctx.translate(720, 0);
+                                        ctx.scale(-1, 1);
+                                        ctx.drawImage(camVid, (720 - drawW) / 2, drawY, drawW, drawH);
+                                    }} else {{
+                                        ctx.drawImage(camVid, drawX, drawY, drawW, drawH);
+                                    }}
+                                    ctx.restore();
+                                }} else {{
+                                    ctx.fillStyle = '#0f0f15';
+                                    ctx.fillRect(0, 640, 720, 640);
+                                    ctx.fillStyle = '#71717a';
+                                    ctx.font = 'bold 20px sans-serif';
+                                    ctx.textAlign = 'center';
+                                    ctx.fillText('📷 Klik "Aktifkan Kamera & Mic"', 360, 960);
+                                }}
+
+                                // 3. Draw Center HUD Divider
+                                ctx.fillStyle = '#25f4ee';
+                                ctx.fillRect(0, 638, 720, 4);
+
+                                ctx.fillStyle = 'rgba(15, 15, 22, 0.88)';
+                                ctx.beginPath();
+                                ctx.roundRect(200, 620, 320, 40, 20);
+                                ctx.fill();
+                                ctx.strokeStyle = '#25f4ee';
+                                ctx.lineWidth = 2;
+                                ctx.stroke();
+
+                                ctx.fillStyle = '#25f4ee';
+                                ctx.font = 'bold 15px sans-serif';
+                                ctx.textAlign = 'center';
+                                ctx.fillText('🔴 LIVE HOST - REAL-TIME', 360, 645);
+
+                                ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+                                ctx.beginPath();
+                                ctx.roundRect(24, 24, 220, 36, 8);
+                                ctx.fill();
+                                ctx.fillStyle = '#34c759';
+                                ctx.font = 'bold 14px sans-serif';
+                                ctx.textAlign = 'left';
+                                ctx.fillText('🐱 SLOT ' + dualCurrentSlot + (dualCurrentSlot === 1 ? ' (STANDBY)' : ' (REAKSI)'), 38, 47);
+
+                                dualAnimFrame = requestAnimationFrame(draw);
+                            }}
+                            draw();
+                        }}
+
+                        async function toggleCamera() {{
+                            const btn = document.getElementById('btnToggleCam');
+                            const badge = document.getElementById('dualStatusBadge');
+                            const camVid = document.getElementById('dualCamVideo');
+                            const catVid = document.getElementById('dualCatVideo');
+
+                            if (dualMediaStream) {{
+                                dualMediaStream.getTracks().forEach(t => t.stop());
+                                dualMediaStream = null;
+                                if (camVid) camVid.srcObject = null;
+                                if (btn) {{
+                                    btn.innerHTML = '📷 Aktifkan Kamera & Mic';
+                                    btn.style.setProperty('--shimmer-color', '#34c759');
+                                    btn.style.setProperty('--bg', 'rgba(52, 199, 89, 0.15)');
+                                }}
+                                if (badge) {{
+                                    badge.innerText = '⚪ Standby (Kamera Nonaktif)';
+                                    badge.style.color = '#a1a1aa';
+                                    badge.style.borderColor = '#71717a';
+                                    badge.style.background = 'rgba(113, 113, 122, 0.2)';
+                                }}
+                                isDualScreenActive = false;
+                                return;
+                            }}
+
+                            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
+                                alert('Browser Anda memblokir akses media. Pastikan membuka dashboard via HTTPS (https://staging.apologets.com:8088).');
+                                return;
+                            }}
+
+                            try {{
+                                const camId = document.getElementById('cameraSourceSelect') ? document.getElementById('cameraSourceSelect').value : null;
+                                const micId = document.getElementById('micSourceSelect') ? document.getElementById('micSourceSelect').value : null;
+
+                                const constraints = {{
+                                    video: camId ? {{ deviceId: {{ exact: camId }}, width: {{ ideal: 720 }}, height: {{ ideal: 640 }} }} : {{ facingMode: 'user', width: {{ ideal: 720 }}, height: {{ ideal: 640 }} }},
+                                    audio: micId ? {{ deviceId: {{ exact: micId }} }} : true
+                                }};
+
+                                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                                dualMediaStream = stream;
+                                if (camVid) {{
+                                    camVid.srcObject = stream;
+                                    camVid.play().catch(e => console.warn(e));
+                                }}
+
+                                if (catVid) {{
+                                    catVid.src = '/video-stream?name=video_1.mp4';
+                                    catVid.loop = true;
+                                    catVid.muted = false;
+                                    catVid.play().catch(e => console.warn(e));
+                                }}
+
+                                setupDualAudioMixing(stream, catVid);
+
+                                if (btn) {{
+                                    btn.innerHTML = '🛑 Matikan Kamera & Mic';
+                                    btn.style.setProperty('--shimmer-color', '#ff3b30');
+                                    btn.style.setProperty('--bg', 'rgba(255, 59, 48, 0.2)');
+                                }}
+                                if (badge) {{
+                                    badge.innerText = '🟢 Preview Dual-Screen Aktif';
+                                    badge.style.color = '#34c759';
+                                    badge.style.borderColor = '#34c759';
+                                    badge.style.background = 'rgba(52, 199, 89, 0.2)';
+                                }}
+                                isDualScreenActive = true;
+                            }} catch (err) {{
+                                alert('Gagal mengakses kamera/mic: ' + err.message);
+                                console.error(err);
+                            }}
+                        }}
+
+                        function setupDualAudioMixing(micStream, catVid) {{
+                            try {{
+                                if (!dualAudioCtx) {{
+                                    dualAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                                }}
+                                if (dualAudioCtx.state === 'suspended') {{
+                                    dualAudioCtx.resume();
+                                }}
+                                dualAudioDest = dualAudioCtx.createMediaStreamDestination();
+
+                                if (micStream.getAudioTracks().length > 0) {{
+                                    const micSrc = dualAudioCtx.createMediaStreamSource(micStream);
+                                    dualMicGain = dualAudioCtx.createGain();
+                                    dualMicGain.gain.value = dualIsMicMuted ? 0 : 1.0;
+                                    micSrc.connect(dualMicGain);
+                                    dualMicGain.connect(dualAudioDest);
+
+                                    const analyser = dualAudioCtx.createAnalyser();
+                                    analyser.fftSize = 64;
+                                    micSrc.connect(analyser);
+                                    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+                                    function updateVu() {{
+                                        if (!dualMediaStream) return;
+                                        analyser.getByteFrequencyData(dataArray);
+                                        let sum = 0;
+                                        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                                        const avg = sum / dataArray.length;
+                                        const pct = Math.min(100, Math.round((avg / 128) * 100));
+                                        const bar = document.getElementById('dualVuLevel');
+                                        if (bar) bar.style.width = pct + '%';
+                                        requestAnimationFrame(updateVu);
+                                    }}
+                                    updateVu();
+                                }}
+
+                                if (catVid && !dualCatAudioSource) {{
+                                    try {{
+                                        dualCatAudioSource = dualAudioCtx.createMediaElementSource(catVid);
+                                        const catGain = dualAudioCtx.createGain();
+                                        catGain.gain.value = 1.0;
+                                        dualCatAudioSource.connect(catGain);
+                                        dualCatAudioSource.connect(dualAudioCtx.destination);
+                                        catGain.connect(dualAudioDest);
+                                    }} catch (e) {{
+                                        console.warn('AudioElementSource warning:', e);
+                                    }}
+                                }}
+                            }} catch (e) {{
+                                console.warn('Audio mixing setup warning:', e);
+                            }}
+                        }}
+
+                        function switchCameraDevice() {{
+                            if (dualMediaStream) {{
+                                toggleCamera().then(() => toggleCamera());
+                            }}
+                        }}
+
+                        function switchMicDevice() {{
+                            if (dualMediaStream) {{
+                                toggleCamera().then(() => toggleCamera());
+                            }}
+                        }}
+
+                        function toggleMirrorCam() {{
+                            dualIsMirror = !dualIsMirror;
+                            const btn = document.getElementById('btnToggleMirror');
+                            if (btn) btn.innerHTML = '🪞 Mirror Kamera: ' + (dualIsMirror ? 'ON' : 'OFF');
+                        }}
+
+                        function toggleMuteMic() {{
+                            dualIsMicMuted = !dualIsMicMuted;
+                            if (dualMicGain) {{
+                                dualMicGain.gain.value = dualIsMicMuted ? 0 : 1.0;
+                            }}
+                            const btn = document.getElementById('btnToggleMic');
+                            if (btn) {{
+                                btn.innerHTML = dualIsMicMuted ? '🔇 Mic: MUTE' : '🎙️ Mic: ON';
+                                btn.style.setProperty('--shimmer-color', dualIsMicMuted ? '#ff9500' : '#25f4ee');
+                            }}
+                        }}
+
+                        function triggerDualScreenSlot(slot, giftName) {{
+                            const catVid = document.getElementById('dualCatVideo');
+                            if (!catVid) return;
+                            dualCurrentSlot = slot;
+                            const badge = document.getElementById('dualCurrentSlotBadge');
+                            if (badge) {{
+                                badge.innerText = (slot === 1 ? '🐱 Slot 1 (Standby)' : '🎁 Slot ' + slot + ' (' + (giftName || 'Reaksi') + ')');
+                                badge.style.color = (slot === 1 ? '#34c759' : '#ffb800');
+                                badge.style.borderColor = (slot === 1 ? '#34c759' : '#ffb800');
+                            }}
+
+                            catVid.src = '/video-stream?name=video_' + slot + '.mp4';
+                            catVid.loop = (slot === 1);
+                            catVid.play().catch(e => console.warn(e));
+
+                            if (dualSlotTimeout) clearTimeout(dualSlotTimeout);
+
+                            if (slot !== 1) {{
+                                catVid.onended = function() {{
+                                    triggerDualScreenSlot(1, 'Standby Loop');
+                                }};
+                            }}
+                        }}
+
+                        function startDualStream() {{
+                            if (!isDualScreenActive || !dualMediaStream) {{
+                                alert('Harap aktifkan Kamera & Mic terlebih dahulu sebelum mulai push stream!');
+                                return;
+                            }}
+
+                            const canvas = document.getElementById('dualCompositeCanvas');
+                            if (!canvas) return;
+
+                            const stream = canvas.captureStream(30);
+                            if (dualAudioDest && dualAudioDest.stream.getAudioTracks().length > 0) {{
+                                stream.addTrack(dualAudioDest.stream.getAudioTracks()[0]);
+                            }}
+
+                            const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                            const wsUrl = proto + '//' + window.location.host + '/ws/stream';
+
+                            console.log('[DualStream] Menghubungkan ke WebSocket pipe:', wsUrl);
+                            dualStreamWs = new WebSocket(wsUrl);
+                            dualStreamWs.binaryType = 'arraybuffer';
+
+                            dualStreamWs.onopen = function() {{
+                                console.log('[DualStream] WebSocket terhubung! Memulai MediaRecorder 30 FPS...');
+                                let mime = 'video/webm;codecs=vp8,opus';
+                                if (!MediaRecorder.isTypeSupported(mime)) {{
+                                    mime = 'video/webm';
+                                }}
+                                try {{
+                                    dualMediaRecorder = new MediaRecorder(stream, {{
+                                        mimeType: mime,
+                                        videoBitsPerSecond: 1500000,
+                                        audioBitsPerSecond: 128000
+                                    }});
+                                }} catch (err) {{
+                                    dualMediaRecorder = new MediaRecorder(stream);
+                                }}
+
+                                dualMediaRecorder.ondataavailable = async function(e) {{
+                                    if (e.data && e.data.size > 0 && dualStreamWs && dualStreamWs.readyState === WebSocket.OPEN) {{
+                                        const buffer = await e.data.arrayBuffer();
+                                        dualStreamWs.send(buffer);
+                                    }}
+                                }};
+
+                                dualMediaRecorder.start(500);
+                                dualIsStreaming = true;
+
+                                const btnStart = document.getElementById('btnStartDualStream');
+                                const btnStop = document.getElementById('btnStopDualStream');
+                                if (btnStart) btnStart.style.display = 'none';
+                                if (btnStop) btnStop.style.display = 'inline-block';
+                                const badge = document.getElementById('dualStatusBadge');
+                                if (badge) {{
+                                    badge.innerText = '🔴 STREAMING TIKTOK (Dual-Screen Pipeline)';
+                                    badge.style.color = '#ff3b30';
+                                    badge.style.borderColor = '#ff3b30';
+                                    badge.style.background = 'rgba(255, 59, 48, 0.25)';
+                                    badge.style.boxShadow = '0 0 15px rgba(255, 59, 48, 0.5)';
+                                }}
+                            }};
+
+                            dualStreamWs.onclose = function() {{
+                                console.log('[DualStream] WebSocket pipe terputus.');
+                                stopDualStream();
+                            }};
+
+                            dualStreamWs.onerror = function(err) {{
+                                console.error('[DualStream] WebSocket error:', err);
+                                alert('Gagal menghubungkan WebSocket stream: ' + err);
+                                stopDualStream();
+                            }};
+                        }}
+
+                        function stopDualStream() {{
+                            dualIsStreaming = false;
+                            if (dualMediaRecorder && dualMediaRecorder.state !== 'inactive') {{
+                                try {{ dualMediaRecorder.stop(); }} catch (e) {{}}
+                            }}
+                            if (dualStreamWs) {{
+                                try {{ dualStreamWs.close(); }} catch (e) {{}}
+                                dualStreamWs = null;
+                            }}
+
+                            const btnStart = document.getElementById('btnStartDualStream');
+                            const btnStop = document.getElementById('btnStopDualStream');
+                            if (btnStart) btnStart.style.display = 'inline-block';
+                            if (btnStop) btnStop.style.display = 'none';
+
+                            const badge = document.getElementById('dualStatusBadge');
+                            if (badge) {{
+                                badge.innerText = isDualScreenActive ? '🟢 Preview Dual-Screen Aktif' : '⚪ Standby (Kamera Nonaktif)';
+                                badge.style.color = isDualScreenActive ? '#34c759' : '#a1a1aa';
+                                badge.style.borderColor = isDualScreenActive ? '#34c759' : '#71717a';
+                                badge.style.background = isDualScreenActive ? 'rgba(52, 199, 89, 0.2)' : 'rgba(113, 113, 122, 0.2)';
+                                badge.style.boxShadow = 'none';
+                            }}
+                        }}
+
+                        window.addEventListener('DOMContentLoaded', initDualScreenStudio);
                     </script>
                 </head>
                 <body>
@@ -2979,6 +3574,106 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             <form action="/stop-stream" method="POST" style="margin:0;">
                                 <button type="submit" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.15);">Stop Live (Matikan Stream)</button>
                             </form>
+                        </div>
+
+                        <!-- Panel Dual-Screen Live Camera + Interactive Cat Studio (Opsi A) -->
+                        <div class="shine-border-card" style="margin: 24px 0; border: 1px solid rgba(37, 244, 238, 0.4); background: #121218;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px;">
+                                <div>
+                                    <h3 style="margin: 0; color: #25f4ee; font-size: 18px; display: flex; align-items: center; gap: 8px;">
+                                        <span>🎥</span> Dual-Screen Live Studio (Host Camera + Video Kucing)
+                                    </h3>
+                                    <p style="color: #a1a1aa; font-size: 13px; margin: 4px 0 0 0;">
+                                        Kamera wajah & mic host digabungkan di layar bawah secara real-time. Video reaksi kucing diputar di layar atas (Rasio vertikal 9:16). Bebas lag & tanpa restart koneksi RTMP TikTok saat gift masuk.
+                                    </p>
+                                </div>
+                                <div style="display: flex; gap: 8px; align-items: center;">
+                                    <span id="dualStatusBadge" style="background: rgba(113, 113, 122, 0.2); color: #a1a1aa; border: 1px solid #71717a; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold;">
+                                        ⚪ Standby (Kamera Nonaktif)
+                                    </span>
+                                </div>
+                            </div>
+
+                            <!-- Hidden Video Elements for Compositing -->
+                            <video id="dualCatVideo" src="/video-stream?name=video_1.mp4" playsinline loop muted crossorigin="anonymous" style="display:none;"></video>
+                            <video id="dualCamVideo" playsinline autoplay muted style="display:none;"></video>
+
+                            <!-- Studio Grid: Left Preview Canvas (9:16), Right Controls -->
+                            <div style="display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; justify-content: center;">
+                                
+                                <!-- Live Preview Stage (9:16 Ratio) -->
+                                <div style="flex: 0 0 auto; width: 300px; height: 533px; background: #000; border-radius: 16px; border: 2px solid #27272a; position: relative; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.8), 0 0 20px rgba(37,244,238,0.15);">
+                                    <canvas id="dualCompositeCanvas" width="720" height="1280" style="width: 100%; height: 100%; object-fit: cover; display: block;"></canvas>
+                                    
+                                    <!-- Floating Mini HUD overlay -->
+                                    <div style="position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; align-items: center; pointer-events: none;">
+                                        <span id="dualCurrentSlotBadge" style="background: rgba(0,0,0,0.7); color: #34c759; border: 1px solid #34c759; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: bold;">
+                                            🐱 Slot 1 (Standby)
+                                        </span>
+                                    </div>
+                                    <div style="position: absolute; bottom: 12px; right: 12px; display: flex; align-items: center; gap: 6px; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 6px; border: 1px solid #333; pointer-events: none;">
+                                        <span style="font-size: 11px; color: #25f4ee;">🎙️</span>
+                                        <div id="dualVuBar" style="width: 40px; height: 6px; background: #222; border-radius: 3px; overflow: hidden;">
+                                            <div id="dualVuLevel" style="width: 0%; height: 100%; background: #34c759; transition: width 0.08s ease;"></div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Controls Column -->
+                                <div style="flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 14px;">
+                                    
+                                    <!-- Device Selectors -->
+                                    <div style="background: #181820; padding: 14px; border-radius: 10px; border: 1px solid #27272a;">
+                                        <h4 style="margin: 0 0 10px 0; font-size: 14px; color: #fff;">⚙️ Pengaturan Perangkat Host</h4>
+                                        
+                                        <label style="display: block; font-size: 12px; color: #a1a1aa; margin-bottom: 4px;">Pilihan Kamera:</label>
+                                        <select id="cameraSourceSelect" onchange="switchCameraDevice()" style="width: 100%; padding: 8px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 13px; margin-bottom: 10px;">
+                                            <option value="">Pilih Kamera...</option>
+                                        </select>
+
+                                        <label style="display: block; font-size: 12px; color: #a1a1aa; margin-bottom: 4px;">Pilihan Mikrofon:</label>
+                                        <select id="micSourceSelect" onchange="switchMicDevice()" style="width: 100%; padding: 8px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 13px;">
+                                            <option value="">Pilih Mikrofon...</option>
+                                        </select>
+                                    </div>
+
+                                    <!-- Action Buttons -->
+                                    <div style="display: flex; flex-direction: column; gap: 10px;">
+                                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                            <button type="button" id="btnToggleCam" onclick="toggleCamera()" class="shimmer-btn" style="--shimmer-color: #34c759; --bg: rgba(52, 199, 89, 0.15); flex: 1; min-width: 140px; padding: 10px 14px; font-weight: bold;">
+                                                📷 Aktifkan Kamera & Mic
+                                            </button>
+                                            <button type="button" id="btnToggleMirror" onclick="toggleMirrorCam()" class="shimmer-btn" style="--shimmer-color: #a07cfe; --bg: rgba(160, 124, 254, 0.15); padding: 10px 14px;">
+                                                🪞 Mirror Kamera: ON
+                                            </button>
+                                            <button type="button" id="btnToggleMic" onclick="toggleMuteMic()" class="shimmer-btn" style="--shimmer-color: #25f4ee; --bg: rgba(37, 244, 238, 0.15); padding: 10px 14px;">
+                                                🎙️ Mic: ON
+                                            </button>
+                                        </div>
+
+                                        <!-- TikTok Live Streaming Actions -->
+                                        <div style="background: rgba(37, 244, 238, 0.05); padding: 14px; border-radius: 10px; border: 1px solid rgba(37, 244, 238, 0.2); margin-top: 6px;">
+                                            <div style="font-size: 13px; font-weight: bold; color: #25f4ee; margin-bottom: 6px;">🚀 Push Dual-Screen Langsung ke TikTok Live</div>
+                                            <p style="font-size: 12px; color: #aaa; margin: 0 0 10px 0;">
+                                                Kamera + Audio host & Video Kucing dikirim secara kontinu via WebSocket ke server FFmpeg dan di-push ke RTMPS TikTok.
+                                            </p>
+                                            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                                <button type="button" id="btnStartDualStream" onclick="startDualStream()" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.18); flex: 1; font-weight: bold; padding: 12px 18px;">
+                                                    🔴 Mulai Push Dual-Screen ke TikTok
+                                                </button>
+                                                <button type="button" id="btnStopDualStream" onclick="stopDualStream()" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.18); padding: 12px 18px; display: none;">
+                                                    ⏹️ Stop Push Dual-Screen
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <!-- HTTPS Guidance Info -->
+                                        <div style="font-size: 11px; color: #71717a; line-height: 1.5; padding: 8px 10px; background: #121214; border-radius: 6px; border: 1px solid #222;">
+                                            💡 <b>Akses Kamera Aman:</b> Dashboard ini dilindungi SSL/HTTPS pada port 8088 (<code style="color:#25f4ee;">https://staging.apologets.com:8088</code>). Akses kamera & mic diizinkan penuh oleh browser HP dan Laptop.
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- Panel Simulasi Gift Event Interaktif -->
@@ -3959,6 +4654,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 if __name__ == '__main__':
+    start_websocket_server()
     with ThreadingHTTPServer(("", PORT), DashboardHandler) as httpd:
-        print(f"[TikTok Lightweight Dashboard] Running on http://0.0.0.0:{PORT}")
+        print(f"[TikTok Lightweight Dashboard] Running on http://0.0.0.0:{PORT} (WS on {WS_PORT})")
         httpd.serve_forever()

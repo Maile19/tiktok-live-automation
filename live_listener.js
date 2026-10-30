@@ -7,7 +7,7 @@ const BASE_DIR = __dirname;
 const ACCOUNT_CONFIG_FILE = path.join(BASE_DIR, 'account_config.json');
 const COOKIES_FILE = path.join(BASE_DIR, 'cookies.json');
 const VPN_CONFIG_FILE = path.join(BASE_DIR, 'vpn_config.json');
-const DASHBOARD_PORT = process.env.DASHBOARD_PORT || 8088;
+const DASHBOARD_PORT = process.env.DASHBOARD_PORT || 8089;
 
 function isAutoVpnActive() {
   try {

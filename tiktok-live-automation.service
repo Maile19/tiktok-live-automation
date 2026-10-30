@@ -11,7 +11,8 @@ Restart=always
 RestartSec=3s
 KillMode=mixed
 TimeoutStopSec=10
-Environment=PORT=8088
+Environment=PORT=8089
+Environment=DASHBOARD_PORT=8089
 StandardOutput=journal
 StandardError=journal
 
