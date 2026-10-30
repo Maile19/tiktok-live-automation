@@ -40,7 +40,7 @@ GUIDE_OVERLAY_FILE = os.path.join(OVERLAYS_DIR, "guide_overlay.png")
 FFMPEG_LOG_FILE = os.path.join(BASE_DIR, "ffmpeg_stream.log")
 STREAM_META_FILE = os.path.join(BASE_DIR, "stream_metadata.json")
 LIVE_LISTENER_LOG_FILE = os.path.join(BASE_DIR, "live_listener.log")
-MAX_FFMPEG_LOG_SIZE = 20 * 1024 * 1024  # 20 MB
+MAX_FFMPEG_LOG_SIZE = 5 * 1024 * 1024  # 5 MB
 
 VPN_DIR = os.path.join(BASE_DIR, "vpn")
 VPN_CONFIG_FILE = os.path.join(BASE_DIR, "vpn_config.json")
@@ -654,6 +654,8 @@ listener_status = {
 gift_queue = collections.deque(maxlen=15)
 queue_lock = threading.RLock()
 recent_gift_logs = collections.deque(maxlen=10)
+global_gift_seq = 0
+latest_gift_event = None
 
 def load_stream_metadata():
     global stream_metadata
@@ -1662,16 +1664,18 @@ def handle_incoming_gift(gift_name, gift_id, sender_name, repeat_count=1):
     - Jika Slot 2 sedang berjalan dan penonton mengirim gift pemicu Slot 3, masukkan Slot 3 ke antrean.
     - Jika sedang Standby (Slot 1), langsung putar slot reaksi.
     """
-    global gift_queue, recent_gift_logs
+    global gift_queue, recent_gift_logs, global_gift_seq, latest_gift_event
     
     target_slot = match_gift_to_slot(gift_name, gift_id)
     if not target_slot:
         print(f"[GiftListener] Gift diterima: '{gift_name}' (ID: {gift_id}) dari {sender_name}, tidak ada mapping Slot 2-6.")
         return {"matched": False, "reason": "No slot mapping found"}
 
-    event_id = f"{int(time.time()*1000)}_{target_slot}"
+    global_gift_seq += 1
+    event_id = f"{int(time.time()*1000)}_{target_slot}_{global_gift_seq}"
     gift_info = {
         "id": event_id,
+        "seq": global_gift_seq,
         "time": time.strftime("%H:%M:%S"),
         "sender": sender_name or "Penonton",
         "giftName": gift_name,
@@ -1681,6 +1685,7 @@ def handle_incoming_gift(gift_name, gift_id, sender_name, repeat_count=1):
         "slotName": f"Slot {target_slot}",
         "status": "Dalam Antrean"
     }
+    latest_gift_event = gift_info
 
     should_play_slot = None
     is_reaction_playing = False
@@ -1952,6 +1957,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             if "auth_token" in c and c["auth_token"].value == "verified_191919":
                 return True
         return False
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Range, Authorization")
+        self.end_headers()
 
     def do_HEAD(self):
         self.do_GET(head_only=True)
@@ -2948,6 +2960,15 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                             container.innerHTML = html;
                                         }}
                                     }}
+                                    if (typeof queueDualScreenSlot === 'function' && isDualScreenActive && data) {{
+                                        if (data.gift_seq && data.gift_seq > lastProcessedGiftSeq) {{
+                                            lastProcessedGiftSeq = data.gift_seq;
+                                            if (data.latest_gift && data.latest_gift.slot) {{
+                                                const g = data.latest_gift;
+                                                queueDualScreenSlot(g.slot, g.giftName, g.sender);
+                                            }}
+                                        }}
+                                    }}
                                 }})
                                 .catch(() => {{}});
                         }}
@@ -3026,7 +3047,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}
 
                                 if (data.success) {{
-                                    if (typeof triggerDualScreenSlot === 'function') triggerDualScreenSlot(slot, data.giftName);
+                                    if (typeof queueDualScreenSlot === 'function') queueDualScreenSlot(slot, data.giftName, 'Simulasi');
                                     showSimStatus(data.message || ('Simulasi Slot ' + slot + ' diterima!'), true, data.queued);
                                 }} else {{
                                     showSimStatus(data.message || 'Gagal memicu simulasi', false, false);
@@ -3071,7 +3092,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         btn.style.borderColor = '';
                                     }}, 2500);
                                 }}
-                                if (typeof triggerDualScreenSlot === 'function') triggerDualScreenSlot(1, 'Standby Loop');
+                                if (typeof queueDualScreenSlot === 'function') queueDualScreenSlot(1, 'Standby Loop', '');
                                 showSimStatus('Antrean dikosongkan. Kembali ke Standby Loop (Slot 1).', true, false);
                                 if (typeof syncListenerStatus === 'function') syncListenerStatus();
                             }})
@@ -3087,7 +3108,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 showSimStatus('Gagal reset: ' + err, false, false);
                             }});
                         }}
-                        setInterval(syncListenerStatus, 3000);
+                        setInterval(syncListenerStatus, 1000);
 
                         // --- Dual-Screen Live Studio (Client-Side Canvas Compositing - Opsi A) ---
                         let isDualScreenActive = false;
@@ -3104,7 +3125,75 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         let dualIsMirror = true;
                         let dualIsMicMuted = false;
                         let dualAnimFrame = null;
-                        let dualSlotTimeout = null;
+                        let dualGiftQueue = [];
+                        let dualIsReactionPlaying = false;
+                        let lastProcessedGiftSeq = 0;
+                        let dualActiveToast = null;
+                        let dualToastTimeout = null;
+
+                        function showCanvasToast(msg) {{
+                            dualActiveToast = msg;
+                            if (dualToastTimeout) clearTimeout(dualToastTimeout);
+                            dualToastTimeout = setTimeout(() => {{
+                                dualActiveToast = null;
+                            }}, 4000);
+                        }}
+
+                        function queueDualScreenSlot(slot, giftName, sender) {{
+                            if (!slot) return;
+                            if (slot === 1) {{
+                                dualGiftQueue = [];
+                                dualIsReactionPlaying = false;
+                                playSlotImmediate(1, 'Standby Loop');
+                                return;
+                            }}
+                            dualGiftQueue.push({{
+                                slot: slot,
+                                giftName: giftName || ('Gift Slot ' + slot),
+                                sender: sender || 'Penonton'
+                            }});
+                            showCanvasToast('🎁 Gift: ' + (giftName || 'Slot ' + slot) + (sender ? ' (@' + sender + ')' : ''));
+                            processDualScreenQueue();
+                        }}
+
+                        function processDualScreenQueue() {{
+                            if (!isDualScreenActive) return;
+                            if (dualIsReactionPlaying) return;
+                            
+                            if (dualGiftQueue.length > 0) {{
+                                const nextItem = dualGiftQueue.shift();
+                                dualIsReactionPlaying = true;
+                                playSlotImmediate(nextItem.slot, nextItem.giftName);
+                            }} else {{
+                                dualIsReactionPlaying = false;
+                                if (dualCurrentSlot !== 1) {{
+                                    playSlotImmediate(1, 'Standby Loop');
+                                }}
+                            }}
+                        }}
+
+                        function playSlotImmediate(slot, giftName) {{
+                            const catVid = document.getElementById('dualCatVideo');
+                            if (!catVid) return;
+                            dualCurrentSlot = slot;
+                            const badge = document.getElementById('dualCurrentSlotBadge');
+                            if (badge) {{
+                                badge.innerText = (slot === 1 ? '🐱 Slot 1 (Standby)' : '🎁 Slot ' + slot + ' (' + (giftName || 'Reaksi') + ')');
+                                badge.style.color = (slot === 1 ? '#34c759' : '#ffb800');
+                                badge.style.borderColor = (slot === 1 ? '#34c759' : '#ffb800');
+                            }}
+
+                            catVid.src = '/video-stream?name=video_' + slot + '.mp4';
+                            catVid.loop = (slot === 1);
+                            catVid.play().catch(e => console.warn('Cat video play error:', e));
+
+                            catVid.onended = function() {{
+                                if (slot !== 1) {{
+                                    dualIsReactionPlaying = false;
+                                    processDualScreenQueue();
+                                }}
+                            }};
+                        }}
 
                         function initDualScreenStudio() {{
                             const canvas = document.getElementById('dualCompositeCanvas');
@@ -3114,7 +3203,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 navigator.mediaDevices.enumerateDevices().then(devices => {{
                                     const camSelect = document.getElementById('cameraSourceSelect');
                                     const micSelect = document.getElementById('micSourceSelect');
-                                    if (camSelect) camSelect.innerHTML = '<option value="">Default Kamera</option>';
+                                    if (camSelect) camSelect.innerHTML = '<option value="">Default Kamera Depan</option>';
                                     if (micSelect) micSelect.innerHTML = '<option value="">Default Mikrofon</option>';
                                     let camCount = 0;
                                     let micCount = 0;
@@ -3147,10 +3236,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             const camVid = document.getElementById('dualCamVideo');
 
                             function draw() {{
+                                // Base Background
                                 ctx.fillStyle = '#0a0a0f';
                                 ctx.fillRect(0, 0, 720, 1280);
 
-                                // 1. Draw Cat Video (Top 0..640)
+                                // 1. Render Cat Video (Top 720x640)
                                 if (catVid && catVid.readyState >= 2) {{
                                     const vW = catVid.videoWidth || 720;
                                     const vH = catVid.videoHeight || 640;
@@ -3174,7 +3264,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ctx.fillText('🐱 Video Kucing (Standby)', 360, 320);
                                 }}
 
-                                // 2. Draw Host Camera (Bottom 640..1280)
+                                // 2. Render Host Camera (Bottom 720x640)
                                 if (camVid && camVid.readyState >= 2) {{
                                     const cW = camVid.videoWidth || 720;
                                     const cH = camVid.videoHeight || 640;
@@ -3204,31 +3294,74 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ctx.fillText('📷 Klik "Aktifkan Kamera & Mic"', 360, 960);
                                 }}
 
-                                // 3. Draw Center HUD Divider
-                                ctx.fillStyle = '#25f4ee';
+                                // 3. Glowing Neon Accent Divider Bar
+                                ctx.save();
+                                const neonGrad = ctx.createLinearGradient(0, 640, 720, 640);
+                                neonGrad.addColorStop(0, '#25f4ee');
+                                neonGrad.addColorStop(0.5, '#00f2fe');
+                                neonGrad.addColorStop(1, '#fe2c55');
+                                ctx.fillStyle = neonGrad;
+                                ctx.shadowColor = '#25f4ee';
+                                ctx.shadowBlur = 12;
                                 ctx.fillRect(0, 638, 720, 4);
+                                ctx.restore();
 
-                                ctx.fillStyle = 'rgba(15, 15, 22, 0.88)';
+                                // Center HUD Pill Badge
+                                ctx.save();
+                                ctx.fillStyle = 'rgba(12, 12, 18, 0.9)';
                                 ctx.beginPath();
-                                ctx.roundRect(200, 620, 320, 40, 20);
+                                ctx.roundRect(210, 618, 300, 44, 22);
                                 ctx.fill();
                                 ctx.strokeStyle = '#25f4ee';
                                 ctx.lineWidth = 2;
+                                ctx.shadowColor = '#25f4ee';
+                                ctx.shadowBlur = 8;
                                 ctx.stroke();
 
-                                ctx.fillStyle = '#25f4ee';
-                                ctx.font = 'bold 15px sans-serif';
-                                ctx.textAlign = 'center';
-                                ctx.fillText('🔴 LIVE HOST - REAL-TIME', 360, 645);
-
-                                ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+                                ctx.fillStyle = '#fe2c55';
                                 ctx.beginPath();
-                                ctx.roundRect(24, 24, 220, 36, 8);
+                                ctx.arc(245, 640, 6, 0, Math.PI * 2);
                                 ctx.fill();
-                                ctx.fillStyle = '#34c759';
+
+                                ctx.fillStyle = '#fff';
+                                ctx.font = 'bold 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                                ctx.textAlign = 'center';
+                                ctx.fillText('LIVE HOST VERIFIED', 370, 646);
+                                ctx.restore();
+
+                                // Slot Watermark Badge on Top-Left
+                                ctx.save();
+                                ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+                                ctx.beginPath();
+                                ctx.roundRect(24, 24, 240, 38, 10);
+                                ctx.fill();
+                                ctx.strokeStyle = (dualCurrentSlot === 1 ? '#34c759' : '#fe2c55');
+                                ctx.lineWidth = 1.5;
+                                ctx.stroke();
+                                ctx.fillStyle = (dualCurrentSlot === 1 ? '#34c759' : '#fe2c55');
                                 ctx.font = 'bold 14px sans-serif';
                                 ctx.textAlign = 'left';
-                                ctx.fillText('🐱 SLOT ' + dualCurrentSlot + (dualCurrentSlot === 1 ? ' (STANDBY)' : ' (REAKSI)'), 38, 47);
+                                ctx.fillText(dualCurrentSlot === 1 ? '🐱 STANDBY (SLOT 1)' : '🎁 REAKSI (SLOT ' + dualCurrentSlot + ')', 38, 48);
+                                ctx.restore();
+
+                                // Live Floating Toast Notification (If Gift Arrives)
+                                if (dualActiveToast) {{
+                                    ctx.save();
+                                    ctx.fillStyle = 'rgba(15, 15, 24, 0.9)';
+                                    ctx.beginPath();
+                                    ctx.roundRect(30, 560, 660, 50, 14);
+                                    ctx.fill();
+                                    ctx.strokeStyle = '#fe2c55';
+                                    ctx.lineWidth = 2;
+                                    ctx.shadowColor = '#fe2c55';
+                                    ctx.shadowBlur = 10;
+                                    ctx.stroke();
+                                    ctx.fillStyle = '#25f4ee';
+                                    ctx.font = 'bold 17px -apple-system, BlinkMacSystemFont, sans-serif';
+                                    ctx.textAlign = 'center';
+                                    ctx.fillText(dualActiveToast, 360, 592);
+                                    ctx.restore();
+                                }}
 
                                 dualAnimFrame = requestAnimationFrame(draw);
                             }}
@@ -3282,6 +3415,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}
 
                                 if (catVid) {{
+                                    catVid.crossOrigin = "anonymous";
                                     catVid.src = '/video-stream?name=video_1.mp4';
                                     catVid.loop = true;
                                     catVid.muted = false;
@@ -3387,30 +3521,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             if (btn) {{
                                 btn.innerHTML = dualIsMicMuted ? '🔇 Mic: MUTE' : '🎙️ Mic: ON';
                                 btn.style.setProperty('--shimmer-color', dualIsMicMuted ? '#ff9500' : '#25f4ee');
-                            }}
-                        }}
-
-                        function triggerDualScreenSlot(slot, giftName) {{
-                            const catVid = document.getElementById('dualCatVideo');
-                            if (!catVid) return;
-                            dualCurrentSlot = slot;
-                            const badge = document.getElementById('dualCurrentSlotBadge');
-                            if (badge) {{
-                                badge.innerText = (slot === 1 ? '🐱 Slot 1 (Standby)' : '🎁 Slot ' + slot + ' (' + (giftName || 'Reaksi') + ')');
-                                badge.style.color = (slot === 1 ? '#34c759' : '#ffb800');
-                                badge.style.borderColor = (slot === 1 ? '#34c759' : '#ffb800');
-                            }}
-
-                            catVid.src = '/video-stream?name=video_' + slot + '.mp4';
-                            catVid.loop = (slot === 1);
-                            catVid.play().catch(e => console.warn(e));
-
-                            if (dualSlotTimeout) clearTimeout(dualSlotTimeout);
-
-                            if (slot !== 1) {{
-                                catVid.onended = function() {{
-                                    triggerDualScreenSlot(1, 'Standby Loop');
-                                }};
                             }}
                         }}
 
@@ -3873,6 +3983,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
                 self.send_header('Content-Length', str(content_length))
                 self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
                 self.end_headers()
                 
                 if head_only:
@@ -3897,6 +4009,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header('Content-Type', mime)
                 self.send_header('Content-Length', str(file_size))
                 self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
                 self.end_headers()
                 
                 if head_only:
@@ -3986,6 +4100,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         elif parsed_url.path == '/health':
             self.send_response(200)
             self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             status_data = {
                 "status": "ok",
@@ -3997,6 +4112,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         elif parsed_url.path == '/api/listener-status':
             self.send_response(200)
             self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             with queue_lock:
                 q_len = len(gift_queue)
@@ -4021,6 +4137,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "queue_length": q_len,
                 "streamingActive": get_ffmpeg_pid() is not None,
                 "currentSlot": stream_metadata.get("currentSlot", 1),
+                "latest_gift": latest_gift_event,
+                "gift_seq": global_gift_seq,
                 "recent_gifts": recent_list,
                 "account": {
                     "username": account_cfg.get("username", ""),
@@ -4076,6 +4194,27 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'{"error": "Forbidden: local access only"}')
                 return
+
+        if parsed_url.path in ('/api/tikfinity-gift', '/api/webhook/gift'):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            try:
+                data = json.loads(body)
+            except Exception:
+                data = {}
+            event_data = data.get("data") if isinstance(data.get("data"), dict) else data
+            gname = event_data.get("gift_name") or event_data.get("giftName") or event_data.get("gift") or ""
+            gid = str(event_data.get("gift_id") or event_data.get("giftId") or "")
+            sender = event_data.get("name") or event_data.get("nickname") or event_data.get("uniqueId") or "Penonton"
+            rcount = int(event_data.get("repeat_count") or event_data.get("repeatCount") or event_data.get("count") or 1)
+            
+            res = handle_incoming_gift(gname, gid, sender, rcount)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True, "result": res}).encode('utf-8'))
+            return
 
         if parsed_url.path == '/api/live-gift':
             content_length = int(self.headers.get('Content-Length', 0))
@@ -4620,6 +4759,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
             self.send_response(200)
             self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(resp_data).encode('utf-8'))
 
