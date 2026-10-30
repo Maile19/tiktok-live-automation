@@ -1,0 +1,65 @@
+{
+  "overlay_enabled": true,
+  "position": {
+    "x": 60,
+    "y": 120
+  },
+  "characters": {
+    "1": {
+      "name": "Karakter 1 (Kucing Kribo)",
+      "avatar": "uploads/avatars/char_1.png"
+    },
+    "2": {
+      "name": "Karakter 2",
+      "avatar": "uploads/avatars/char_2.png"
+    },
+    "3": {
+      "name": "Karakter 3",
+      "avatar": "uploads/avatars/char_3.png"
+    },
+    "4": {
+      "name": "Karakter 4",
+      "avatar": "uploads/avatars/char_4.png"
+    }
+  },
+  "mappings": [
+    {
+      "slot": 2,
+      "gift_id": "rose",
+      "character_ids": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ]
+    },
+    {
+      "slot": 3,
+      "gift_id": "ice_cream",
+      "character_ids": [
+        "1"
+      ]
+    },
+    {
+      "slot": 4,
+      "gift_id": "doughnut",
+      "character_ids": [
+        "2"
+      ]
+    },
+    {
+      "slot": 5,
+      "gift_id": "cap",
+      "character_ids": [
+        "3"
+      ]
+    },
+    {
+      "slot": 6,
+      "gift_id": "confetti",
+      "character_ids": [
+        "4"
+      ]
+    }
+  ]
+}

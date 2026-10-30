@@ -12,6 +12,7 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "obs-websocket-js": "^5.0.6",
+    "socks-proxy-agent": "^10.1.0",
     "tiktok-live-connector": "^2.5.0",
     "ws": "^8.16.0"
   },

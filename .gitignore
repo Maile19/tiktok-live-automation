@@ -3,3 +3,21 @@ dist/
 .env
 *.log
 .DS_Store
+
+# Temporary & backup files
+*.bak*
+*.audit_backup
+__pycache__/
+*.pyc
+
+# Runtime metadata & credentials
+cookies.json
+stream_metadata.json
+vpn/
+vpn_config.json
+video_metadata.json
+
+# Uploads & media
+uploads/
+*.mp4
+*.webm
