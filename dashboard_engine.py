@@ -1315,16 +1315,21 @@ def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
         "-f", "matroska",
         "-i", "pipe:0",
         "-c:v", "libx264",
-        "-preset", "ultrafast",
+        "-preset", "veryfast",
         "-tune", "zerolatency",
-        "-b:v", "1500k",
-        "-maxrate", "1500k",
-        "-bufsize", "3000k",
+        "-b:v", "3000k",
+        "-maxrate", "3500k",
+        "-bufsize", "6000k",
         "-pix_fmt", "yuv420p",
+        "-r", "30",
+        "-fps_mode", "cfr",
         "-g", "60",
+        "-keyint_min", "60",
+        "-sc_threshold", "0",
         "-c:a", "aac",
         "-b:a", "128k",
         "-ar", "44100",
+        "-flvflags", "no_duration_filesize",
         "-f", "flv",
         destination
     ]
@@ -3223,6 +3228,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         let dualActiveToast = null;
                         let dualToastTimeout = null;
                         let dualReactionTimer = null;
+                        let dualCatFitMode = 'fit';
+                        let dualCamFitMode = 'fill';
+                        let dualTickWorker = null;
 
                         function showCanvasToast(msg) {{
                             dualActiveToast = msg;
@@ -3374,6 +3382,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             const catVid = document.getElementById('dualCatVideo');
                             const camVid = document.getElementById('dualCamVideo');
 
+                            // High-quality image smoothing to eliminate downscale blur
+                            ctx.imageSmoothingEnabled = true;
+                            ctx.imageSmoothingQuality = 'high';
+
                             function draw() {{
                                 // Base Background
                                 ctx.fillStyle = '#0a0a0f';
@@ -3383,16 +3395,49 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 if (catVid && catVid.readyState >= 2) {{
                                     const vW = catVid.videoWidth || 720;
                                     const vH = catVid.videoHeight || 640;
-                                    const scale = Math.max(720 / vW, 640 / vH);
-                                    const drawW = vW * scale;
-                                    const drawH = vH * scale;
-                                    const drawX = (720 - drawW) / 2;
-                                    const drawY = (640 - drawH) / 2;
                                     ctx.save();
                                     ctx.beginPath();
                                     ctx.rect(0, 0, 720, 640);
                                     ctx.clip();
-                                    ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
+
+                                    if (dualCatFitMode === 'fit') {{
+                                        // Ambient backdrop: stretched & dimmed to prevent black bars without zoom
+                                        const bgScale = Math.max(720 / vW, 640 / vH);
+                                        const bgW = vW * bgScale;
+                                        const bgH = vH * bgScale;
+                                        const bgX = (720 - bgW) / 2;
+                                        const bgY = (640 - bgH) / 2;
+                                        ctx.globalAlpha = 0.25;
+                                        ctx.drawImage(catVid, bgX, bgY, bgW, bgH);
+                                        ctx.globalAlpha = 1.0;
+
+                                        // Dark gradient vignette on flanks
+                                        const vigGrad = ctx.createLinearGradient(0, 0, 720, 0);
+                                        vigGrad.addColorStop(0, 'rgba(10, 10, 15, 0.9)');
+                                        vigGrad.addColorStop(0.22, 'rgba(10, 10, 15, 0.15)');
+                                        vigGrad.addColorStop(0.78, 'rgba(10, 10, 15, 0.15)');
+                                        vigGrad.addColorStop(1, 'rgba(10, 10, 15, 0.9)');
+                                        ctx.fillStyle = vigGrad;
+                                        ctx.fillRect(0, 0, 720, 640);
+
+                                        // Center uncropped video (Full vertical 9:16 preserved)
+                                        const fitScale = Math.min(720 / vW, 640 / vH);
+                                        const drawW = vW * fitScale;
+                                        const drawH = vH * fitScale;
+                                        const drawX = (720 - drawW) / 2;
+                                        const drawY = (640 - drawH) / 2;
+                                        ctx.shadowColor = 'rgba(0, 0, 0, 0.75)';
+                                        ctx.shadowBlur = 18;
+                                        ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
+                                    }} else {{
+                                        // Fill / Cover mode (Zoomed to full box)
+                                        const fillScale = Math.max(720 / vW, 640 / vH);
+                                        const drawW = vW * fillScale;
+                                        const drawH = vH * fillScale;
+                                        const drawX = (720 - drawW) / 2;
+                                        const drawY = (640 - drawH) / 2;
+                                        ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
+                                    }}
                                     ctx.restore();
                                 }} else {{
                                     ctx.fillStyle = '#14141c';
@@ -3407,21 +3452,67 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 if (camVid && camVid.readyState >= 2) {{
                                     const cW = camVid.videoWidth || 720;
                                     const cH = camVid.videoHeight || 640;
-                                    const scale = Math.max(720 / cW, 640 / cH);
-                                    const drawW = cW * scale;
-                                    const drawH = cH * scale;
-                                    const drawX = (720 - drawW) / 2;
-                                    const drawY = 640 + (640 - drawH) / 2;
                                     ctx.save();
                                     ctx.beginPath();
                                     ctx.rect(0, 640, 720, 640);
                                     ctx.clip();
-                                    if (dualIsMirror) {{
-                                        ctx.translate(720, 0);
-                                        ctx.scale(-1, 1);
-                                        ctx.drawImage(camVid, (720 - drawW) / 2, drawY, drawW, drawH);
+
+                                    if (dualCamFitMode === 'fit') {{
+                                        // Ambient backdrop
+                                        const bgScale = Math.max(720 / cW, 640 / cH);
+                                        const bgW = cW * bgScale;
+                                        const bgH = cH * bgScale;
+                                        const bgX = (720 - bgW) / 2;
+                                        const bgY = 640 + (640 - bgH) / 2;
+                                        ctx.globalAlpha = 0.25;
+                                        if (dualIsMirror) {{
+                                            ctx.translate(720, 0);
+                                            ctx.scale(-1, 1);
+                                            ctx.drawImage(camVid, (720 - bgW) / 2, bgY, bgW, bgH);
+                                            ctx.setTransform(1, 0, 0, 1, 0, 0);
+                                        }} else {{
+                                            ctx.drawImage(camVid, bgX, bgY, bgW, bgH);
+                                        }}
+                                        ctx.globalAlpha = 1.0;
+
+                                        const vigGrad = ctx.createLinearGradient(0, 640, 720, 640);
+                                        vigGrad.addColorStop(0, 'rgba(10, 10, 15, 0.9)');
+                                        vigGrad.addColorStop(0.22, 'rgba(10, 10, 15, 0.15)');
+                                        vigGrad.addColorStop(0.78, 'rgba(10, 10, 15, 0.15)');
+                                        vigGrad.addColorStop(1, 'rgba(10, 10, 15, 0.9)');
+                                        ctx.fillStyle = vigGrad;
+                                        ctx.fillRect(0, 640, 720, 640);
+
+                                        const fitScale = Math.min(720 / cW, 640 / cH);
+                                        const drawW = cW * fitScale;
+                                        const drawH = cH * fitScale;
+                                        const drawX = (720 - drawW) / 2;
+                                        const drawY = 640 + (640 - drawH) / 2;
+
+                                        ctx.shadowColor = 'rgba(0, 0, 0, 0.75)';
+                                        ctx.shadowBlur = 18;
+                                        if (dualIsMirror) {{
+                                            ctx.translate(720, 0);
+                                            ctx.scale(-1, 1);
+                                            ctx.drawImage(camVid, (720 - drawW) / 2, drawY, drawW, drawH);
+                                        }} else {{
+                                            ctx.drawImage(camVid, drawX, drawY, drawW, drawH);
+                                        }}
                                     }} else {{
-                                        ctx.drawImage(camVid, drawX, drawY, drawW, drawH);
+                                        // Fill / Cover mode
+                                        const fillScale = Math.max(720 / cW, 640 / cH);
+                                        const drawW = cW * fillScale;
+                                        const drawH = cH * fillScale;
+                                        const drawX = (720 - drawW) / 2;
+                                        const drawY = 640 + (640 - drawH) / 2;
+
+                                        if (dualIsMirror) {{
+                                            ctx.translate(720, 0);
+                                            ctx.scale(-1, 1);
+                                            ctx.drawImage(camVid, (720 - drawW) / 2, drawY, drawW, drawH);
+                                        }} else {{
+                                            ctx.drawImage(camVid, drawX, drawY, drawW, drawH);
+                                        }}
                                     }}
                                     ctx.restore();
                                 }} else {{
@@ -3501,10 +3592,50 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ctx.fillText(dualActiveToast, 360, 592);
                                     ctx.restore();
                                 }}
-
-                                dualAnimFrame = requestAnimationFrame(draw);
                             }}
-                            draw();
+
+                            // Anti-throttling 30 FPS timing engine (unaffected by background tab or focus loss)
+                            let lastFrameTime = 0;
+                            const targetIntervalMs = 1000 / 30; // ~33.33ms
+
+                            function frameTick() {{
+                                const now = performance.now();
+                                if (now - lastFrameTime >= targetIntervalMs - 2) {{
+                                    lastFrameTime = now;
+                                    draw();
+                                }}
+                            }}
+
+                            try {{
+                                if (!dualTickWorker) {{
+                                    const workerBlob = new Blob([
+                                        'let timer = null;' +
+                                        'self.onmessage = function(e) {{' +
+                                        '  if (e.data === "start") {{' +
+                                        '    if (!timer) timer = setInterval(function() {{ self.postMessage("tick"); }}, 33);' +
+                                        '  }} else if (e.data === "stop") {{' +
+                                        '    if (timer) {{ clearInterval(timer); timer = null; }}' +
+                                        '  }}' +
+                                        '}};'
+                                    ], {{ type: 'application/javascript' }});
+                                    dualTickWorker = new Worker(URL.createObjectURL(workerBlob));
+                                    dualTickWorker.onmessage = function(e) {{
+                                        if (e.data === 'tick') {{
+                                            frameTick();
+                                        }}
+                                    }};
+                                    dualTickWorker.postMessage('start');
+                                }}
+                            }} catch(wErr) {{
+                                console.warn('[DualScreen] Worker timer fallback:', wErr);
+                                setInterval(frameTick, targetIntervalMs);
+                            }}
+
+                            function rafLoop() {{
+                                frameTick();
+                                dualAnimFrame = requestAnimationFrame(rafLoop);
+                            }}
+                            rafLoop();
                         }}
 
                         async function toggleCamera() {{
@@ -3542,7 +3673,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 const micId = document.getElementById('micSourceSelect') ? document.getElementById('micSourceSelect').value : null;
 
                                 const constraints = {{
-                                    video: camId ? {{ deviceId: {{ exact: camId }}, width: {{ ideal: 720 }}, height: {{ ideal: 640 }} }} : {{ facingMode: 'user', width: {{ ideal: 720 }}, height: {{ ideal: 640 }} }},
+                                    video: {{
+                                        ...(camId ? {{ deviceId: {{ exact: camId }} }} : {{ facingMode: 'user' }}),
+                                        width: {{ ideal: 1280, min: 640 }},
+                                        height: {{ ideal: 720, min: 480 }},
+                                        frameRate: {{ ideal: 30, min: 24 }}
+                                    }},
                                     audio: micId ? {{ deviceId: {{ exact: micId }} }} : true
                                 }};
 
@@ -3720,7 +3856,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 try {{
                                     dualMediaRecorder = new MediaRecorder(stream, {{
                                         mimeType: mime,
-                                        videoBitsPerSecond: 1500000,
+                                        videoBitsPerSecond: 3500000,
                                         audioBitsPerSecond: 128000
                                     }});
                                 }} catch (err) {{
@@ -3734,7 +3870,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     }}
                                 }};
 
-                                dualMediaRecorder.start(500);
+                                dualMediaRecorder.start(250);
                                 dualIsStreaming = true;
 
                                 const btnStart = document.getElementById('btnStartDualStream');
@@ -3900,7 +4036,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     
                                     <!-- Device Selectors -->
                                     <div style="background: #181820; padding: 14px; border-radius: 10px; border: 1px solid #27272a;">
-                                        <h4 style="margin: 0 0 10px 0; font-size: 14px; color: #fff;">⚙️ Pengaturan Perangkat Host</h4>
+                                        <h4 style="margin: 0 0 10px 0; font-size: 14px; color: #fff;">⚙️ Pengaturan Perangkat Host & Layout</h4>
                                         
                                         <label style="display: block; font-size: 12px; color: #a1a1aa; margin-bottom: 4px;">Pilihan Kamera:</label>
                                         <select id="cameraSourceSelect" onchange="switchCameraDevice()" style="width: 100%; padding: 8px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 13px; margin-bottom: 10px;">
@@ -3908,9 +4044,26 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         </select>
 
                                         <label style="display: block; font-size: 12px; color: #a1a1aa; margin-bottom: 4px;">Pilihan Mikrofon:</label>
-                                        <select id="micSourceSelect" onchange="switchMicDevice()" style="width: 100%; padding: 8px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 13px;">
+                                        <select id="micSourceSelect" onchange="switchMicDevice()" style="width: 100%; padding: 8px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 13px; margin-bottom: 12px;">
                                             <option value="">Pilih Mikrofon...</option>
                                         </select>
+
+                                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                            <div style="flex: 1; min-width: 130px;">
+                                                <label style="display: block; font-size: 11px; color: #25f4ee; margin-bottom: 4px; font-weight: 600;">Framing Video Kucing:</label>
+                                                <select id="dualCatFitSelect" onchange="dualCatFitMode = this.value;" style="width: 100%; padding: 7px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 12px;">
+                                                    <option value="fit" selected>🔍 Fit (Utuh Tanpa Zoom)</option>
+                                                    <option value="fill">📐 Fill (Penuh Layar)</option>
+                                                </select>
+                                            </div>
+                                            <div style="flex: 1; min-width: 130px;">
+                                                <label style="display: block; font-size: 11px; color: #fe2c55; margin-bottom: 4px; font-weight: 600;">Framing Kamera Host:</label>
+                                                <select id="dualCamFitSelect" onchange="dualCamFitMode = this.value;" style="width: 100%; padding: 7px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 12px;">
+                                                    <option value="fill" selected>📐 Fill (Fokus Host Widescreen)</option>
+                                                    <option value="fit">🔍 Fit (Utuh Tanpa Zoom)</option>
+                                                </select>
+                                            </div>
+                                        </div>
                                     </div>
 
                                     <!-- Action Buttons -->
