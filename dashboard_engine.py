@@ -1291,15 +1291,14 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
         save_stream_metadata()
 
 def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
-    global streaming_process, stream_metadata
+    global streaming_process, stream_metadata, dual_screen_active
     stop_ffmpeg_stream(close_tiktok_room=False)
     time.sleep(0.5)
 
-    if not rtmp_url:
+    if not rtmp_url or not stream_key:
+        load_stream_metadata()
         rtmp_url = stream_metadata.get("rtmpUrl", "")
-    if not stream_key:
         stream_key = stream_metadata.get("rawStreamKey", "")
-    if not room_id:
         room_id = stream_metadata.get("roomId", "")
 
     if not rtmp_url or not stream_key:
@@ -1313,7 +1312,7 @@ def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
         "ffmpeg",
         "-nostats",
         "-loglevel", "warning",
-        "-re",
+        "-f", "matroska",
         "-i", "pipe:0",
         "-c:v", "libx264",
         "-preset", "ultrafast",
@@ -1382,6 +1381,7 @@ def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
         stream_metadata["roomId"] = room_id
         stream_metadata["currentSlot"] = 1
         stream_metadata["currentVideo"] = "Dual-Screen Live (Canvas + Cam)"
+        dual_screen_active = True
         save_stream_metadata()
         return streaming_process
 
@@ -1389,21 +1389,71 @@ async def ws_stream_handler(websocket):
     global dual_screen_active, dual_screen_ws_client, streaming_process
     print("[DualScreen WS] Klien terhubung ke WebSocket stream pipe.")
     dual_screen_ws_client = websocket
+
+    load_stream_metadata()
+    rtmp_url = stream_metadata.get("rtmpUrl", "")
+    stream_key = stream_metadata.get("rawStreamKey", "")
+    room_id = stream_metadata.get("roomId", "")
+
+    if not rtmp_url or not stream_key:
+        print("[DualScreen WS] RTMP URL atau Stream Key belum tersedia.")
+        try:
+            await websocket.send(json.dumps({
+                "status": "error",
+                "message": "TikTok Live belum aktif! Silakan klik 'Start Live' terlebih dahulu."
+            }))
+            await websocket.close()
+        except Exception:
+            pass
+        dual_screen_active = False
+        dual_screen_ws_client = None
+        return
+
+    # Selalu nyalakan FFmpeg khusus mode dual-screen stdin pipe
+    proc = start_dual_screen_ffmpeg_stream(rtmp_url=rtmp_url, stream_key=stream_key, room_id=room_id)
+    if not proc or proc.poll() is not None:
+        print("[DualScreen WS] Gagal memulai FFmpeg dual-screen stdin pipe!")
+        try:
+            await websocket.send(json.dumps({
+                "status": "error",
+                "message": "Gagal memulai proses FFmpeg dual-screen pada server."
+            }))
+            await websocket.close()
+        except Exception:
+            pass
+        dual_screen_active = False
+        dual_screen_ws_client = None
+        return
+
     dual_screen_active = True
+    print(f"[DualScreen WS] Dual-screen FFmpeg aktif (PID: {proc.pid}), siap menerima binary chunks.")
+    try:
+        await websocket.send(json.dumps({
+            "status": "ready",
+            "message": "FFmpeg stdin pipe siap menerima stream."
+        }))
+    except Exception:
+        pass
 
-    if streaming_process is None or streaming_process.poll() is not None:
-        start_dual_screen_ffmpeg_stream()
-
+    bytes_received = 0
+    chunks_count = 0
     try:
         async for message in websocket:
             if isinstance(message, bytes):
-                if streaming_process and streaming_process.poll() is None and streaming_process.stdin:
+                chunks_count += 1
+                bytes_received += len(message)
+                if chunks_count % 30 == 0:
+                    print(f"[DualScreen WS] Chunks masuk: {chunks_count} ({bytes_received / (1024*1024):.2f} MB), pipe status: {'running' if proc.poll() is None else f'exited ({proc.poll()})'}")
+                if proc.poll() is None and proc.stdin:
                     try:
-                        streaming_process.stdin.write(message)
-                        streaming_process.stdin.flush()
+                        proc.stdin.write(message)
+                        proc.stdin.flush()
                     except (BrokenPipeError, OSError) as pe:
                         print(f"[DualScreen WS] Pipe write error: {pe}")
                         break
+                else:
+                    print(f"[DualScreen WS] FFmpeg proses berhenti mendadak (code: {proc.poll()})")
+                    break
             elif isinstance(message, str):
                 try:
                     payload = json.loads(message)
@@ -1413,10 +1463,38 @@ async def ws_stream_handler(websocket):
                     pass
     except websockets.exceptions.ConnectionClosed:
         print("[DualScreen WS] Klien WebSocket terputus.")
+    except Exception as e:
+        print(f"[DualScreen WS] WebSocket exception: {e}")
     finally:
         dual_screen_active = False
         dual_screen_ws_client = None
-        print("[DualScreen WS] Sesi WebSocket streaming dual-screen selesai.")
+        print(f"[DualScreen WS] Sesi WebSocket streaming dual-screen selesai. Total data: {bytes_received} bytes.")
+        try:
+            if proc and proc.poll() is None:
+                if proc.stdin:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+
+        # Kembalikan otomatis ke video standby loop (video_1.mp4) jika stream TikTok masih aktif
+        load_stream_metadata()
+        if stream_metadata.get("rtmpUrl") and stream_metadata.get("rawStreamKey"):
+            print("[DualScreen WS] Kembali ke video standby loop (video_1.mp4)...")
+            start_ffmpeg_stream(
+                rtmp_url=stream_metadata.get("rtmpUrl"),
+                stream_key=stream_metadata.get("rawStreamKey"),
+                room_id=stream_metadata.get("roomId", ""),
+                slot_num=1,
+                loop=True
+            )
 
 def start_websocket_server():
     def _run():
@@ -2960,12 +3038,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                             container.innerHTML = html;
                                         }}
                                     }}
-                                    if (typeof queueDualScreenSlot === 'function' && isDualScreenActive && data) {{
+                                    if (typeof queueDualScreenSlot === 'function' && data) {{
                                         if (data.gift_seq && data.gift_seq > lastProcessedGiftSeq) {{
                                             lastProcessedGiftSeq = data.gift_seq;
                                             if (data.latest_gift && data.latest_gift.slot) {{
                                                 const g = data.latest_gift;
-                                                queueDualScreenSlot(g.slot, g.giftName, g.sender);
+                                                if (g.sender !== 'PenontonSimulasi') {{
+                                                    queueDualScreenSlot(g.slot, g.giftName, g.sender);
+                                                }}
                                             }}
                                         }}
                                     }}
@@ -3015,10 +3095,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                         function simulateGift(e, slot) {{
                             if (e && e.preventDefault) e.preventDefault();
-                            const btn = e ? (e.currentTarget || e.target) : document.getElementById('btn-sim-slot-' + slot);
+                            console.log('[SimulateGift] Tombol Slot ' + slot + ' diklik.');
+
+                            const btn = document.getElementById('btn-sim-slot-' + slot) || (e ? (e.currentTarget || e.target) : null);
                             const origHtml = btn ? btn.innerHTML : ('Slot ' + slot);
                             
-                            // Nonaktifkan tombol hanya saat fetch berlangsung (< 1 detik)
                             if (btn) {{
                                 btn.disabled = true;
                                 btn.innerHTML = '<span>⏳</span> Mengirim...';
@@ -3028,9 +3109,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 method: 'POST',
                                 headers: {{ 'Accept': 'application/json' }}
                             }})
-                            .then(r => r.json())
+                            .then(r => {{
+                                if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+                                return r.json();
+                            }})
                             .then(data => {{
-                                // Langsung aktifkan kembali tombol agar leluasa klik slot lain atau mengisi antrean
+                                console.log('[SimulateGift] Response dari server:', data);
                                 if (btn) {{
                                     btn.disabled = false;
                                     if (data.queued) {{
@@ -3047,7 +3131,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}
 
                                 if (data.success) {{
-                                    if (typeof queueDualScreenSlot === 'function') queueDualScreenSlot(slot, data.giftName, 'Simulasi');
+                                    if (typeof queueDualScreenSlot === 'function') {{
+                                        queueDualScreenSlot(slot, data.giftName, 'Simulasi');
+                                    }}
                                     showSimStatus(data.message || ('Simulasi Slot ' + slot + ' diterima!'), true, data.queued);
                                 }} else {{
                                     showSimStatus(data.message || 'Gagal memicu simulasi', false, false);
@@ -3055,6 +3141,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 if (typeof syncListenerStatus === 'function') syncListenerStatus();
                             }})
                             .catch(err => {{
+                                console.error('[SimulateGift] Error:', err);
                                 if (btn) {{
                                     btn.disabled = false;
                                     btn.innerHTML = '⚠️ Error';
@@ -3063,13 +3150,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         btn.style.borderColor = '';
                                     }}, 2500);
                                 }}
-                                showSimStatus('Gagal request simulasi: ' + err, false, false);
+                                showSimStatus('Gagal request simulasi: ' + err.message, false, false);
                             }});
                         }}
 
                         function resetStandby(e) {{
                             if (e && e.preventDefault) e.preventDefault();
-                            const btn = e ? (e.currentTarget || e.target) : document.getElementById('btn-reset-standby');
+                            console.log('[ResetStandby] Reset antrean & kembali ke Standby Slot 1.');
+                            const btn = document.getElementById('btn-reset-standby') || (e ? (e.currentTarget || e.target) : null);
                             const origHtml = btn ? btn.innerHTML : 'Reset ke Standby';
                             
                             if (btn) {{
@@ -3081,7 +3169,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 method: 'POST',
                                 headers: {{ 'Accept': 'application/json' }}
                             }})
-                            .then(r => r.json())
+                            .then(r => {{
+                                if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+                                return r.json();
+                            }})
                             .then(data => {{
                                 if (btn) {{
                                     btn.disabled = false;
@@ -3097,6 +3188,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 if (typeof syncListenerStatus === 'function') syncListenerStatus();
                             }})
                             .catch(err => {{
+                                console.error('[ResetStandby] Error:', err);
                                 if (btn) {{
                                     btn.disabled = false;
                                     btn.innerHTML = '⚠️ Error';
@@ -3105,7 +3197,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         btn.style.borderColor = '';
                                     }}, 2500);
                                 }}
-                                showSimStatus('Gagal reset: ' + err, false, false);
+                                showSimStatus('Gagal reset: ' + err.message, false, false);
                             }});
                         }}
                         setInterval(syncListenerStatus, 1000);
@@ -3130,6 +3222,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         let lastProcessedGiftSeq = 0;
                         let dualActiveToast = null;
                         let dualToastTimeout = null;
+                        let dualReactionTimer = null;
 
                         function showCanvasToast(msg) {{
                             dualActiveToast = msg;
@@ -3144,6 +3237,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             if (slot === 1) {{
                                 dualGiftQueue = [];
                                 dualIsReactionPlaying = false;
+                                if (dualReactionTimer) clearTimeout(dualReactionTimer);
                                 playSlotImmediate(1, 'Standby Loop');
                                 return;
                             }}
@@ -3157,7 +3251,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         }}
 
                         function processDualScreenQueue() {{
-                            if (!isDualScreenActive) return;
                             if (dualIsReactionPlaying) return;
                             
                             if (dualGiftQueue.length > 0) {{
@@ -3183,21 +3276,67 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 badge.style.borderColor = (slot === 1 ? '#34c759' : '#ffb800');
                             }}
 
+                            if (dualReactionTimer) clearTimeout(dualReactionTimer);
+
                             catVid.src = '/video-stream?name=video_' + slot + '.mp4';
                             catVid.loop = (slot === 1);
-                            catVid.play().catch(e => console.warn('Cat video play error:', e));
 
                             catVid.onended = function() {{
                                 if (slot !== 1) {{
+                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
                                     dualIsReactionPlaying = false;
                                     processDualScreenQueue();
                                 }}
                             }};
+
+                            catVid.onerror = function(err) {{
+                                console.warn('[DualScreen] Cat video error loading slot ' + slot, err);
+                                if (slot !== 1) {{
+                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                    dualIsReactionPlaying = false;
+                                    processDualScreenQueue();
+                                }}
+                            }};
+
+                            catVid.onloadedmetadata = function() {{
+                                if (slot !== 1) {{
+                                    const dur = (catVid.duration && !isNaN(catVid.duration) && catVid.duration > 0) ? catVid.duration : 15;
+                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                    dualReactionTimer = setTimeout(() => {{
+                                        if (dualIsReactionPlaying && dualCurrentSlot === slot) {{
+                                            console.log('[DualScreen] Safety timer auto-advance for slot ' + slot);
+                                            dualIsReactionPlaying = false;
+                                            processDualScreenQueue();
+                                        }}
+                                    }}, (dur + 1.5) * 1000);
+                                }}
+                            }};
+
+                            catVid.play().catch(e => {{
+                                console.warn('Cat video play warning:', e);
+                                if (slot !== 1) {{
+                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                    dualIsReactionPlaying = false;
+                                    processDualScreenQueue();
+                                }}
+                            }});
                         }}
 
                         function initDualScreenStudio() {{
                             const canvas = document.getElementById('dualCompositeCanvas');
                             if (!canvas) return;
+
+                            // Explicitly bind event listeners to gift simulation buttons for max reliability
+                            for (let s = 2; s <= 6; s++) {{
+                                const simBtn = document.getElementById('btn-sim-slot-' + s);
+                                if (simBtn) {{
+                                    simBtn.addEventListener('click', (ev) => simulateGift(ev, s));
+                                }}
+                            }}
+                            const rstBtn = document.getElementById('btn-reset-standby');
+                            if (rstBtn) {{
+                                rstBtn.addEventListener('click', (ev) => resetStandby(ev));
+                            }}
 
                             if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
                                 navigator.mediaDevices.enumerateDevices().then(devices => {{
@@ -3534,8 +3673,20 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             if (!canvas) return;
 
                             const stream = canvas.captureStream(30);
-                            if (dualAudioDest && dualAudioDest.stream.getAudioTracks().length > 0) {{
-                                stream.addTrack(dualAudioDest.stream.getAudioTracks()[0]);
+                            if (dualAudioDest) {{
+                                if (dualAudioDest.stream.getAudioTracks().length === 0 && dualAudioCtx) {{
+                                    try {{
+                                        const osc = dualAudioCtx.createOscillator();
+                                        const silent = dualAudioCtx.createGain();
+                                        silent.gain.value = 0.0001;
+                                        osc.connect(silent);
+                                        silent.connect(dualAudioDest);
+                                        osc.start();
+                                    }} catch(e) {{}}
+                                }}
+                                if (dualAudioDest.stream.getAudioTracks().length > 0) {{
+                                    stream.addTrack(dualAudioDest.stream.getAudioTracks()[0]);
+                                }}
                             }}
 
                             const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -3545,9 +3696,24 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             dualStreamWs = new WebSocket(wsUrl);
                             dualStreamWs.binaryType = 'arraybuffer';
 
+                            dualStreamWs.onmessage = function(ev) {{
+                                try {{
+                                    const msg = JSON.parse(ev.data);
+                                    if (msg.status === 'error') {{
+                                        alert('⚠️ Dual-Screen Pipe Error: ' + msg.message);
+                                        stopDualStream();
+                                    }} else if (msg.status === 'ready') {{
+                                        console.log('[DualStream] Server pipe siap menerima data.');
+                                    }}
+                                }} catch(e) {{}}
+                            }};
+
                             dualStreamWs.onopen = function() {{
                                 console.log('[DualStream] WebSocket terhubung! Memulai MediaRecorder 30 FPS...');
                                 let mime = 'video/webm;codecs=vp8,opus';
+                                if (!MediaRecorder.isTypeSupported(mime)) {{
+                                    mime = 'video/webm;codecs=vp8';
+                                }}
                                 if (!MediaRecorder.isTypeSupported(mime)) {{
                                     mime = 'video/webm';
                                 }}
@@ -3592,7 +3758,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                             dualStreamWs.onerror = function(err) {{
                                 console.error('[DualStream] WebSocket error:', err);
-                                alert('Gagal menghubungkan WebSocket stream: ' + err);
+                                alert('Gagal menghubungkan WebSocket stream. Pastikan membuka dashboard via HTTPS.');
                                 stopDualStream();
                             }};
                         }}
@@ -3769,10 +3935,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                             </p>
                                             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                                                 <button type="button" id="btnStartDualStream" onclick="startDualStream()" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.18); flex: 1; font-weight: bold; padding: 12px 18px;">
-                                                    🔴 Mulai Push Dual-Screen ke TikTok
+                                                    🚀 Mulai Dual-Screen Stream (Push ke TikTok)
                                                 </button>
                                                 <button type="button" id="btnStopDualStream" onclick="stopDualStream()" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.18); padding: 12px 18px; display: none;">
-                                                    ⏹️ Stop Push Dual-Screen
+                                                    ⏹️ Stop Dual-Screen Stream
                                                 </button>
                                             </div>
                                         </div>
