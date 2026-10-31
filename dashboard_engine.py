@@ -1193,8 +1193,8 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     has_audio = check_has_audio(video_path)
 
     loop_args = ["-stream_loop", "-1"] if loop else []
-    # Dual-Screen server-side layout filter: Top 720x640 video, neon divider line at y=638, bottom 720x640 dark placeholder
-    scale_filter = "scale=720:640:force_original_aspect_ratio=decrease,pad=720:640:(ow-iw)/2:(oh-ih)/2:color=0x0a0a0f,pad=720:1280:0:0:color=0x0d0d14,drawbox=x=0:y=638:w=720:h=4:color=0x25f4ee:t=fill"
+    # Full-screen 720x1280 layout + Floating top-right PiP webcam box (200x200 at x=496, y=24)
+    scale_filter = "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=496:y=24:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=496:y=24:w=200:h=200:color=0x25f4ee:t=2"
 
     cmd = [
         "ffmpeg",
@@ -1223,20 +1223,20 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
         "-map", "[outv]",
         "-map", audio_map,
         "-c:v", "libx264",
-        "-preset", "superfast",
+        "-preset", "ultrafast",
         "-tune", "zerolatency",
         "-threads", "2",
-        "-b:v", "2200k",
-        "-maxrate", "2500k",
-        "-bufsize", "4400k",
+        "-b:v", "1500k",
+        "-maxrate", "1800k",
+        "-bufsize", "3600k",
         "-pix_fmt", "yuv420p",
-        "-r", "30",
+        "-r", "24",
         "-fps_mode", "cfr",
-        "-g", "60",
-        "-keyint_min", "60",
+        "-g", "48",
+        "-keyint_min", "48",
         "-sc_threshold", "0",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "96k",
         "-ar", "44100",
         "-flvflags", "no_duration_filesize",
         "-f", "flv",
@@ -1319,25 +1319,24 @@ def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
         "ffmpeg",
         "-nostats",
         "-loglevel", "warning",
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
+        "-thread_queue_size", "4096",
         "-f", "matroska",
         "-i", "pipe:0",
         "-c:v", "libx264",
-        "-preset", "superfast",
+        "-preset", "ultrafast",
         "-tune", "zerolatency",
         "-threads", "2",
-        "-b:v", "2200k",
-        "-maxrate", "2500k",
-        "-bufsize", "4400k",
+        "-b:v", "1500k",
+        "-maxrate", "1800k",
+        "-bufsize", "3600k",
         "-pix_fmt", "yuv420p",
-        "-r", "30",
+        "-r", "24",
         "-fps_mode", "cfr",
-        "-g", "60",
-        "-keyint_min", "60",
+        "-g", "48",
+        "-keyint_min", "48",
         "-sc_threshold", "0",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "96k",
         "-ar", "44100",
         "-flvflags", "no_duration_filesize",
         "-f", "flv",
@@ -2410,24 +2409,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     v_mime = "video/mp4" if existing_file.lower().endswith(".mp4") else "video/webm"
                     
                     file_status_ui = f"""
-                    <span style='color:#34c759; margin-right:10px;'>📁 <b>{display_name}</b> <span style='color:#888; font-size:12px;'>({size_mb} MB)</span></span>
-                    <button type="button" class="modern-btn" style="padding:5px 12px; font-size:11px; margin-right:8px; background:#27272a; color:#25f4ee; border:1px solid #3f3f46; cursor:pointer;" onclick="editVideoName('{i}', '{display_name}')">✏️ Edit Nama</button>
-                    <a href='/delete-video?name={existing_file}&slot={i}' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:6px 14px; font-size:12px; text-decoration:none;'>Hapus</a>
+                    <span style='color:#34c759; margin-right:8px;'>✅ <b>Video Tersedia</b> <span style='color:#888; font-size:12px;'>({size_mb} MB)</span></span>
+                    <button type="button" class="modern-btn" style="padding:5px 12px; font-size:11px; margin-right:6px; background:#27272a; color:#25f4ee; border:1px solid #3f3f46; cursor:pointer;" onclick="editVideoName('{i}', '{display_name}')">✏️ Edit</button>
+                    <button type="button" id="btn-preview-slot-{i}" class="modern-btn" style="padding:5px 12px; font-size:11px; margin-right:6px; background:rgba(37,244,238,0.1); color:#25f4ee; border:1px solid #25f4ee; cursor:pointer;" onclick="toggleSlotPreview('{i}', '{existing_file}', '{v_mime}', '{display_name}', '{size_mb}')">👁️ Tampilkan Preview</button>
+                    <a href='/delete-video?name={existing_file}&slot={i}' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:5px 12px; font-size:11px; text-decoration:none;'>Hapus</a>
                     """
                     
                     preview_html = f"""
-                    <div style='margin-top:10px; background:#121214; padding:10px 14px; border-radius:8px; border:1px solid #27272a; display:flex; gap:16px; align-items:center;'>
-                        <video controls preload="metadata" style="max-height:130px; width:auto; max-width:220px; border-radius:6px; background:#000; border:1px solid #3f3f46;">
-                            <source src="/video-stream?name={existing_file}" type="{v_mime}">
-                            Browser Anda tidak mendukung preview video.
-                        </video>
-                        <div style="font-size:12px; color:#a1a1aa; line-height:1.6;">
-                            <div style="color:#fff; font-weight:bold; font-size:13px; margin-bottom:4px;">🎬 Video Preview Ready</div>
-                            <div>Nama File: <span style="color:#25f4ee; font-weight:600;">{display_name}</span></div>
-                            <div>Ukuran File: <span style="color:#34c759;">{size_mb} MB</span></div>
-                            <div style="color:#888; font-size:11px; margin-top:4px;">Klik tombol play untuk cek video & audio.</div>
-                        </div>
-                    </div>
+                    <div id="preview-container-{i}" style="display:none; margin-top:10px;"></div>
                     """
                 else:
                     file_status_ui = f"""
@@ -3217,8 +3206,82 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         }}
                         setInterval(syncListenerStatus, 1000);
 
-                        // --- Dual-Screen Live Studio (Client-Side Canvas Compositing - Opsi A) ---
+                        // --- On-Demand Slot Preview Controls (0% Hardware Decoder Footprint by Default) ---
+                        let activeSlotPreview = null;
+
+                        function toggleSlotPreview(slot, filename, mime, displayName, sizeMb) {{
+                            const container = document.getElementById('preview-container-' + slot);
+                            const btn = document.getElementById('btn-preview-slot-' + slot);
+                            if (!container || !btn) return;
+
+                            if (container.style.display !== 'none' && container.innerHTML.trim() !== '') {{
+                                destroySlotPreview(slot);
+                                return;
+                            }}
+
+                            // Destroy any other open slot previews to strictly conserve hardware decoders
+                            for (let s = 1; s <= 6; s++) {{
+                                if (s !== parseInt(slot)) {{
+                                    destroySlotPreview(s);
+                                }}
+                            }}
+
+                            // Mount video dynamically on-demand
+                            container.innerHTML = '<div style="background:#121216; padding:10px; border-radius:8px; border:1px solid #27272a;">' +
+                                '<video id="slot-preview-vid-' + slot + '" controls playsinline preload="metadata" style="width:100%; max-height:260px; border-radius:6px; background:#000;">' +
+                                '<source src="/video-stream?name=' + encodeURIComponent(filename) + '&t=' + Date.now() + '" type="' + mime + '">' +
+                                'Browser tidak mendukung pemutaran video.' +
+                                '</video>' +
+                                '<div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px; font-size:11px; color:#888;">' +
+                                '<span>File: <b style="color:#eee;">' + displayName + '</b> (' + sizeMb + ' MB)</span>' +
+                                '<button type="button" class="modern-btn" style="padding:3px 8px; font-size:11px; background:#27272a; color:#ff3b30; border:1px solid #ff3b30; cursor:pointer;" onclick="destroySlotPreview(\\'' + slot + '\\')">Tutup</button>' +
+                                '</div>' +
+                                '</div>';
+                            container.style.display = 'block';
+                            btn.innerHTML = '🙈 Tutup Preview';
+                            btn.style.borderColor = '#ff3b30';
+                            btn.style.color = '#ff3b30';
+                            btn.style.background = 'rgba(255, 59, 48, 0.12)';
+                            activeSlotPreview = slot;
+                        }}
+
+                        function destroySlotPreview(slot) {{
+                            const container = document.getElementById('preview-container-' + slot);
+                            const btn = document.getElementById('btn-preview-slot-' + slot);
+                            if (container) {{
+                                const vid = container.querySelector('video');
+                                if (vid) {{
+                                    try {{
+                                        vid.pause();
+                                        vid.removeAttribute('src');
+                                        while (vid.firstChild) {{
+                                            vid.removeChild(vid.firstChild);
+                                        }}
+                                        vid.load();
+                                    }} catch(e) {{}}
+                                }}
+                                container.innerHTML = '';
+                                container.style.display = 'none';
+                            }}
+                            if (btn) {{
+                                btn.innerHTML = '👁️ Tampilkan Preview';
+                                btn.style.borderColor = '#25f4ee';
+                                btn.style.color = '#25f4ee';
+                                btn.style.background = 'rgba(37, 244, 238, 0.1)';
+                            }}
+                            if (activeSlotPreview === slot) activeSlotPreview = null;
+                        }}
+
+                        function destroyAllSlotPreviews() {{
+                            for (let s = 1; s <= 6; s++) {{
+                                destroySlotPreview(s);
+                            }}
+                        }}
+
+                        // --- Dual-Screen Live Studio (Client-Side Canvas Compositing - PiP Layout) ---
                         let isDualScreenActive = false;
+                        let isMonitorOutputVisible = false;
+                        let isRenderLoopRunning = false;
                         let dualMediaStream = null;
                         let dualAudioCtx = null;
                         let dualAudioDest = null;
@@ -3238,10 +3301,77 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         let dualActiveToast = null;
                         let dualToastTimeout = null;
                         let dualReactionTimer = null;
-                        let dualCatFitMode = 'fit';
+                        let dualCatFitMode = 'fill';
                         let dualCamFitMode = 'fill';
                         let dualTickWorker = null;
-                        let staticBgCanvas = null;
+
+                        function toggleMonitorOutput() {{
+                            isMonitorOutputVisible = !isMonitorOutputVisible;
+                            const stage = document.getElementById('dualPreviewStage');
+                            const placeholder = document.getElementById('dualPreviewPlaceholder');
+                            const btn = document.getElementById('btnToggleMonitorOutput');
+
+                            if (isMonitorOutputVisible) {{
+                                if (stage) stage.style.display = 'block';
+                                if (placeholder) placeholder.style.display = 'none';
+                                if (btn) {{
+                                    btn.innerHTML = '<span>🙈</span> <span>Sembunyikan Monitor Output</span>';
+                                    btn.style.borderColor = '#ff9500';
+                                    btn.style.color = '#ff9500';
+                                    btn.style.background = 'rgba(255, 149, 0, 0.12)';
+                                }}
+                                startRenderLoop();
+                            }} else {{
+                                if (stage) stage.style.display = 'none';
+                                if (placeholder) placeholder.style.display = 'flex';
+                                if (btn) {{
+                                    btn.innerHTML = '<span>👁️</span> <span>Tampilkan Monitor Output</span>';
+                                    btn.style.borderColor = '#25f4ee';
+                                    btn.style.color = '#25f4ee';
+                                    btn.style.background = 'rgba(37, 244, 238, 0.12)';
+                                }}
+                                // If NOT live streaming, stop rendering loop completely to free 100% CPU/GPU
+                                if (!dualIsStreaming) {{
+                                    stopRenderLoop();
+                                }}
+                            }}
+                        }}
+
+                        function startRenderLoop() {{
+                            if (isRenderLoopRunning) return;
+                            isRenderLoopRunning = true;
+                            const catVid = document.getElementById('dualCatVideo');
+                            if (catVid) {{
+                                if (!catVid.src || catVid.src === '' || catVid.src.endsWith('/')) {{
+                                    catVid.crossOrigin = "anonymous";
+                                    catVid.src = '/video-stream?name=video_1.mp4';
+                                    catVid.loop = true;
+                                }}
+                                if (catVid.paused) {{
+                                    catVid.play().catch(e => console.warn('catVid play on startRenderLoop:', e));
+                                }}
+                            }}
+                            const camVid = document.getElementById('dualCamVideo');
+                            if (camVid && dualMediaStream && camVid.paused) {{
+                                camVid.play().catch(e => console.warn('camVid play on startRenderLoop:', e));
+                            }}
+                            startCanvasLoop();
+                        }}
+
+                        function stopRenderLoop() {{
+                            isRenderLoopRunning = false;
+                            if (dualAnimFrame) {{
+                                cancelAnimationFrame(dualAnimFrame);
+                                dualAnimFrame = null;
+                            }}
+                            if (dualTickWorker) {{
+                                dualTickWorker.postMessage('stop');
+                            }}
+                            const catVid = document.getElementById('dualCatVideo');
+                            if (catVid) {{
+                                catVid.pause();
+                            }}
+                        }}
 
                         function showCanvasToast(msg) {{
                             dualActiveToast = msg;
@@ -3297,6 +3427,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                             if (dualReactionTimer) clearTimeout(dualReactionTimer);
 
+                            catVid.crossOrigin = "anonymous";
                             catVid.src = '/video-stream?name=video_' + slot + '.mp4';
                             catVid.loop = (slot === 1);
 
@@ -3331,14 +3462,16 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}
                             }};
 
-                            catVid.play().catch(e => {{
-                                console.warn('Cat video play warning:', e);
-                                if (slot !== 1) {{
-                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
-                                    dualIsReactionPlaying = false;
-                                    processDualScreenQueue();
-                                }}
-                            }});
+                            if (isRenderLoopRunning || dualIsStreaming || isMonitorOutputVisible) {{
+                                catVid.play().catch(e => {{
+                                    console.warn('Cat video play warning:', e);
+                                    if (slot !== 1) {{
+                                        if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                        dualIsReactionPlaying = false;
+                                        processDualScreenQueue();
+                                    }}
+                                }});
+                            }}
                         }}
 
                         function initDualScreenStudio() {{
@@ -3383,52 +3516,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}).catch(err => console.warn('enumerateDevices error:', err));
                             }}
 
-                            startCanvasLoop();
-                        }}
-
-                        function initStaticBackground() {{
-                            if (staticBgCanvas) return;
-                            staticBgCanvas = document.createElement('canvas');
-                            staticBgCanvas.width = 720;
-                            staticBgCanvas.height = 1280;
-                            const sctx = staticBgCanvas.getContext('2d');
-
-                            // 1. Base dark background
-                            sctx.fillStyle = '#0a0a0f';
-                            sctx.fillRect(0, 0, 720, 1280);
-
-                            // 2. Top and bottom stage placeholders
-                            sctx.fillStyle = '#121218';
-                            sctx.fillRect(0, 0, 720, 640);
-                            sctx.fillStyle = '#0d0d14';
-                            sctx.fillRect(0, 640, 720, 640);
-
-                            // 3. Static Neon Divider Bar at y=638 (4px)
-                            const neonGrad = sctx.createLinearGradient(0, 640, 720, 640);
-                            neonGrad.addColorStop(0, '#25f4ee');
-                            neonGrad.addColorStop(0.5, '#00f2fe');
-                            neonGrad.addColorStop(1, '#fe2c55');
-                            sctx.fillStyle = neonGrad;
-                            sctx.fillRect(0, 638, 720, 4);
-
-                            // 4. Center HUD Pill Badge
-                            sctx.fillStyle = 'rgba(12, 12, 18, 0.95)';
-                            sctx.beginPath();
-                            sctx.roundRect(210, 618, 300, 44, 22);
-                            sctx.fill();
-                            sctx.strokeStyle = '#25f4ee';
-                            sctx.lineWidth = 2;
-                            sctx.stroke();
-
-                            sctx.fillStyle = '#fe2c55';
-                            sctx.beginPath();
-                            sctx.arc(245, 640, 6, 0, Math.PI * 2);
-                            sctx.fill();
-
-                            sctx.fillStyle = '#ffffff';
-                            sctx.font = 'bold 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-                            sctx.textAlign = 'center';
-                            sctx.fillText('LIVE HOST VERIFIED', 370, 646);
+                            // Default 0% load: Do NOT call startCanvasLoop() on page load
+                            isMonitorOutputVisible = false;
+                            isRenderLoopRunning = false;
                         }}
 
                         function startCanvasLoop() {{
@@ -3438,126 +3528,133 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             const catVid = document.getElementById('dualCatVideo');
                             const camVid = document.getElementById('dualCamVideo');
 
-                            initStaticBackground();
-
                             // Lightweight image smoothing: 'low' saves ~60% CPU/GPU overhead
                             ctx.imageSmoothingEnabled = true;
                             ctx.imageSmoothingQuality = 'low';
 
                             function draw() {{
-                                // 1. Blit pre-rendered static background (Single drawImage call)
-                                if (staticBgCanvas) {{
-                                    ctx.drawImage(staticBgCanvas, 0, 0);
-                                }} else {{
-                                    ctx.fillStyle = '#0a0a0f';
-                                    ctx.fillRect(0, 0, 720, 1280);
-                                }}
+                                // Base dark background
+                                ctx.fillStyle = '#0a0a0f';
+                                ctx.fillRect(0, 0, 720, 1280);
 
-                                // 2. Fast Render: Cat Video (Top 720x640)
+                                // 1. Full-Screen Video (720x1280)
                                 if (catVid && catVid.readyState >= 2) {{
                                     const vW = catVid.videoWidth || 720;
-                                    const vH = catVid.videoHeight || 640;
+                                    const vH = catVid.videoHeight || 1280;
 
                                     if (dualCatFitMode === 'fit') {{
-                                        const fitScale = Math.min(720 / vW, 640 / vH);
+                                        const fitScale = Math.min(720 / vW, 1280 / vH);
                                         const drawW = vW * fitScale;
                                         const drawH = vH * fitScale;
                                         const drawX = (720 - drawW) * 0.5;
-                                        const drawY = (640 - drawH) * 0.5;
+                                        const drawY = (1280 - drawH) * 0.5;
                                         ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
                                     }} else {{
-                                        const fillScale = Math.max(720 / vW, 640 / vH);
+                                        const fillScale = Math.max(720 / vW, 1280 / vH);
                                         const drawW = vW * fillScale;
                                         const drawH = vH * fillScale;
                                         const drawX = (720 - drawW) * 0.5;
-                                        const drawY = (640 - drawH) * 0.5;
+                                        const drawY = (1280 - drawH) * 0.5;
                                         ctx.save();
                                         ctx.beginPath();
-                                        ctx.rect(0, 0, 720, 640);
+                                        ctx.rect(0, 0, 720, 1280);
                                         ctx.clip();
                                         ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
                                         ctx.restore();
                                     }}
                                 }} else {{
+                                    ctx.fillStyle = '#121218';
+                                    ctx.fillRect(0, 0, 720, 1280);
                                     ctx.fillStyle = '#71717a';
-                                    ctx.font = 'bold 20px sans-serif';
+                                    ctx.font = 'bold 22px sans-serif';
                                     ctx.textAlign = 'center';
-                                    ctx.fillText('🐱 Video Kucing (Standby)', 360, 320);
+                                    ctx.fillText('🐱 Video Standby / Reaksi', 360, 640);
                                 }}
 
-                                // 3. Fast Render: Host Camera (Bottom 720x640)
+                                // 2. Floating Webcam PiP Box: 200x200 px at Top-Right (x=496, y=24)
+                                const pipW = 200;
+                                const pipH = 200;
+                                const pipX = 496;
+                                const pipY = 24;
+
                                 if (camVid && camVid.readyState >= 2) {{
-                                    const cW = camVid.videoWidth || 640;
-                                    const cH = camVid.videoHeight || 480;
+                                    const cW = camVid.videoWidth || 240;
+                                    const cH = camVid.videoHeight || 240;
+                                    const minDim = Math.min(cW, cH);
+                                    const sX = (cW - minDim) * 0.5;
+                                    const sY = (cH - minDim) * 0.5;
+
                                     ctx.save();
                                     ctx.beginPath();
-                                    ctx.rect(0, 640, 720, 640);
+                                    ctx.rect(pipX, pipY, pipW, pipH);
                                     ctx.clip();
 
-                                    if (dualCamFitMode === 'fit') {{
-                                        const fitScale = Math.min(720 / cW, 640 / cH);
-                                        const drawW = cW * fitScale;
-                                        const drawH = cH * fitScale;
-                                        const drawX = (720 - drawW) * 0.5;
-                                        const drawY = 640 + (640 - drawH) * 0.5;
-                                        if (dualIsMirror) {{
-                                            ctx.translate(720, 0);
-                                            ctx.scale(-1, 1);
-                                            ctx.drawImage(camVid, (720 - drawW) * 0.5, drawY, drawW, drawH);
-                                        }} else {{
-                                            ctx.drawImage(camVid, drawX, drawY, drawW, drawH);
-                                        }}
+                                    if (dualIsMirror) {{
+                                        ctx.translate(pipX + pipW, pipY);
+                                        ctx.scale(-1, 1);
+                                        ctx.drawImage(camVid, sX, sY, minDim, minDim, 0, 0, pipW, pipH);
                                     }} else {{
-                                        const fillScale = Math.max(720 / cW, 640 / cH);
-                                        const drawW = cW * fillScale;
-                                        const drawH = cH * fillScale;
-                                        const drawX = (720 - drawW) * 0.5;
-                                        const drawY = 640 + (640 - drawH) * 0.5;
-                                        if (dualIsMirror) {{
-                                            ctx.translate(720, 0);
-                                            ctx.scale(-1, 1);
-                                            ctx.drawImage(camVid, (720 - drawW) * 0.5, drawY, drawW, drawH);
-                                        }} else {{
-                                            ctx.drawImage(camVid, drawX, drawY, drawW, drawH);
-                                        }}
+                                        ctx.drawImage(camVid, sX, sY, minDim, minDim, pipX, pipY, pipW, pipH);
                                     }}
                                     ctx.restore();
-                                }} else {{
-                                    ctx.fillStyle = '#71717a';
-                                    ctx.font = 'bold 20px sans-serif';
+
+                                    // Neon border 2px
+                                    ctx.strokeStyle = '#25f4ee';
+                                    ctx.lineWidth = 2;
+                                    ctx.strokeRect(pipX, pipY, pipW, pipH);
+
+                                    // Host indicator badge
+                                    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                                    ctx.fillRect(pipX, pipY + pipH - 22, pipW, 22);
+                                    ctx.fillStyle = '#25f4ee';
+                                    ctx.font = 'bold 11px sans-serif';
                                     ctx.textAlign = 'center';
-                                    ctx.fillText('📷 Menunggu Kamera Host...', 360, 960);
+                                    ctx.fillText('🔴 LIVE HOST', pipX + pipW * 0.5, pipY + pipH - 6);
+                                }} else {{
+                                    ctx.fillStyle = 'rgba(18, 18, 24, 0.85)';
+                                    ctx.fillRect(pipX, pipY, pipW, pipH);
+                                    ctx.strokeStyle = '#25f4ee';
+                                    ctx.lineWidth = 2;
+                                    ctx.strokeRect(pipX, pipY, pipW, pipH);
+
+                                    ctx.fillStyle = '#71717a';
+                                    ctx.font = 'bold 12px sans-serif';
+                                    ctx.textAlign = 'center';
+                                    ctx.fillText('📷 Cam Standby', pipX + pipW * 0.5, pipY + pipH * 0.5 + 4);
                                 }}
 
-                                // 4. Dynamic Badges: Slot Watermark
+                                // 3. Dynamic Watermark Badge at Top-Left (x=24, y=24)
                                 ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
-                                ctx.fillRect(24, 24, 230, 34);
+                                ctx.beginPath();
+                                ctx.roundRect(24, 24, 210, 34, 6);
+                                ctx.fill();
                                 ctx.fillStyle = (dualCurrentSlot === 1 ? '#34c759' : '#fe2c55');
                                 ctx.font = 'bold 13px sans-serif';
                                 ctx.textAlign = 'left';
                                 ctx.fillText(dualCurrentSlot === 1 ? '🐱 STANDBY (SLOT 1)' : '🎁 REAKSI (SLOT ' + dualCurrentSlot + ')', 34, 46);
 
-                                // 5. Toast Notification (If Gift Arrives)
+                                // 4. Toast Notification at Bottom (x=30, y=1140)
                                 if (dualActiveToast) {{
                                     ctx.fillStyle = 'rgba(15, 15, 24, 0.9)';
-                                    ctx.fillRect(30, 560, 660, 50);
+                                    ctx.fillRect(30, 1140, 660, 50);
                                     ctx.strokeStyle = '#fe2c55';
                                     ctx.lineWidth = 1.5;
-                                    ctx.strokeRect(30, 560, 660, 50);
+                                    ctx.strokeRect(30, 1140, 660, 50);
                                     ctx.fillStyle = '#25f4ee';
                                     ctx.font = 'bold 16px sans-serif';
                                     ctx.textAlign = 'center';
-                                    ctx.fillText(dualActiveToast, 360, 592);
+                                    ctx.fillText(dualActiveToast, 360, 1172);
                                 }}
                             }}
 
-                            // Decoupled 30 FPS Engine: RAF when tab is active; Web Worker ONLY when document.hidden === true
+                            // Decoupled 24 FPS Engine: RAF when tab active; Web Worker ONLY when document.hidden === true
                             let lastRafTime = 0;
-                            const targetIntervalMs = 1000 / 30; // 33.33ms
+                            const targetIntervalMs = 1000 / 24; // ~41.66ms
 
                             function rafLoop(timestamp) {{
+                                if (!isRenderLoopRunning) return;
                                 if (!document.hidden) {{
-                                    if (timestamp - lastRafTime >= targetIntervalMs - 3) {{
+                                    if (timestamp - lastRafTime >= targetIntervalMs - 2) {{
                                         lastRafTime = timestamp;
                                         draw();
                                     }}
@@ -3571,7 +3668,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         'let timer = null;' +
                                         'self.onmessage = function(e) {{' +
                                         '  if (e.data === "start") {{' +
-                                        '    if (!timer) timer = setInterval(function() {{ self.postMessage("tick"); }}, 33);' +
+                                        '    if (!timer) timer = setInterval(function() {{ self.postMessage("tick"); }}, 41);' +
                                         '  }} else if (e.data === "stop") {{' +
                                         '    if (timer) {{ clearInterval(timer); timer = null; }}' +
                                         '  }}' +
@@ -3579,7 +3676,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ], {{ type: 'application/javascript' }});
                                     dualTickWorker = new Worker(URL.createObjectURL(workerBlob));
                                     dualTickWorker.onmessage = function(e) {{
-                                        if (e.data === 'tick' && document.hidden) {{
+                                        if (e.data === 'tick' && document.hidden && isRenderLoopRunning) {{
                                             draw();
                                         }}
                                     }};
@@ -3590,14 +3687,18 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                             document.addEventListener('visibilitychange', function() {{
                                 if (document.hidden) {{
-                                    if (dualTickWorker) dualTickWorker.postMessage('start');
+                                    if (dualTickWorker && isRenderLoopRunning) dualTickWorker.postMessage('start');
                                 }} else {{
                                     if (dualTickWorker) dualTickWorker.postMessage('stop');
                                     lastRafTime = performance.now();
                                 }}
                             }});
 
-                            // Start rendering loop
+                            if (dualAnimFrame) {{
+                                cancelAnimationFrame(dualAnimFrame);
+                                dualAnimFrame = null;
+                            }}
+                            lastRafTime = performance.now();
                             rafLoop(performance.now());
                         }}
 
@@ -3638,9 +3739,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 const constraints = {{
                                     video: {{
                                         ...(camId ? {{ deviceId: {{ exact: camId }} }} : {{ facingMode: 'user' }}),
-                                        width: {{ ideal: 640 }},
-                                        height: {{ ideal: 480 }},
-                                        frameRate: {{ ideal: 30 }}
+                                        width: {{ ideal: 240, max: 320 }},
+                                        height: {{ ideal: 240, max: 240 }},
+                                        frameRate: {{ ideal: 24, max: 24 }}
                                     }},
                                     audio: micId ? {{ deviceId: {{ exact: micId }} }} : true
                                 }};
@@ -3654,10 +3755,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                                 if (catVid) {{
                                     catVid.crossOrigin = "anonymous";
-                                    catVid.src = '/video-stream?name=video_1.mp4';
-                                    catVid.loop = true;
+                                    if (!catVid.src || catVid.src === '' || catVid.src.endsWith('/')) {{
+                                        catVid.src = '/video-stream?name=video_1.mp4';
+                                        catVid.loop = true;
+                                    }}
                                     catVid.muted = false;
-                                    catVid.play().catch(e => console.warn(e));
+                                    if (isRenderLoopRunning || dualIsStreaming || isMonitorOutputVisible) {{
+                                        catVid.play().catch(e => console.warn(e));
+                                    }}
                                 }}
 
                                 setupDualAudioMixing(stream, catVid);
@@ -3668,7 +3773,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     btn.style.setProperty('--bg', 'rgba(255, 59, 48, 0.2)');
                                 }}
                                 if (badge) {{
-                                    badge.innerText = '🟢 Preview Dual-Screen Aktif';
+                                    badge.innerText = '🟢 Kamera & Mic Siap';
                                     badge.style.color = '#34c759';
                                     badge.style.borderColor = '#34c759';
                                     badge.style.background = 'rgba(52, 199, 89, 0.2)';
@@ -3763,15 +3868,19 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         }}
 
                         function startDualStream() {{
+                            destroyAllSlotPreviews();
+
                             if (!isDualScreenActive || !dualMediaStream) {{
                                 alert('Harap aktifkan Kamera & Mic terlebih dahulu sebelum mulai push stream!');
                                 return;
                             }}
 
+                            startRenderLoop();
+
                             const canvas = document.getElementById('dualCompositeCanvas');
                             if (!canvas) return;
 
-                            const stream = canvas.captureStream(30);
+                            const stream = canvas.captureStream(24);
                             if (dualAudioDest) {{
                                 if (dualAudioDest.stream.getAudioTracks().length === 0 && dualAudioCtx) {{
                                     try {{
@@ -3828,8 +3937,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 try {{
                                     dualMediaRecorder = new MediaRecorder(stream, {{
                                         mimeType: mime,
-                                        videoBitsPerSecond: 2200000,
-                                        audioBitsPerSecond: 128000
+                                        videoBitsPerSecond: 1200000,
+                                        audioBitsPerSecond: 96000
                                     }});
                                 }} catch (err) {{
                                     dualMediaRecorder = new MediaRecorder(stream);
@@ -3842,7 +3951,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     }}
                                 }};
 
-                                dualMediaRecorder.start(100);
+                                dualMediaRecorder.start(200);
                                 dualIsStreaming = true;
 
                                 const btnStart = document.getElementById('btnStartDualStream');
@@ -3851,7 +3960,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 if (btnStop) btnStop.style.display = 'inline-block';
                                 const badge = document.getElementById('dualStatusBadge');
                                 if (badge) {{
-                                    badge.innerText = '🔴 STREAMING TIKTOK (Dual-Screen Pipeline)';
+                                    badge.innerText = '🔴 STREAMING TIKTOK (Full-Screen + PiP)';
                                     badge.style.color = '#ff3b30';
                                     badge.style.borderColor = '#ff3b30';
                                     badge.style.background = 'rgba(255, 59, 48, 0.25)';
@@ -3881,6 +3990,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 dualStreamWs = null;
                             }}
 
+                            // If monitor output is hidden, stop render loop completely
+                            if (!isMonitorOutputVisible) {{
+                                stopRenderLoop();
+                            }}
+
                             const btnStart = document.getElementById('btnStartDualStream');
                             const btnStop = document.getElementById('btnStopDualStream');
                             if (btnStart) btnStart.style.display = 'inline-block';
@@ -3888,7 +4002,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                             const badge = document.getElementById('dualStatusBadge');
                             if (badge) {{
-                                badge.innerText = isDualScreenActive ? '🟢 Preview Dual-Screen Aktif' : '⚪ Standby (Kamera Nonaktif)';
+                                badge.innerText = isDualScreenActive ? '🟢 Kamera & Mic Siap' : '⚪ Standby (Kamera Nonaktif)';
                                 badge.style.color = isDualScreenActive ? '#34c759' : '#a1a1aa';
                                 badge.style.borderColor = isDualScreenActive ? '#34c759' : '#71717a';
                                 badge.style.background = isDualScreenActive ? 'rgba(52, 199, 89, 0.2)' : 'rgba(113, 113, 122, 0.2)';
@@ -3906,6 +4020,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         async function handleStartLiveClick(ev) {{
                             if (ev) ev.preventDefault();
                             if (!validateStartLive()) return;
+
+                            // Destroy all slot previews immediately to free hardware decoders
+                            destroyAllSlotPreviews();
 
                             const btn = document.getElementById('btnMainStartLive');
                             const origText = btn ? btn.innerHTML : '🚀 Start Live (Dual-Screen TikTok)';
@@ -3939,7 +4056,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 console.log('[StartLive] Room RTMP TikTok siap:', data.rtmp_url);
 
                                 if (btn) {{
-                                    btn.innerHTML = '🔴 LIVE DUAL-SCREEN AKTIF';
+                                    btn.innerHTML = '🔴 LIVE FULLSCREEN + PIP AKTIF';
                                     btn.style.setProperty('--shimmer-color', '#34c759');
                                     btn.style.setProperty('--bg', 'rgba(52, 199, 89, 0.2)');
                                     btn.disabled = false;
@@ -3949,7 +4066,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 startDualStream();
 
                             }} catch (err) {{
-                                alert('Gagal memulai Live Dual-Screen: ' + err.message);
+                                alert('Gagal memulai Live: ' + err.message);
                                 if (btn) {{
                                     btn.disabled = false;
                                     btn.innerHTML = origText;
@@ -4026,10 +4143,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px;">
                                 <div>
                                     <h3 style="margin: 0; color: #25f4ee; font-size: 18px; display: flex; align-items: center; gap: 8px;">
-                                        <span>🎥</span> Dual-Screen Live Studio (Host Camera + Video Kucing)
+                                        <span>🎥</span> Dual-Screen Live Studio (Full-Screen + PiP Host)
                                     </h3>
                                     <p style="color: #a1a1aa; font-size: 13px; margin: 4px 0 0 0;">
-                                        Kamera wajah & mic host digabungkan di layar bawah secara real-time. Video reaksi kucing diputar di layar atas (Rasio vertikal 9:16). Bebas lag & tanpa restart koneksi RTMP TikTok saat gift masuk.
+                                        Video utama Full-Screen 9:16 (720x1280) dengan floating webcam Picture-in-Picture (200x200 di kanan atas). Pipeline 24 FPS ringan & hemat sumber daya perangkat.
                                     </p>
                                 </div>
                                 <div style="display: flex; gap: 8px; align-items: center;">
@@ -4039,27 +4156,47 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 </div>
                             </div>
 
-                            <!-- Hidden Video Elements for Compositing -->
-                            <video id="dualCatVideo" src="/video-stream?name=video_1.mp4" playsinline loop muted crossorigin="anonymous" style="display:none;"></video>
+                            <!-- Hidden Video Elements for Compositing (Tanpa src otomatis agar 0% decoder) -->
+                            <video id="dualCatVideo" playsinline loop muted crossorigin="anonymous" style="display:none;"></video>
                             <video id="dualCamVideo" playsinline autoplay muted style="display:none;"></video>
 
                             <!-- Studio Grid: Left Preview Canvas (9:16), Right Controls -->
                             <div style="display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; justify-content: center;">
                                 
-                                <!-- Live Preview Stage (9:16 Ratio) -->
-                                <div style="flex: 0 0 auto; width: 300px; height: 533px; background: #000; border-radius: 16px; border: 2px solid #27272a; position: relative; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.8), 0 0 20px rgba(37,244,238,0.15);">
-                                    <canvas id="dualCompositeCanvas" width="720" height="1280" style="width: 100%; height: 100%; object-fit: cover; display: block;"></canvas>
-                                    
-                                    <!-- Floating Mini HUD overlay -->
-                                    <div style="position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; align-items: center; pointer-events: none;">
-                                        <span id="dualCurrentSlotBadge" style="background: rgba(0,0,0,0.7); color: #34c759; border: 1px solid #34c759; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: bold;">
-                                            🐱 Slot 1 (Standby)
-                                        </span>
+                                <!-- Studio Preview Column with On-Demand Monitor Output -->
+                                <div style="flex: 0 0 auto; width: 300px; display: flex; flex-direction: column; align-items: center; gap: 10px;">
+                                    <!-- Toggle Monitor Output Button -->
+                                    <button type="button" id="btnToggleMonitorOutput" onclick="toggleMonitorOutput()" class="modern-btn" style="width: 100%; padding: 10px 14px; font-size: 13px; font-weight: bold; background: rgba(37, 244, 238, 0.12); color: #25f4ee; border: 1px solid #25f4ee; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                                        <span>👁️</span> <span>Tampilkan Monitor Output</span>
+                                    </button>
+
+                                    <!-- Placeholder when Monitor Output is Hidden (0% GPU/CPU overhead) -->
+                                    <div id="dualPreviewPlaceholder" style="width: 300px; height: 533px; background: #121218; border-radius: 16px; border: 2px dashed #3f3f46; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 24px; box-sizing: border-box;">
+                                        <span style="font-size: 38px; margin-bottom: 12px;">🖥️</span>
+                                        <div style="font-size: 14px; font-weight: bold; color: #fff; margin-bottom: 6px;">Monitor Output Nonaktif</div>
+                                        <div style="font-size: 12px; color: #71717a; line-height: 1.5; margin-bottom: 16px;">
+                                            Rendering layar dinonaktifkan (0% pemakaian CPU/GPU/Decoder). Klik tombol di atas untuk melihat preview visual canvas.
+                                        </div>
+                                        <button type="button" class="modern-btn" onclick="toggleMonitorOutput()" style="padding: 6px 14px; font-size: 12px; background: #27272a; color: #25f4ee; border: 1px solid #3f3f46; cursor: pointer;">
+                                            Buka Monitor
+                                        </button>
                                     </div>
-                                    <div style="position: absolute; bottom: 12px; right: 12px; display: flex; align-items: center; gap: 6px; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 6px; border: 1px solid #333; pointer-events: none;">
-                                        <span style="font-size: 11px; color: #25f4ee;">🎙️</span>
-                                        <div id="dualVuBar" style="width: 40px; height: 6px; background: #222; border-radius: 3px; overflow: hidden;">
-                                            <div id="dualVuLevel" style="width: 0%; height: 100%; background: #34c759; transition: width 0.08s ease;"></div>
+
+                                    <!-- Live Preview Stage (9:16 Ratio) - Hidden by default -->
+                                    <div id="dualPreviewStage" style="display: none; width: 300px; height: 533px; background: #000; border-radius: 16px; border: 2px solid #27272a; position: relative; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.8), 0 0 20px rgba(37,244,238,0.15);">
+                                        <canvas id="dualCompositeCanvas" width="720" height="1280" style="width: 100%; height: 100%; object-fit: cover; display: block;"></canvas>
+                                        
+                                        <!-- Floating Mini HUD overlay -->
+                                        <div style="position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; align-items: center; pointer-events: none;">
+                                            <span id="dualCurrentSlotBadge" style="background: rgba(0,0,0,0.7); color: #34c759; border: 1px solid #34c759; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: bold;">
+                                                🐱 Slot 1 (Standby)
+                                            </span>
+                                        </div>
+                                        <div style="position: absolute; bottom: 12px; right: 12px; display: flex; align-items: center; gap: 6px; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 6px; border: 1px solid #333; pointer-events: none;">
+                                            <span style="font-size: 11px; color: #25f4ee;">🎙️</span>
+                                            <div id="dualVuBar" style="width: 40px; height: 6px; background: #222; border-radius: 3px; overflow: hidden;">
+                                                <div id="dualVuLevel" style="width: 0%; height: 100%; background: #34c759; transition: width 0.08s ease;"></div>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -4083,17 +4220,16 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                                         <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                                             <div style="flex: 1; min-width: 130px;">
-                                                <label style="display: block; font-size: 11px; color: #25f4ee; margin-bottom: 4px; font-weight: 600;">Framing Video Kucing:</label>
+                                                <label style="display: block; font-size: 11px; color: #25f4ee; margin-bottom: 4px; font-weight: 600;">Framing Video Utama:</label>
                                                 <select id="dualCatFitSelect" onchange="dualCatFitMode = this.value;" style="width: 100%; padding: 7px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 12px;">
-                                                    <option value="fit" selected>🔍 Fit (Utuh Tanpa Zoom)</option>
-                                                    <option value="fill">📐 Fill (Penuh Layar)</option>
+                                                    <option value="fill" selected>📐 Fill (Penuh Layar 9:16)</option>
+                                                    <option value="fit">🔍 Fit (Utuh Tanpa Potong)</option>
                                                 </select>
                                             </div>
                                             <div style="flex: 1; min-width: 130px;">
-                                                <label style="display: block; font-size: 11px; color: #fe2c55; margin-bottom: 4px; font-weight: 600;">Framing Kamera Host:</label>
-                                                <select id="dualCamFitSelect" onchange="dualCamFitMode = this.value;" style="width: 100%; padding: 7px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 12px;">
-                                                    <option value="fill" selected>📐 Fill (Fokus Host Widescreen)</option>
-                                                    <option value="fit">🔍 Fit (Utuh Tanpa Zoom)</option>
+                                                <label style="display: block; font-size: 11px; color: #fe2c55; margin-bottom: 4px; font-weight: 600;">Layout Kamera Host:</label>
+                                                <select id="dualCamFitSelect" style="width: 100%; padding: 7px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 12px;">
+                                                    <option value="pip" selected>🖼️ Floating PiP (200x200 Kanan Atas)</option>
                                                 </select>
                                             </div>
                                         </div>
@@ -4115,16 +4251,16 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                                         <!-- TikTok Live Streaming Actions -->
                                         <div style="background: rgba(37, 244, 238, 0.05); padding: 14px; border-radius: 10px; border: 1px solid rgba(37, 244, 238, 0.2); margin-top: 6px;">
-                                            <div style="font-size: 13px; font-weight: bold; color: #25f4ee; margin-bottom: 6px;">🚀 Push Dual-Screen Langsung ke TikTok Live</div>
+                                            <div style="font-size: 13px; font-weight: bold; color: #25f4ee; margin-bottom: 6px;">🚀 Push Full-Screen + PiP Langsung ke TikTok Live</div>
                                             <p style="font-size: 12px; color: #aaa; margin: 0 0 10px 0;">
-                                                Kamera + Audio host & Video Kucing dikirim secara kontinu via WebSocket ke server FFmpeg dan di-push ke RTMPS TikTok.
+                                                Kamera host (PiP 200x200) + Audio & Video utama dikirim secara kontinu via WebSocket ke server FFmpeg dan di-push ke RTMPS TikTok (24 FPS / 1.2 Mbps).
                                             </p>
                                             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                                                 <button type="button" id="btnStartDualStream" onclick="startDualStream()" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.18); flex: 1; font-weight: bold; padding: 12px 18px;">
-                                                    🚀 Mulai Dual-Screen Stream (Push ke TikTok)
+                                                    🚀 Mulai Stream Live (Full-Screen + PiP)
                                                 </button>
                                                 <button type="button" id="btnStopDualStream" onclick="stopDualStream()" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.18); padding: 12px 18px; display: none;">
-                                                    ⏹️ Stop Dual-Screen Stream
+                                                    ⏹️ Stop Stream Live
                                                 </button>
                                             </div>
                                         </div>
