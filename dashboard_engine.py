@@ -1191,6 +1191,13 @@ def stop_ffmpeg_stream(close_tiktok_room=False):
             stream_metadata["active"] = False
             save_stream_metadata()
 
+def find_slot_video(slot_num):
+    for ext in ("mp4", "webm", "mov", "mkv"):
+        cand = os.path.join(VIDEOS_DIR, f"video_{slot_num}.{ext}")
+        if os.path.exists(cand):
+            return cand
+    return None
+
 def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_override=None, loop=True, slot_num=1):
     global streaming_process, stream_metadata
     # HANYA matikan proses FFmpeg lokal, JANGAN tutup room TikTok
@@ -1209,11 +1216,7 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     
     video_path = video_override
     if not video_path:
-        for ext in ("webm", "mp4"):
-            candidate = os.path.join(VIDEOS_DIR, f"video_{slot_num}.{ext}")
-            if os.path.exists(candidate):
-                video_path = candidate
-                break
+        video_path = find_slot_video(slot_num)
     if not video_path:
         video_path = os.path.join(BASE_DIR, "media", "standby-loop.mp4")
     
@@ -1697,13 +1700,7 @@ def play_slot(slot_num, source_info=None):
             print(f"[StreamingEngine] Stream RTMP belum aktif, play_slot({slot_num}) dibatalkan.")
             return False
 
-    slot_video_path = None
-    for ext in ("webm", "mp4"):
-        cand = os.path.join(VIDEOS_DIR, f"video_{slot_num}.{ext}")
-        if os.path.exists(cand):
-            slot_video_path = cand
-            break
-            
+    slot_video_path = find_slot_video(slot_num)
     if not slot_video_path:
         if slot_num == 1:
             slot_video_path = os.path.join(BASE_DIR, "media", "standby-loop.mp4")
@@ -3082,7 +3079,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         }}
                     </style>
                     <script>
-                        let lastProcessedGiftSeq = 0;
+                        let lastProcessedGiftSeq = -1;
+                        const recentlyLocalQueuedEventIds = new Set();
                         function validateUpload(form) {{
                             const fileInput = form.querySelector('input[type="file"]');
                             if (!fileInput || fileInput.files.length === 0) {{
@@ -3199,11 +3197,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         }}
                                     }}
                                     if (typeof queueDualScreenSlot === 'function' && data) {{
-                                        if (data.gift_seq && data.gift_seq > lastProcessedGiftSeq) {{
+                                        if (lastProcessedGiftSeq === -1) {{
+                                            lastProcessedGiftSeq = data.gift_seq || 0;
+                                        }} else if (data.gift_seq && data.gift_seq > lastProcessedGiftSeq) {{
                                             lastProcessedGiftSeq = data.gift_seq;
                                             if (data.latest_gift && data.latest_gift.slot) {{
                                                 const g = data.latest_gift;
-                                                if (g.sender !== 'PenontonSimulasi') {{
+                                                if (!recentlyLocalQueuedEventIds.has(g.id)) {{
                                                     queueDualScreenSlot(g.slot, g.giftName, g.sender);
                                                 }}
                                             }}
@@ -3253,11 +3253,20 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             el.innerHTML = (isQueue ? '📥 ' : (isSuccess ? '🟢 ' : '⚠️ ')) + msg;
                         }}
 
+                        let isSimulatingGift = false;
                         function simulateGift(e, slot) {{
-                            if (e && e.preventDefault) e.preventDefault();
+                            if (e) {{
+                                if (e.preventDefault) e.preventDefault();
+                                if (e.stopPropagation) e.stopPropagation();
+                            }}
+                            if (isSimulatingGift) {{
+                                console.log('[SimulateGift] Request sedang berjalan, cegah double trigger.');
+                                return;
+                            }}
+                            isSimulatingGift = true;
                             console.log('[SimulateGift] Tombol Slot ' + slot + ' diklik.');
 
-                            const btn = document.getElementById('btn-sim-slot-' + slot) || (e ? (e.currentTarget || e.target) : null);
+                            const btn = (e && (e.currentTarget || e.target)) ? (e.currentTarget || e.target) : document.getElementById('btn-sim-slot-' + slot);
                             const origHtml = btn ? btn.innerHTML : ('Slot ' + slot);
                             
                             if (btn) {{
@@ -3291,6 +3300,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}
 
                                 if (data.success) {{
+                                    if (data.id) {{
+                                        recentlyLocalQueuedEventIds.add(data.id);
+                                    }}
                                     if (!isMonitorOutputVisible && typeof toggleMonitorOutput === 'function') {{
                                         toggleMonitorOutput();
                                     }} else if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
@@ -3316,13 +3328,21 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     }}, 2500);
                                 }}
                                 showSimStatus('Gagal request simulasi: ' + err.message, false, false);
+                            }})
+                            .finally(() => {{
+                                setTimeout(() => {{
+                                    isSimulatingGift = false;
+                                }}, 400);
                             }});
                         }}
 
                         function resetStandby(e) {{
-                            if (e && e.preventDefault) e.preventDefault();
+                            if (e) {{
+                                if (e.preventDefault) e.preventDefault();
+                                if (e.stopPropagation) e.stopPropagation();
+                            }}
                             console.log('[ResetStandby] Reset antrean & kembali ke Standby Slot 1.');
-                            const btn = document.getElementById('btn-reset-standby') || (e ? (e.currentTarget || e.target) : null);
+                            const btn = (e && (e.currentTarget || e.target)) ? (e.currentTarget || e.target) : document.getElementById('btn-reset-standby');
                             const origHtml = btn ? btn.innerHTML : 'Reset ke Standby';
                             
                             if (btn) {{
@@ -3522,6 +3542,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                         function testDynamicOverlay(slot) {{
                             console.log('[DynamicOverlay] Manual test trigger slot:', slot);
+                            if (!isMonitorOutputVisible && typeof toggleMonitorOutput === 'function') {{
+                                toggleMonitorOutput();
+                            }} else if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
+                                startRenderLoop();
+                            }}
                             playDynamicOverlaySlot(slot, true);
                         }}
 
@@ -3672,8 +3697,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             if (catVid) {{
                                 if (!catVid.src || catVid.src === '' || catVid.src.endsWith('/')) {{
                                     catVid.crossOrigin = "anonymous";
-                                    catVid.src = '/video-stream?name=video_1.mp4';
-                                    catVid.loop = true;
+                                    catVid.src = '/video-stream?name=video_' + dualCurrentSlot + '.mp4';
+                                    catVid.loop = (dualCurrentSlot === 1);
                                 }}
                                 if (catVid.paused) {{
                                     catVid.play().catch(e => console.warn('catVid play on startRenderLoop:', e));
@@ -3714,7 +3739,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             if (dualToastTimeout) clearTimeout(dualToastTimeout);
                             dualToastTimeout = setTimeout(() => {{
                                 dualActiveToast = null;
-                            }}, 4000);
+                            }}, 4500);
                         }}
 
                         function queueDualScreenSlot(slot, giftName, sender) {{
@@ -3764,7 +3789,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             if (dualReactionTimer) clearTimeout(dualReactionTimer);
 
                             catVid.crossOrigin = "anonymous";
-                            catVid.src = '/video-stream?name=video_' + slot + '.mp4';
+                            const targetSrc = '/video-stream?name=video_' + slot + '.mp4';
+                            if (!catVid.src || !catVid.src.endsWith(targetSrc)) {{
+                                catVid.src = targetSrc;
+                            }}
                             catVid.loop = (slot === 1);
 
                             catVid.onended = function() {{
@@ -3802,31 +3830,18 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 startRenderLoop();
                             }}
 
+                            try {{
+                                catVid.currentTime = 0;
+                            }} catch(e) {{}}
+
                             catVid.play().catch(e => {{
                                 console.warn('Cat video play warning:', e);
-                                if (slot !== 1) {{
-                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
-                                    dualIsReactionPlaying = false;
-                                    processDualScreenQueue();
-                                }}
                             }});
                         }}
 
                         function initDualScreenStudio() {{
                             const canvas = document.getElementById('dualCompositeCanvas');
                             if (!canvas) return;
-
-                            // Explicitly bind event listeners to gift simulation buttons for max reliability
-                            for (let s = 2; s <= 6; s++) {{
-                                const simBtn = document.getElementById('btn-sim-slot-' + s);
-                                if (simBtn) {{
-                                    simBtn.addEventListener('click', (ev) => simulateGift(ev, s));
-                                }}
-                            }}
-                            const rstBtn = document.getElementById('btn-reset-standby');
-                            if (rstBtn) {{
-                                rstBtn.addEventListener('click', (ev) => resetStandby(ev));
-                            }}
 
                             if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
                                 navigator.mediaDevices.enumerateDevices().then(devices => {{
@@ -4001,17 +4016,33 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                                 // 5. Toast Notification / Gift Banner at Center-Top (x=30, y=400)
                                 if (dualActiveToast) {{
-                                    ctx.fillStyle = 'rgba(15, 15, 24, 0.92)';
+                                    ctx.save();
+                                    ctx.fillStyle = 'rgba(15, 15, 24, 0.94)';
                                     ctx.beginPath();
-                                    ctx.roundRect(30, 400, 660, 52, 8);
+                                    if (ctx.roundRect) {{
+                                        ctx.roundRect(30, 400, 660, 54, 10);
+                                    }} else {{
+                                        ctx.rect(30, 400, 660, 54);
+                                    }}
                                     ctx.fill();
                                     ctx.strokeStyle = '#fe2c55';
                                     ctx.lineWidth = 2;
                                     ctx.stroke();
+
+                                    // Inner neon highlight line
+                                    if (ctx.roundRect) {{
+                                        ctx.beginPath();
+                                        ctx.roundRect(33, 403, 654, 48, 8);
+                                        ctx.strokeStyle = 'rgba(37, 244, 238, 0.45)';
+                                        ctx.lineWidth = 1;
+                                        ctx.stroke();
+                                    }}
+
                                     ctx.fillStyle = '#25f4ee';
                                     ctx.font = 'bold 16px sans-serif';
                                     ctx.textAlign = 'center';
-                                    ctx.fillText(dualActiveToast, 360, 432);
+                                    ctx.fillText(dualActiveToast, 360, 434);
+                                    ctx.restore();
                                 }}
                             }}
 
@@ -4814,6 +4845,15 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 return
             filepath = os.path.realpath(os.path.join(VIDEOS_DIR, filename))
             real_videos_dir = os.path.realpath(VIDEOS_DIR)
+            if not filepath.startswith(real_videos_dir) or not os.path.exists(filepath):
+                if filename.startswith("video_"):
+                    slot_part = filename.replace("video_", "").split(".")[0]
+                    try:
+                        cand = find_slot_video(int(slot_part))
+                        if cand and os.path.exists(cand):
+                            filepath = os.path.realpath(cand)
+                    except Exception:
+                        pass
             if not filepath.startswith(real_videos_dir) or not os.path.exists(filepath):
                 self.send_response(404)
                 self.end_headers()
@@ -5826,6 +5866,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2>Gagal stop stream: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
                 
         elif parsed_url.path == '/simulate-gift':
+            global global_gift_seq, latest_gift_event, recent_gift_logs
             query_params = urllib.parse.parse_qs(parsed_url.query)
             slot_str = query_params.get("slot", [None])[0]
             if not slot_str:
@@ -5891,8 +5932,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         detail_msg = f"Live stream langsung beralih ke Video Reaksi Slot {target_slot} ({gift_name})."
                 else:
                     detail_msg = f"Simulasi diterima, namun tidak ada slot reaksi yang cocok ({res.get('reason')})."
+                event_id = latest_gift_event.get("id") if latest_gift_event else ""
             else:
-                global global_gift_seq, latest_gift_event, recent_gift_logs
                 global_gift_seq += 1
                 event_id = f"{int(time.time()*1000)}_{target_slot}_{global_gift_seq}"
                 gift_info = {
@@ -5910,10 +5951,27 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 latest_gift_event = gift_info
                 recent_gift_logs.appendleft(gift_info)
                 listener_status["totalGiftsReceived"] += 1
+                stream_metadata["currentSlot"] = target_slot
+                stream_metadata["currentVideo"] = f"video_{target_slot}.mp4"
                 detail_msg = f"Simulasi Gift {gift_name} (Slot {target_slot}) berhasil dicatat & dipicu."
+
+                v_path = find_slot_video(target_slot)
+                dur = get_video_duration(v_path) if v_path else 10.0
+                def _offline_slot_finish(seq_id, eid):
+                    time.sleep(max(1.0, dur))
+                    with queue_lock:
+                        if global_gift_seq == seq_id:
+                            stream_metadata["currentSlot"] = 1
+                            stream_metadata["currentVideo"] = "video_1.mp4"
+                        for log in recent_gift_logs:
+                            if log.get("id") == eid and log.get("status") == "Sedang Diputar":
+                                log["status"] = "Selesai"
+                                break
+                threading.Thread(target=_offline_slot_finish, args=(global_gift_seq, event_id), daemon=True).start()
 
             resp_data = {
                 "success": True,
+                "id": event_id,
                 "slot": target_slot,
                 "giftName": gift_name,
                 "icon": gift_icon,
