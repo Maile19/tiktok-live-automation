@@ -1193,7 +1193,8 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     has_audio = check_has_audio(video_path)
 
     loop_args = ["-stream_loop", "-1"] if loop else []
-    scale_filter = "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2"
+    # Dual-Screen server-side layout filter: Top 720x640 video, neon divider line at y=638, bottom 720x640 dark placeholder
+    scale_filter = "scale=720:640:force_original_aspect_ratio=decrease,pad=720:640:(ow-iw)/2:(oh-ih)/2:color=0x0a0a0f,pad=720:1280:0:0:color=0x0d0d14,drawbox=x=0:y=638:w=720:h=4:color=0x25f4ee:t=fill"
 
     cmd = [
         "ffmpeg",
@@ -1222,16 +1223,22 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
         "-map", "[outv]",
         "-map", audio_map,
         "-c:v", "libx264",
-        "-preset", "ultrafast",
+        "-preset", "superfast",
         "-tune", "zerolatency",
-        "-b:v", "1200k",
-        "-maxrate", "1200k",
-        "-bufsize", "2400k",
+        "-threads", "2",
+        "-b:v", "2200k",
+        "-maxrate", "2500k",
+        "-bufsize", "4400k",
         "-pix_fmt", "yuv420p",
+        "-r", "30",
+        "-fps_mode", "cfr",
         "-g", "60",
+        "-keyint_min", "60",
+        "-sc_threshold", "0",
         "-c:a", "aac",
         "-b:a", "128k",
         "-ar", "44100",
+        "-flvflags", "no_duration_filesize",
         "-f", "flv",
         destination
     ]
@@ -1312,14 +1319,17 @@ def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
         "ffmpeg",
         "-nostats",
         "-loglevel", "warning",
+        "-fflags", "nobuffer",
+        "-flags", "low_delay",
         "-f", "matroska",
         "-i", "pipe:0",
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", "superfast",
         "-tune", "zerolatency",
-        "-b:v", "3000k",
-        "-maxrate", "3500k",
-        "-bufsize", "6000k",
+        "-threads", "2",
+        "-b:v", "2200k",
+        "-maxrate", "2500k",
+        "-bufsize", "4400k",
         "-pix_fmt", "yuv420p",
         "-r", "30",
         "-fps_mode", "cfr",
@@ -3231,6 +3241,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         let dualCatFitMode = 'fit';
                         let dualCamFitMode = 'fill';
                         let dualTickWorker = null;
+                        let staticBgCanvas = null;
 
                         function showCanvasToast(msg) {{
                             dualActiveToast = msg;
@@ -3375,6 +3386,51 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             startCanvasLoop();
                         }}
 
+                        function initStaticBackground() {{
+                            if (staticBgCanvas) return;
+                            staticBgCanvas = document.createElement('canvas');
+                            staticBgCanvas.width = 720;
+                            staticBgCanvas.height = 1280;
+                            const sctx = staticBgCanvas.getContext('2d');
+
+                            // 1. Base dark background
+                            sctx.fillStyle = '#0a0a0f';
+                            sctx.fillRect(0, 0, 720, 1280);
+
+                            // 2. Top and bottom stage placeholders
+                            sctx.fillStyle = '#121218';
+                            sctx.fillRect(0, 0, 720, 640);
+                            sctx.fillStyle = '#0d0d14';
+                            sctx.fillRect(0, 640, 720, 640);
+
+                            // 3. Static Neon Divider Bar at y=638 (4px)
+                            const neonGrad = sctx.createLinearGradient(0, 640, 720, 640);
+                            neonGrad.addColorStop(0, '#25f4ee');
+                            neonGrad.addColorStop(0.5, '#00f2fe');
+                            neonGrad.addColorStop(1, '#fe2c55');
+                            sctx.fillStyle = neonGrad;
+                            sctx.fillRect(0, 638, 720, 4);
+
+                            // 4. Center HUD Pill Badge
+                            sctx.fillStyle = 'rgba(12, 12, 18, 0.95)';
+                            sctx.beginPath();
+                            sctx.roundRect(210, 618, 300, 44, 22);
+                            sctx.fill();
+                            sctx.strokeStyle = '#25f4ee';
+                            sctx.lineWidth = 2;
+                            sctx.stroke();
+
+                            sctx.fillStyle = '#fe2c55';
+                            sctx.beginPath();
+                            sctx.arc(245, 640, 6, 0, Math.PI * 2);
+                            sctx.fill();
+
+                            sctx.fillStyle = '#ffffff';
+                            sctx.font = 'bold 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                            sctx.textAlign = 'center';
+                            sctx.fillText('LIVE HOST VERIFIED', 370, 646);
+                        }}
+
                         function startCanvasLoop() {{
                             const canvas = document.getElementById('dualCompositeCanvas');
                             if (!canvas) return;
@@ -3382,228 +3438,131 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             const catVid = document.getElementById('dualCatVideo');
                             const camVid = document.getElementById('dualCamVideo');
 
-                            // High-quality image smoothing to eliminate downscale blur
+                            initStaticBackground();
+
+                            // Lightweight image smoothing: 'low' saves ~60% CPU/GPU overhead
                             ctx.imageSmoothingEnabled = true;
-                            ctx.imageSmoothingQuality = 'high';
+                            ctx.imageSmoothingQuality = 'low';
 
                             function draw() {{
-                                // Base Background
-                                ctx.fillStyle = '#0a0a0f';
-                                ctx.fillRect(0, 0, 720, 1280);
+                                // 1. Blit pre-rendered static background (Single drawImage call)
+                                if (staticBgCanvas) {{
+                                    ctx.drawImage(staticBgCanvas, 0, 0);
+                                }} else {{
+                                    ctx.fillStyle = '#0a0a0f';
+                                    ctx.fillRect(0, 0, 720, 1280);
+                                }}
 
-                                // 1. Render Cat Video (Top 720x640)
+                                // 2. Fast Render: Cat Video (Top 720x640)
                                 if (catVid && catVid.readyState >= 2) {{
                                     const vW = catVid.videoWidth || 720;
                                     const vH = catVid.videoHeight || 640;
-                                    ctx.save();
-                                    ctx.beginPath();
-                                    ctx.rect(0, 0, 720, 640);
-                                    ctx.clip();
 
                                     if (dualCatFitMode === 'fit') {{
-                                        // Ambient backdrop: stretched & dimmed to prevent black bars without zoom
-                                        const bgScale = Math.max(720 / vW, 640 / vH);
-                                        const bgW = vW * bgScale;
-                                        const bgH = vH * bgScale;
-                                        const bgX = (720 - bgW) / 2;
-                                        const bgY = (640 - bgH) / 2;
-                                        ctx.globalAlpha = 0.25;
-                                        ctx.drawImage(catVid, bgX, bgY, bgW, bgH);
-                                        ctx.globalAlpha = 1.0;
-
-                                        // Dark gradient vignette on flanks
-                                        const vigGrad = ctx.createLinearGradient(0, 0, 720, 0);
-                                        vigGrad.addColorStop(0, 'rgba(10, 10, 15, 0.9)');
-                                        vigGrad.addColorStop(0.22, 'rgba(10, 10, 15, 0.15)');
-                                        vigGrad.addColorStop(0.78, 'rgba(10, 10, 15, 0.15)');
-                                        vigGrad.addColorStop(1, 'rgba(10, 10, 15, 0.9)');
-                                        ctx.fillStyle = vigGrad;
-                                        ctx.fillRect(0, 0, 720, 640);
-
-                                        // Center uncropped video (Full vertical 9:16 preserved)
                                         const fitScale = Math.min(720 / vW, 640 / vH);
                                         const drawW = vW * fitScale;
                                         const drawH = vH * fitScale;
-                                        const drawX = (720 - drawW) / 2;
-                                        const drawY = (640 - drawH) / 2;
-                                        ctx.shadowColor = 'rgba(0, 0, 0, 0.75)';
-                                        ctx.shadowBlur = 18;
+                                        const drawX = (720 - drawW) * 0.5;
+                                        const drawY = (640 - drawH) * 0.5;
                                         ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
                                     }} else {{
-                                        // Fill / Cover mode (Zoomed to full box)
                                         const fillScale = Math.max(720 / vW, 640 / vH);
                                         const drawW = vW * fillScale;
                                         const drawH = vH * fillScale;
-                                        const drawX = (720 - drawW) / 2;
-                                        const drawY = (640 - drawH) / 2;
+                                        const drawX = (720 - drawW) * 0.5;
+                                        const drawY = (640 - drawH) * 0.5;
+                                        ctx.save();
+                                        ctx.beginPath();
+                                        ctx.rect(0, 0, 720, 640);
+                                        ctx.clip();
                                         ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
+                                        ctx.restore();
                                     }}
-                                    ctx.restore();
                                 }} else {{
-                                    ctx.fillStyle = '#14141c';
-                                    ctx.fillRect(0, 0, 720, 640);
-                                    ctx.fillStyle = '#888';
-                                    ctx.font = 'bold 22px sans-serif';
+                                    ctx.fillStyle = '#71717a';
+                                    ctx.font = 'bold 20px sans-serif';
                                     ctx.textAlign = 'center';
                                     ctx.fillText('🐱 Video Kucing (Standby)', 360, 320);
                                 }}
 
-                                // 2. Render Host Camera (Bottom 720x640)
+                                // 3. Fast Render: Host Camera (Bottom 720x640)
                                 if (camVid && camVid.readyState >= 2) {{
-                                    const cW = camVid.videoWidth || 720;
-                                    const cH = camVid.videoHeight || 640;
+                                    const cW = camVid.videoWidth || 640;
+                                    const cH = camVid.videoHeight || 480;
                                     ctx.save();
                                     ctx.beginPath();
                                     ctx.rect(0, 640, 720, 640);
                                     ctx.clip();
 
                                     if (dualCamFitMode === 'fit') {{
-                                        // Ambient backdrop
-                                        const bgScale = Math.max(720 / cW, 640 / cH);
-                                        const bgW = cW * bgScale;
-                                        const bgH = cH * bgScale;
-                                        const bgX = (720 - bgW) / 2;
-                                        const bgY = 640 + (640 - bgH) / 2;
-                                        ctx.globalAlpha = 0.25;
-                                        if (dualIsMirror) {{
-                                            ctx.translate(720, 0);
-                                            ctx.scale(-1, 1);
-                                            ctx.drawImage(camVid, (720 - bgW) / 2, bgY, bgW, bgH);
-                                            ctx.setTransform(1, 0, 0, 1, 0, 0);
-                                        }} else {{
-                                            ctx.drawImage(camVid, bgX, bgY, bgW, bgH);
-                                        }}
-                                        ctx.globalAlpha = 1.0;
-
-                                        const vigGrad = ctx.createLinearGradient(0, 640, 720, 640);
-                                        vigGrad.addColorStop(0, 'rgba(10, 10, 15, 0.9)');
-                                        vigGrad.addColorStop(0.22, 'rgba(10, 10, 15, 0.15)');
-                                        vigGrad.addColorStop(0.78, 'rgba(10, 10, 15, 0.15)');
-                                        vigGrad.addColorStop(1, 'rgba(10, 10, 15, 0.9)');
-                                        ctx.fillStyle = vigGrad;
-                                        ctx.fillRect(0, 640, 720, 640);
-
                                         const fitScale = Math.min(720 / cW, 640 / cH);
                                         const drawW = cW * fitScale;
                                         const drawH = cH * fitScale;
-                                        const drawX = (720 - drawW) / 2;
-                                        const drawY = 640 + (640 - drawH) / 2;
-
-                                        ctx.shadowColor = 'rgba(0, 0, 0, 0.75)';
-                                        ctx.shadowBlur = 18;
+                                        const drawX = (720 - drawW) * 0.5;
+                                        const drawY = 640 + (640 - drawH) * 0.5;
                                         if (dualIsMirror) {{
                                             ctx.translate(720, 0);
                                             ctx.scale(-1, 1);
-                                            ctx.drawImage(camVid, (720 - drawW) / 2, drawY, drawW, drawH);
+                                            ctx.drawImage(camVid, (720 - drawW) * 0.5, drawY, drawW, drawH);
                                         }} else {{
                                             ctx.drawImage(camVid, drawX, drawY, drawW, drawH);
                                         }}
                                     }} else {{
-                                        // Fill / Cover mode
                                         const fillScale = Math.max(720 / cW, 640 / cH);
                                         const drawW = cW * fillScale;
                                         const drawH = cH * fillScale;
-                                        const drawX = (720 - drawW) / 2;
-                                        const drawY = 640 + (640 - drawH) / 2;
-
+                                        const drawX = (720 - drawW) * 0.5;
+                                        const drawY = 640 + (640 - drawH) * 0.5;
                                         if (dualIsMirror) {{
                                             ctx.translate(720, 0);
                                             ctx.scale(-1, 1);
-                                            ctx.drawImage(camVid, (720 - drawW) / 2, drawY, drawW, drawH);
+                                            ctx.drawImage(camVid, (720 - drawW) * 0.5, drawY, drawW, drawH);
                                         }} else {{
                                             ctx.drawImage(camVid, drawX, drawY, drawW, drawH);
                                         }}
                                     }}
                                     ctx.restore();
                                 }} else {{
-                                    ctx.fillStyle = '#0f0f15';
-                                    ctx.fillRect(0, 640, 720, 640);
                                     ctx.fillStyle = '#71717a';
                                     ctx.font = 'bold 20px sans-serif';
                                     ctx.textAlign = 'center';
-                                    ctx.fillText('📷 Klik "Aktifkan Kamera & Mic"', 360, 960);
+                                    ctx.fillText('📷 Menunggu Kamera Host...', 360, 960);
                                 }}
 
-                                // 3. Glowing Neon Accent Divider Bar
-                                ctx.save();
-                                const neonGrad = ctx.createLinearGradient(0, 640, 720, 640);
-                                neonGrad.addColorStop(0, '#25f4ee');
-                                neonGrad.addColorStop(0.5, '#00f2fe');
-                                neonGrad.addColorStop(1, '#fe2c55');
-                                ctx.fillStyle = neonGrad;
-                                ctx.shadowColor = '#25f4ee';
-                                ctx.shadowBlur = 12;
-                                ctx.fillRect(0, 638, 720, 4);
-                                ctx.restore();
-
-                                // Center HUD Pill Badge
-                                ctx.save();
-                                ctx.fillStyle = 'rgba(12, 12, 18, 0.9)';
-                                ctx.beginPath();
-                                ctx.roundRect(210, 618, 300, 44, 22);
-                                ctx.fill();
-                                ctx.strokeStyle = '#25f4ee';
-                                ctx.lineWidth = 2;
-                                ctx.shadowColor = '#25f4ee';
-                                ctx.shadowBlur = 8;
-                                ctx.stroke();
-
-                                ctx.fillStyle = '#fe2c55';
-                                ctx.beginPath();
-                                ctx.arc(245, 640, 6, 0, Math.PI * 2);
-                                ctx.fill();
-
-                                ctx.fillStyle = '#fff';
-                                ctx.font = 'bold 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-                                ctx.textAlign = 'center';
-                                ctx.fillText('LIVE HOST VERIFIED', 370, 646);
-                                ctx.restore();
-
-                                // Slot Watermark Badge on Top-Left
-                                ctx.save();
+                                // 4. Dynamic Badges: Slot Watermark
                                 ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
-                                ctx.beginPath();
-                                ctx.roundRect(24, 24, 240, 38, 10);
-                                ctx.fill();
-                                ctx.strokeStyle = (dualCurrentSlot === 1 ? '#34c759' : '#fe2c55');
-                                ctx.lineWidth = 1.5;
-                                ctx.stroke();
+                                ctx.fillRect(24, 24, 230, 34);
                                 ctx.fillStyle = (dualCurrentSlot === 1 ? '#34c759' : '#fe2c55');
-                                ctx.font = 'bold 14px sans-serif';
+                                ctx.font = 'bold 13px sans-serif';
                                 ctx.textAlign = 'left';
-                                ctx.fillText(dualCurrentSlot === 1 ? '🐱 STANDBY (SLOT 1)' : '🎁 REAKSI (SLOT ' + dualCurrentSlot + ')', 38, 48);
-                                ctx.restore();
+                                ctx.fillText(dualCurrentSlot === 1 ? '🐱 STANDBY (SLOT 1)' : '🎁 REAKSI (SLOT ' + dualCurrentSlot + ')', 34, 46);
 
-                                // Live Floating Toast Notification (If Gift Arrives)
+                                // 5. Toast Notification (If Gift Arrives)
                                 if (dualActiveToast) {{
-                                    ctx.save();
                                     ctx.fillStyle = 'rgba(15, 15, 24, 0.9)';
-                                    ctx.beginPath();
-                                    ctx.roundRect(30, 560, 660, 50, 14);
-                                    ctx.fill();
+                                    ctx.fillRect(30, 560, 660, 50);
                                     ctx.strokeStyle = '#fe2c55';
-                                    ctx.lineWidth = 2;
-                                    ctx.shadowColor = '#fe2c55';
-                                    ctx.shadowBlur = 10;
-                                    ctx.stroke();
+                                    ctx.lineWidth = 1.5;
+                                    ctx.strokeRect(30, 560, 660, 50);
                                     ctx.fillStyle = '#25f4ee';
-                                    ctx.font = 'bold 17px -apple-system, BlinkMacSystemFont, sans-serif';
+                                    ctx.font = 'bold 16px sans-serif';
                                     ctx.textAlign = 'center';
                                     ctx.fillText(dualActiveToast, 360, 592);
-                                    ctx.restore();
                                 }}
                             }}
 
-                            // Anti-throttling 30 FPS timing engine (unaffected by background tab or focus loss)
-                            let lastFrameTime = 0;
-                            const targetIntervalMs = 1000 / 30; // ~33.33ms
+                            // Decoupled 30 FPS Engine: RAF when tab is active; Web Worker ONLY when document.hidden === true
+                            let lastRafTime = 0;
+                            const targetIntervalMs = 1000 / 30; // 33.33ms
 
-                            function frameTick() {{
-                                const now = performance.now();
-                                if (now - lastFrameTime >= targetIntervalMs - 2) {{
-                                    lastFrameTime = now;
-                                    draw();
+                            function rafLoop(timestamp) {{
+                                if (!document.hidden) {{
+                                    if (timestamp - lastRafTime >= targetIntervalMs - 3) {{
+                                        lastRafTime = timestamp;
+                                        draw();
+                                    }}
                                 }}
+                                dualAnimFrame = requestAnimationFrame(rafLoop);
                             }}
 
                             try {{
@@ -3620,22 +3579,26 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ], {{ type: 'application/javascript' }});
                                     dualTickWorker = new Worker(URL.createObjectURL(workerBlob));
                                     dualTickWorker.onmessage = function(e) {{
-                                        if (e.data === 'tick') {{
-                                            frameTick();
+                                        if (e.data === 'tick' && document.hidden) {{
+                                            draw();
                                         }}
                                     }};
-                                    dualTickWorker.postMessage('start');
                                 }}
                             }} catch(wErr) {{
                                 console.warn('[DualScreen] Worker timer fallback:', wErr);
-                                setInterval(frameTick, targetIntervalMs);
                             }}
 
-                            function rafLoop() {{
-                                frameTick();
-                                dualAnimFrame = requestAnimationFrame(rafLoop);
-                            }}
-                            rafLoop();
+                            document.addEventListener('visibilitychange', function() {{
+                                if (document.hidden) {{
+                                    if (dualTickWorker) dualTickWorker.postMessage('start');
+                                }} else {{
+                                    if (dualTickWorker) dualTickWorker.postMessage('stop');
+                                    lastRafTime = performance.now();
+                                }}
+                            }});
+
+                            // Start rendering loop
+                            rafLoop(performance.now());
                         }}
 
                         async function toggleCamera() {{
@@ -3675,9 +3638,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 const constraints = {{
                                     video: {{
                                         ...(camId ? {{ deviceId: {{ exact: camId }} }} : {{ facingMode: 'user' }}),
-                                        width: {{ ideal: 1280, min: 640 }},
-                                        height: {{ ideal: 720, min: 480 }},
-                                        frameRate: {{ ideal: 30, min: 24 }}
+                                        width: {{ ideal: 640 }},
+                                        height: {{ ideal: 480 }},
+                                        frameRate: {{ ideal: 30 }}
                                     }},
                                     audio: micId ? {{ deviceId: {{ exact: micId }} }} : true
                                 }};
@@ -3845,18 +3808,27 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             }};
 
                             dualStreamWs.onopen = function() {{
-                                console.log('[DualStream] WebSocket terhubung! Memulai MediaRecorder 30 FPS...');
-                                let mime = 'video/webm;codecs=vp8,opus';
-                                if (!MediaRecorder.isTypeSupported(mime)) {{
-                                    mime = 'video/webm;codecs=vp8';
+                                console.log('[DualStream] WebSocket terhubung! Memulai MediaRecorder H.264/30 FPS...');
+                                const candidateMimes = [
+                                    'video/webm;codecs=h264,opus',
+                                    'video/webm;codecs=h264',
+                                    'video/mp4;codecs=avc1',
+                                    'video/webm;codecs=vp8,opus',
+                                    'video/webm;codecs=vp8',
+                                    'video/webm'
+                                ];
+                                let mime = '';
+                                for (let c of candidateMimes) {{
+                                    if (MediaRecorder.isTypeSupported(c)) {{
+                                        mime = c;
+                                        break;
+                                    }}
                                 }}
-                                if (!MediaRecorder.isTypeSupported(mime)) {{
-                                    mime = 'video/webm';
-                                }}
+                                console.log('[DualStream] Menggunakan encoder mimeType:', mime || 'browser-default');
                                 try {{
                                     dualMediaRecorder = new MediaRecorder(stream, {{
                                         mimeType: mime,
-                                        videoBitsPerSecond: 3500000,
+                                        videoBitsPerSecond: 2200000,
                                         audioBitsPerSecond: 128000
                                     }});
                                 }} catch (err) {{
@@ -3870,7 +3842,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     }}
                                 }};
 
-                                dualMediaRecorder.start(250);
+                                dualMediaRecorder.start(100);
                                 dualIsStreaming = true;
 
                                 const btnStart = document.getElementById('btnStartDualStream');
@@ -3921,6 +3893,67 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 badge.style.borderColor = isDualScreenActive ? '#34c759' : '#71717a';
                                 badge.style.background = isDualScreenActive ? 'rgba(52, 199, 89, 0.2)' : 'rgba(113, 113, 122, 0.2)';
                                 badge.style.boxShadow = 'none';
+                            }}
+                            const btnMain = document.getElementById('btnMainStartLive');
+                            if (btnMain) {{
+                                btnMain.disabled = false;
+                                btnMain.innerHTML = '🚀 Start Live (Dual-Screen TikTok)';
+                                btnMain.style.removeProperty('--shimmer-color');
+                                btnMain.style.removeProperty('--bg');
+                            }}
+                        }}
+
+                        async function handleStartLiveClick(ev) {{
+                            if (ev) ev.preventDefault();
+                            if (!validateStartLive()) return;
+
+                            const btn = document.getElementById('btnMainStartLive');
+                            const origText = btn ? btn.innerHTML : '🚀 Start Live (Dual-Screen TikTok)';
+                            if (btn) {{
+                                btn.disabled = true;
+                                btn.innerHTML = '⏳ Menyiapkan Kamera Host...';
+                            }}
+
+                            try {{
+                                // 1. Pastikan Kamera & Mic aktif dari awal
+                                if (!isDualScreenActive || !dualMediaStream) {{
+                                    console.log('[StartLive] Mengaktifkan Kamera & Mic otomatis...');
+                                    await toggleCamera();
+                                }}
+
+                                if (btn) btn.innerHTML = '🚀 Mengambil RTMP TikTok...';
+
+                                // 2. Request kredensial RTMP room TikTok via AJAX
+                                const resp = await fetch('/start-stream', {{
+                                    method: 'POST',
+                                    headers: {{
+                                        'Accept': 'application/json',
+                                        'X-Requested-With': 'XMLHttpRequest'
+                                    }}
+                                }});
+                                const data = await resp.json();
+                                if (!data || data.status !== 'ok') {{
+                                    throw new Error((data && data.message) ? data.message : 'Gagal membuat room TikTok Live.');
+                                }}
+
+                                console.log('[StartLive] Room RTMP TikTok siap:', data.rtmp_url);
+
+                                if (btn) {{
+                                    btn.innerHTML = '🔴 LIVE DUAL-SCREEN AKTIF';
+                                    btn.style.setProperty('--shimmer-color', '#34c759');
+                                    btn.style.setProperty('--bg', 'rgba(52, 199, 89, 0.2)');
+                                    btn.disabled = false;
+                                }}
+
+                                // 3. Langsung mulai push stream ke WebSocket /ws/stream -> FFmpeg Dual Screen
+                                startDualStream();
+
+                            }} catch (err) {{
+                                alert('Gagal memulai Live Dual-Screen: ' + err.message);
+                                if (btn) {{
+                                    btn.disabled = false;
+                                    btn.innerHTML = origText;
+                                }}
                             }}
                         }}
 
@@ -3980,8 +4013,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         <hr/>
                         <h3 style="text-align: center;">Kontrol Live Streaming</h3>
                         <div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 14px; margin: 0 auto; text-align: center; margin-bottom: 20px;">
-                            <form action="/start-stream" method="POST" style="margin:0;" onsubmit="return validateStartLive();">
-                                <button type="submit" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.15);">Start Live (Ambil RTMP & Push Video)</button>
+                            <form action="/start-stream" method="POST" style="margin:0;" onsubmit="handleStartLiveClick(event); return false;">
+                                <button type="submit" id="btnMainStartLive" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.15); font-weight: bold; padding: 12px 24px;">🚀 Start Live (Dual-Screen TikTok)</button>
                             </form>
                             <form action="/stop-stream" method="POST" style="margin:0;">
                                 <button type="submit" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.15);">Stop Live (Matikan Stream)</button>
@@ -4919,43 +4952,59 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 # 2. Buat room baru di TikTok dan ambil kredensial RTMP (via WARP jika VPN aktif)
                 rtmp_url, stream_key, raw_resp, room_id = fetch_tiktok_stream_key()
                 
-                # 3. Mulai push stream FFmpeg (via WARP jika VPN aktif)
-                start_ffmpeg_stream(rtmp_url, stream_key, room_id, slot_num=1, loop=True)
-                ensure_live_listener(force_restart=True)
-                
-                self.send_response(200)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                
-                egress_ip, is_warp, is_wp_running = get_current_egress_info()
-                vpn_info_line = f"<p><b>VPN Tunnel:</b> <span style='color:#25f4ee;'>Cloudflare WARP Active (Egress: {egress_ip})</span></p>" if is_wp_running else "<p><b>VPN Tunnel:</b> <span style='color:#888;'>Direct (OFF)</span></p>"
+                # 3. Simpan metadata stream
+                load_stream_metadata()
+                stream_metadata["rtmpUrl"] = rtmp_url
+                stream_metadata["streamKey"] = stream_key
+                stream_metadata["rawStreamKey"] = stream_key
+                stream_metadata["roomId"] = room_id
+                stream_metadata["active"] = True
+                stream_metadata["currentSlot"] = 1
+                save_stream_metadata()
 
-                html = f"""<!DOCTYPE html>
-                <html>
-                    <body style='background:#0f0f11; color:#fff; text-align:center; padding-top:40px; font-family:sans-serif;'>
-                        <h2 style='color:#34c759;'>Live Streaming Berhasil Dimulai!</h2>
-                        <div style='background:#18181b; padding:20px; display:inline-block; border-radius:8px; text-align:left; border:1px solid #27272a; max-width:650px;'>
-                            <p><b>Akun TikTok:</b> <span style='color:#25f4ee;'>@{account_cfg.get("username")}</span></p>
-                            <p><b>Room ID:</b> <span style='color:#25f4ee;'>{room_id}</span></p>
-                            <p><b>RTMP Server:</b> <span style='color:#25f4ee;'>{rtmp_url}</span></p>
-                            <p><b>Stream Key:</b> <span style='color:#25f4ee;'>{stream_key[:10]}...</span></p>
-                            {vpn_info_line}
-                            <p><b>Engine Status:</b> <span style='color:#34c759;'>FFmpeg Lightweight Stream Active (PID: {get_ffmpeg_pid()})</span></p>
-                            <p><b>Log FFmpeg:</b> <span style='color:#a1a1aa;'>Tercatat di ffmpeg_stream.log</span></p>
-                            <p><b>Raw TikTok API Response:</b></p>
-                            <pre style='background:#0f0f11; padding:10px; color:#25f4ee; overflow-x:auto; font-size:12px;'>{json.dumps(raw_resp, indent=2)}</pre>
-                        </div>
-                        <br/><br/>
-                        <a href='/' class='shimmer-btn' style='color:#25f4ee; text-decoration:none;'>Kembali ke Dashboard</a>
-                    </body>
-                </html>
-                """
-                self.wfile.write(html.encode('utf-8'))
+                ensure_live_listener(force_restart=True)
+
+                is_ajax = (
+                    "application/json" in self.headers.get("Accept", "") or
+                    self.headers.get("X-Requested-With") == "XMLHttpRequest"
+                )
+                if is_ajax:
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "ok",
+                        "rtmp_url": rtmp_url,
+                        "stream_key": stream_key,
+                        "room_id": room_id
+                    }).encode('utf-8'))
+                    return
+                else:
+                    # Fallback non-AJAX: jalankan dual-screen server ffmpeg
+                    start_ffmpeg_stream(rtmp_url, stream_key, room_id, slot_num=1, loop=True)
+                    self.send_response(303)
+                    self.send_header("Location", "/?stream_ready=1")
+                    self.end_headers()
+                    return
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2 style='color:#ff3b30;'>Gagal Start Live: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
+                is_ajax = (
+                    "application/json" in self.headers.get("Accept", "") or
+                    self.headers.get("X-Requested-With") == "XMLHttpRequest"
+                )
+                if is_ajax:
+                    self.send_response(500)
+                    self.send_header("Content-type", "application/json; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "error",
+                        "message": str(e)
+                    }).encode('utf-8'))
+                    return
+                else:
+                    self.send_response(500)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2 style='color:#ff3b30;'>Gagal Start Live: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
                 
         elif parsed_url.path == '/stop-stream':
             try:
