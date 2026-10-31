@@ -1,0 +1,50 @@
+{
+  "layer_position": "above_webcam",
+  "scheduler": {
+    "enabled": true,
+    "min_interval_sec": 15,
+    "max_interval_sec": 60
+  },
+  "slots": {
+    "1": {
+      "name": "Layer Animasi 1",
+      "enabled": true
+    },
+    "2": {
+      "name": "Layer Animasi 2",
+      "enabled": true
+    },
+    "3": {
+      "name": "Layer Animasi 3",
+      "enabled": true
+    },
+    "4": {
+      "name": "Layer Animasi 4",
+      "enabled": true
+    },
+    "5": {
+      "name": "Layer Animasi 5",
+      "enabled": true
+    },
+    "6": {
+      "name": "Layer Animasi 6",
+      "enabled": true
+    },
+    "7": {
+      "name": "Layer Animasi 7",
+      "enabled": true
+    },
+    "8": {
+      "name": "Layer Animasi 8",
+      "enabled": true
+    },
+    "9": {
+      "name": "Layer Animasi 9",
+      "enabled": true
+    },
+    "10": {
+      "name": "Layer Animasi 10",
+      "enabled": true
+    }
+  }
+}

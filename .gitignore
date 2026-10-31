@@ -7,6 +7,9 @@ dist/
 # Temporary & backup files
 *.bak*
 *.audit_backup
+*.orig
+*.swp
+*~
 __pycache__/
 *.pyc
 

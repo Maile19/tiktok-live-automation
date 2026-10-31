@@ -912,6 +912,215 @@ def save_video_meta(meta):
     except Exception as e:
         print(f"[VideoMeta] Error saving metadata: {e}")
 
+def probe_video_specs(filepath):
+    """
+    Mengambil metadata video dan audio menggunakan ffprobe dalam format JSON.
+    Mengembalikan dict berisi stream video, stream audio, dan format container.
+    """
+    try:
+        cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", filepath
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode != 0:
+            return None
+        data = json.loads(res.stdout)
+        v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
+        a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
+        return {"video": v, "audio": a, "format": data.get("format", {})}
+    except Exception as e:
+        print(f"[SmartBypass] Error probing video {filepath}: {e}")
+        return None
+
+def normalize_slot_video(temp_input_path, final_output_path):
+    """
+    Smart Bypass Video Processor (Zero CPU Re-encode):
+    - Case A (Direct Copy Bypass):
+      Jika resolusi 720x1280, codec h264, pix_fmt yuv420p, dan audio AAC (44.1k/48k stereo/mono),
+      jalankan remux instan `-c copy -movflags +faststart` (0% CPU, kualitas 100% identik).
+    - Case B (Audio Transcode Only):
+      Jika video sudah 720x1280 h264 yuv420p tetapi audio belum sesuai atau tidak ada audio,
+      jalankan `-c:v copy` (video 100% TIDAK di-encode ulang) dan sesuaikan track audio AAC.
+    - Case C (Fallback Re-encode):
+      Hanya jika resolusi bukan 720x1280 atau codec bukan h264, lakukan transcode berkualitas tinggi
+      ke 720x1280 yuv420p dengan preset veryfast dan CRF 20.
+    """
+    specs = probe_video_specs(temp_input_path)
+    if not specs or not specs.get("video"):
+        shutil.copyfile(temp_input_path, final_output_path)
+        return {"mode": "DIRECT_FILE_COPY", "details": "ffprobe unreadable, copied as-is"}
+
+    v = specs["video"]
+    a = specs.get("audio")
+    fmt = specs.get("format", {})
+    
+    width = int(v.get("width", 0))
+    height = int(v.get("height", 0))
+    codec_name = v.get("codec_name", "").lower()
+    pix_fmt = v.get("pix_fmt", "").lower()
+
+    # Parse Frame Rate (r_frame_rate atau avg_frame_rate)
+    fps_val = 0.0
+    for r_cand in (v.get("r_frame_rate", ""), v.get("avg_frame_rate", "")):
+        try:
+            if "/" in r_cand:
+                num, den = r_cand.split("/")
+                val = float(num) / float(den) if float(den) > 0 else 0.0
+            else:
+                val = float(r_cand)
+            if val > 0:
+                fps_val = val
+                break
+        except Exception:
+            pass
+
+    # Parse Bitrate (bps)
+    v_bitrate = 0
+    v_br_raw = v.get("bit_rate")
+    fmt_br_raw = fmt.get("bit_rate")
+    if v_br_raw and str(v_br_raw).isdigit():
+        v_bitrate = int(v_br_raw)
+    elif fmt_br_raw and str(fmt_br_raw).isdigit():
+        v_bitrate = int(fmt_br_raw)
+    else:
+        try:
+            dur_sec = float(fmt.get("duration", 0))
+            sz_bytes = float(fmt.get("size", 0))
+            if dur_sec > 0 and sz_bytes > 0:
+                v_bitrate = int((sz_bytes * 8) / dur_sec)
+        except Exception:
+            v_bitrate = 0
+
+    # Syarat Ketat video_compliant:
+    # 1. Resolusi tepat 720x1280
+    # 2. Codec h264
+    # 3. Pixel format yuv420p
+    # 4. FPS <= 30 (ideal 24)
+    # 5. Bitrate video <= 3,000,000 bps (3 Mbps)
+    is_res_ok = (width == 720 and height == 1280)
+    is_codec_ok = (codec_name == "h264")
+    is_pix_fmt_ok = (pix_fmt == "yuv420p")
+    is_fps_ok = (0.0 < fps_val <= 30.5)
+    is_bitrate_ok = (0 < v_bitrate <= 3000000)
+    video_compliant = is_res_ok and is_codec_ok and is_pix_fmt_ok and is_fps_ok and is_bitrate_ok
+
+    # Syarat Ketat audio_compliant:
+    # 1. Codec aac
+    # 2. Sample rate wajib 44100 Hz
+    # 3. Channels 2 (stereo)
+    has_audio = a is not None
+    audio_codec = a.get("codec_name", "").lower() if has_audio else ""
+    sample_rate = str(a.get("sample_rate", "")).strip() if has_audio else ""
+    channels = int(a.get("channels", 0)) if has_audio else 0
+    audio_compliant = has_audio and (audio_codec == "aac") and (sample_rate == "44100") and (channels == 2)
+
+    t0 = time.time()
+
+    # Case A: Direct Copy Bypass (0% CPU re-encode, 100% bit-for-bit video quality)
+    if video_compliant and audio_compliant:
+        cmd = [
+            "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+            "-i", temp_input_path,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            final_output_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if res.returncode == 0:
+            elapsed = round(time.time() - t0, 3)
+            print(f"[SmartBypass] ⚡ DIRECT COPY BYPASS (720x1280 h264 yuv420p & AAC {sample_rate}Hz in {elapsed}s). 0% CPU! Video kualitas 100% asli.")
+            return {
+                "mode": "DIRECT_COPY_BYPASS",
+                "width": width, "height": height, "codec": codec_name,
+                "fps": v.get("r_frame_rate", "24/1"),
+                "audio": f"AAC {sample_rate}Hz {channels}ch",
+                "cpu_saved": "100%",
+                "elapsed": elapsed
+            }
+
+    # Case B: Smart Audio Transcode / Silence Inject (Video -c:v copy preserved, 0% CPU video re-encode)
+    if video_compliant:
+        if has_audio:
+            cmd = [
+                "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+                "-i", temp_input_path,
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                "-movflags", "+faststart",
+                final_output_path
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+                "-i", temp_input_path,
+                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                "-shortest",
+                "-movflags", "+faststart",
+                final_output_path
+            ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if res.returncode == 0:
+            elapsed = round(time.time() - t0, 3)
+            print(f"[SmartBypass] 🎵 AUDIO TRANSCODE ONLY (Video -c:v copy preserved in {elapsed}s). 0% video re-encode!")
+            return {
+                "mode": "AUDIO_TRANSCODE_ONLY",
+                "width": width, "height": height, "codec": codec_name,
+                "fps": v.get("r_frame_rate", "24/1"),
+                "audio": "AAC 44100Hz 2ch (normalized)",
+                "cpu_saved": "95%",
+                "elapsed": elapsed
+            }
+
+    # Case C: Fallback Re-encode (Resolusi bukan 720x1280 atau codec bukan h264)
+    print(f"[SmartBypass] ⚠️ FALLBACK RE-ENCODE ({width}x{height} {codec_name} {pix_fmt} -> 720x1280 h264 yuv420p)")
+    scale_pad_filter = "scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black"
+    if has_audio:
+        cmd = [
+            "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+            "-i", temp_input_path,
+            "-vf", scale_pad_filter,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-maxrate", "2000k", "-bufsize", "4000k",
+            "-pix_fmt", "yuv420p", "-r", "24", "-fps_mode", "cfr",
+            "-g", "48", "-keyint_min", "48", "-sc_threshold", "0",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-movflags", "+faststart",
+            final_output_path
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+            "-i", temp_input_path,
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-vf", scale_pad_filter,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-maxrate", "2000k", "-bufsize", "4000k",
+            "-pix_fmt", "yuv420p", "-r", "24", "-fps_mode", "cfr",
+            "-g", "48", "-keyint_min", "48", "-sc_threshold", "0",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-shortest",
+            "-movflags", "+faststart",
+            final_output_path
+        ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    elapsed = round(time.time() - t0, 3)
+    if res.returncode == 0:
+        return {
+            "mode": "FALLBACK_RE_ENCODE",
+            "width": 720, "height": 1280, "codec": "h264",
+            "fps": "24/1",
+            "audio": "AAC 44100Hz 2ch",
+            "cpu_saved": "0% (Transcoded)",
+            "elapsed": elapsed
+        }
+    else:
+        print(f"[SmartBypass] Error during fallback re-encode: {res.stderr}")
+        shutil.copyfile(temp_input_path, final_output_path)
+        return {"mode": "EMERGENCY_RAW_COPY", "error": res.stderr, "elapsed": elapsed}
+
 DEFAULT_CHARACTER_CONFIG = {
     "overlay_enabled": True,
     "position": {"x": 60, "y": 150},
@@ -2564,7 +2773,18 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     display_name = orig_name if orig_name else existing_file
                     v_mime = "video/mp4" if existing_file.lower().endswith(".mp4") else "video/webm"
                     
+                    bypass_mode = slot_meta.get("bypass_mode", "")
+                    if bypass_mode == "DIRECT_COPY_BYPASS":
+                        bypass_badge = "<span style='background:rgba(52,199,89,0.18); border:1px solid #34c759; color:#34c759; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; margin-right:8px;'>⚡ Direct Bypass (0% CPU)</span>"
+                    elif bypass_mode == "AUDIO_TRANSCODE_ONLY":
+                        bypass_badge = "<span style='background:rgba(37,244,238,0.18); border:1px solid #25f4ee; color:#25f4ee; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; margin-right:8px;'>🎵 Audio Normalized</span>"
+                    elif bypass_mode == "FALLBACK_RE_ENCODE":
+                        bypass_badge = "<span style='background:rgba(255,184,0,0.18); border:1px solid #ffb800; color:#ffb800; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; margin-right:8px;'>🔄 Transcoded (720x1280)</span>"
+                    else:
+                        bypass_badge = "<span style='background:rgba(52,199,89,0.18); border:1px solid #34c759; color:#34c759; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; margin-right:8px;'>⚡ 720x1280 Ready</span>"
+
                     file_status_ui = f"""
+                    {bypass_badge}
                     <span style='color:#34c759; margin-right:8px;'>✅ <b>Video Tersedia</b> <span style='color:#888; font-size:12px;'>({size_mb} MB)</span></span>
                     <button type="button" class="modern-btn" style="padding:5px 12px; font-size:11px; margin-right:6px; background:#27272a; color:#25f4ee; border:1px solid #3f3f46; cursor:pointer;" onclick="editVideoName('{i}', '{display_name}')">✏️ Edit</button>
                     <button type="button" id="btn-preview-slot-{i}" class="modern-btn" style="padding:5px 12px; font-size:11px; margin-right:6px; background:rgba(37,244,238,0.1); color:#25f4ee; border:1px solid #25f4ee; cursor:pointer;" onclick="toggleSlotPreview('{i}', '{existing_file}', '{v_mime}', '{display_name}', '{size_mb}')">👁️ Tampilkan Preview</button>
@@ -2626,14 +2846,42 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 </button>
                 """
 
-            # Load existing cookies content for textarea
+            # Load existing cookies content & metadata for textarea and status badge
             cookies_content = ""
+            cookies_count = 0
+            cookies_mtime_str = "-"
             if cookies_exist:
                 try:
                     with open(COOKIES_FILE, 'r', encoding='utf-8') as cf:
                         cookies_content = cf.read()
+                        try:
+                            parsed_c = json.loads(cookies_content)
+                            if isinstance(parsed_c, (list, dict)):
+                                cookies_count = len(parsed_c)
+                        except Exception:
+                            pass
+                    mtime = os.path.getmtime(COOKIES_FILE)
+                    cookies_mtime_str = time.strftime('%Y-%m-%d %H:%M:%S WIB', time.localtime(mtime))
                 except Exception:
                     pass
+            escaped_cookies_content = cookies_content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+            if cookies_exist and cookies_count > 0:
+                if session_valid:
+                    cookies_badge_color = "#34c759"
+                    cookies_badge_bg = "rgba(52, 199, 89, 0.15)"
+                    cookies_badge_border = "#34c759"
+                    cookies_badge_text = f"🟢 Valid ({cookies_count} Cookies)"
+                else:
+                    cookies_badge_color = "#ffb800"
+                    cookies_badge_bg = "rgba(255, 184, 0, 0.15)"
+                    cookies_badge_border = "#ffb800"
+                    cookies_badge_text = f"🟡 Terpasang ({cookies_count} Cookies) - Perlu Validasi"
+            else:
+                cookies_badge_color = "#ff3b30"
+                cookies_badge_bg = "rgba(255, 59, 48, 0.15)"
+                cookies_badge_border = "#ff3b30"
+                cookies_badge_text = "🔴 Belum Terpasang (cookies.json kosong)"
 
             char_cfg = load_character_config()
             pos_x = char_cfg.get("position", {}).get("x", 60)
@@ -2757,6 +3005,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 s_meta = dyn_slots_cfg.get(s_str, {})
                 s_name = s_meta.get("name", f"Layer Animasi {s}")
                 s_name_escaped = s_name.replace("'", "\\'")
+                s_enabled = s_meta.get("enabled", True)
+                s_checked = "checked" if s_enabled else ""
+                s_status_text = "Aktif" if s_enabled else "Nonaktif"
+                s_status_color = "#25f4ee" if s_enabled else "#71717a"
                 
                 existing_dyn_file = None
                 for ext in ("webm", "mp4"):
@@ -2767,30 +3019,36 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 
                 if existing_dyn_file:
                     size_mb = round(os.path.getsize(os.path.join(DYNAMIC_OVERLAYS_DIR, existing_dyn_file)) / (1024 * 1024), 2)
-                    dyn_status_ui = f"""
-                    <span style='color:#34c759; margin-right:8px; font-size:12px;'>✅ <b>File Siap</b> ({size_mb} MB)</span>
-                    <button type="button" class="modern-btn" style="padding:4px 10px; font-size:11px; margin-right:6px; background:#27272a; color:#25f4ee; border:1px solid #3f3f46; cursor:pointer;" onclick="editDynamicOverlayName('{s}', '{s_name_escaped}')">✏️ Ubah Nama</button>
-                    <button type="button" class="modern-btn" style="padding:4px 10px; font-size:11px; margin-right:6px; background:rgba(37,244,238,0.15); color:#25f4ee; border:1px solid #25f4ee; cursor:pointer;" onclick="testDynamicOverlay('{s}')">▶ Test Layer</button>
-                    <a href='/delete-dynamic-overlay?slot={s}' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:4px 10px; font-size:11px; text-decoration:none;' onclick="return confirm('Hapus overlay slot {s}?');">Hapus</a>
-                    """
+                    file_info_ui = f"<span style='color:#34c759; font-size:11px; font-weight:600;'>✅ <b>File Siap</b> ({size_mb} MB)</span>"
+                    test_btn_ui = f"<button type='button' class='modern-btn' style='padding:4px 10px; font-size:11px; background:rgba(37,244,238,0.15); color:#25f4ee; border:1px solid #25f4ee; border-radius:4px; cursor:pointer;' onclick=\"testDynamicOverlay('{s}')\">▶ Test Layer</button>"
+                    delete_btn_ui = f"<a href='/delete-dynamic-overlay?slot={s}' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:4px 8px; font-size:11px; border-radius:4px; text-decoration:none;' onclick=\"return confirm('Hapus overlay slot {s}?');\">Hapus</a>"
+                    upload_btn_label = "Ganti"
                 else:
-                    dyn_status_ui = f"""
-                    <form action="/upload-dynamic-overlay" method="POST" enctype="multipart/form-data" style='display:flex; align-items:center; gap:8px; margin:0;'>
-                        <input type="hidden" name="slot" value="{s}" />
-                        <span style="color:#a1a1aa; font-size:11px;">Format .webm (Alpha VP8/VP9)</span>
-                        <input type="file" name="overlayfile" accept="video/webm,video/mp4,.webm,.mp4" style="color:#aaa; font-size:11px;" required />
-                        <button type="submit" class="modern-btn btn-upload" style="padding:4px 12px; font-size:11px;">Upload</button>
-                    </form>
-                    """
+                    file_info_ui = "<span style='color:#71717a; font-size:11px;'>⚪ Belum ada file</span>"
+                    test_btn_ui = "<button type='button' class='modern-btn' style='padding:4px 10px; font-size:11px; background:rgba(255,255,255,0.05); color:#52525b; border:1px solid #3f3f46; border-radius:4px; cursor:not-allowed;' disabled title='Upload file .webm terlebih dahulu'>▶ Test Layer</button>"
+                    delete_btn_ui = ""
+                    upload_btn_label = "Upload"
 
                 dyn_overlay_slots_html += f"""
-                <div style='background:#181820; padding:10px 14px; margin:8px 0; border-radius:8px; border:1px solid #27272a; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;'>
-                    <div style='display:flex; align-items:center; gap:10px;'>
+                <div style='background:#181820; padding:10px 14px; margin:8px 0; border-radius:8px; border:1px solid #27272a; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;'>
+                    <div style='display:flex; align-items:center; gap:10px; flex-wrap:wrap;'>
                         <span style='font-size:13px; font-weight:bold; color:#25f4ee;'>Slot {s}</span>
                         <span style='color:#fff; font-size:13px; font-weight:500;'>{s_name}</span>
+                        <button type="button" class="modern-btn" style="padding:2px 8px; font-size:10px; background:#27272a; color:#a1a1aa; border:1px solid #3f3f46; border-radius:4px; cursor:pointer;" onclick="editDynamicOverlayName('{s}', '{s_name_escaped}')">✏️ Ubah Nama</button>
+                        <label style="display:inline-flex; align-items:center; gap:5px; font-size:11px; color:#fff; cursor:pointer; background:#121216; padding:3px 8px; border-radius:4px; border:1px solid #3f3f46;">
+                            <input type="checkbox" id="dynSlotToggle_{s}" {s_checked} onchange="toggleDynamicOverlaySlot('{s}', this.checked)" style="accent-color:#25f4ee; cursor:pointer;" />
+                            <span id="dynSlotLabel_{s}" style="color:{s_status_color}; font-weight:bold;">{s_status_text}</span>
+                        </label>
                     </div>
-                    <div style='display:flex; align-items:center;'>
-                        {dyn_status_ui}
+                    <div style='display:flex; align-items:center; gap:8px; flex-wrap:wrap;'>
+                        {file_info_ui}
+                        {test_btn_ui}
+                        {delete_btn_ui}
+                        <form action="/upload-dynamic-overlay" method="POST" enctype="multipart/form-data" style='display:inline-flex; align-items:center; gap:6px; margin:0;'>
+                            <input type="hidden" name="slot" value="{s}" />
+                            <input type="file" name="overlayfile" accept="video/webm,video/mp4,.webm,.mp4" style="color:#aaa; font-size:10px; max-width:145px;" required />
+                            <button type="submit" class="modern-btn btn-upload" style="padding:3px 10px; font-size:11px;">{upload_btn_label}</button>
+                        </form>
                     </div>
                 </div>
                 """
@@ -3024,6 +3282,49 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             guide_y = int(guide_pos.get("y", 150))
             compositor_cfg_json = json.dumps(comp_cfg)
 
+            cookies_card_html = f"""
+            <!-- 🍪 TikTok Session / JSON Cookies Card (Bento Grid 2.0) -->
+            <div class="card" style="margin-top: 15px; border: 1px solid rgba(37, 244, 238, 0.25); background: #13131a;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+                    <div>
+                        <h3 style="margin:0; color:var(--cyan); font-size:17px; display:flex; align-items:center; gap:8px;">
+                            <span>🍪</span> TikTok Session / JSON Cookies
+                        </h3>
+                        <p style="color:#a1a1aa; font-size:12px; margin:4px 0 0 0;">
+                            Tempelkan JSON Cookies akun TikTok Anda (format JSON Array dari Cookie-Editor / EditThisCookie). Digunakan untuk otentikasi live room TikTok & gift listener.
+                        </p>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span id="cookieStatusBadge" style="background:{cookies_badge_bg}; border:1px solid {cookies_badge_border}; color:{cookies_badge_color}; padding:4px 12px; border-radius:12px; font-size:12px; font-weight:bold;">
+                            {cookies_badge_text}
+                        </span>
+                    </div>
+                </div>
+
+                <div style="margin-bottom:12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; flex-wrap:wrap; gap:6px;">
+                        <span style="font-size:12px; color:#888;">File: <code style="color:var(--cyan);">cookies.json</code> &bull; Terakhir Update: <span id="cookieLastUpdated" style="color:#ddd;">{cookies_mtime_str}</span></span>
+                        <div style="display:flex; gap:6px;">
+                            <button type="button" onclick="window.formatJsonCookies()" class="modern-btn" style="padding:4px 10px; font-size:11px; background:#27272a; color:#a1a1aa; border:1px solid #3f3f46; cursor:pointer;">✨ Format JSON</button>
+                            <button type="button" onclick="window.clearJsonCookies()" class="modern-btn" style="padding:4px 10px; font-size:11px; background:rgba(255,59,48,0.12); color:#ff3b30; border:1px solid rgba(255,59,48,0.3); cursor:pointer;">🗑️ Clear</button>
+                        </div>
+                    </div>
+                    <textarea id="json-cookies-input" rows="6" style="width:100%; box-sizing:border-box; background:#0d0d12; color:#34c759; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; font-size:12px; line-height:1.4; border:1px solid #27272a; border-radius:8px; padding:12px; resize:vertical;" placeholder='[&#10;  &#123;&#10;    &quot;name&quot;: &quot;sessionid&quot;,&#10;    &quot;value&quot;: &quot;...&quot;,&#10;    &quot;domain&quot;: &quot;.tiktok.com&quot;&#10;  &#125;&#10;]' spellcheck="false">{escaped_cookies_content}</textarea>
+                </div>
+
+                <div id="cookiesFeedbackBanner" style="display:none; padding:10px 14px; border-radius:6px; font-size:13px; margin-bottom:12px; transition:all 0.3s ease;"></div>
+
+                <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                    <button type="button" id="btnSaveCookies" onclick="window.saveJsonCookies(event)" class="shimmer-btn" style="--shimmer-color:#25f4ee; --bg:rgba(37,244,238,0.15); padding:9px 18px; font-size:13px; font-weight:bold; cursor:pointer; border-radius:8px;">
+                        💾 Simpan / Update Cookies
+                    </button>
+                    <button type="button" id="btnValidateCookies" onclick="window.triggerAccountValidation(event)" class="shimmer-btn" style="--shimmer-color:#34c759; --bg:rgba(52,199,89,0.15); padding:9px 18px; font-size:13px; font-weight:bold; cursor:pointer; border-radius:8px;">
+                        🔍 Validasi Session Akun (via WARP Proxy)
+                    </button>
+                </div>
+            </div>
+            """
+
             html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -3256,6 +3557,41 @@ let compositorConfig = {compositor_cfg_json};
                             fetch('/api/listener-status')
                                 .then(r => r.json())
                                 .then(data => {{
+                                    if (data && data.streamingActive !== undefined) {{
+                                        const isLive = Boolean(data.streamingActive);
+                                        const topBadge = document.getElementById('topLiveStatusBadge');
+                                        const topText = document.getElementById('topLiveStatusText');
+                                        const btnStart = document.getElementById('btnMainStartLive');
+                                        const btnStop = document.getElementById('btnMainStopLive');
+
+                                        if (isLive) {{
+                                            if (topBadge) {{
+                                                topBadge.style.color = '#34c759';
+                                                topBadge.style.borderColor = '#34c759';
+                                                topBadge.style.background = 'rgba(52, 199, 89, 0.15)';
+                                            }}
+                                            if (topText) topText.innerText = 'AKTIF & STREAMING';
+                                            if (btnStart) btnStart.style.display = 'none';
+                                            if (btnStop) {{
+                                                btnStop.style.display = 'inline-flex';
+                                                btnStop.disabled = false;
+                                                btnStop.innerHTML = '⏹️ STOP STREAMING';
+                                            }}
+                                        }} else {{
+                                            if (topBadge) {{
+                                                topBadge.style.color = '#ff3b30';
+                                                topBadge.style.borderColor = '#ff3b30';
+                                                topBadge.style.background = 'rgba(255, 59, 48, 0.15)';
+                                            }}
+                                            if (topText) topText.innerText = 'OFFLINE';
+                                            if (btnStart) {{
+                                                btnStart.style.display = 'inline-flex';
+                                                btnStart.disabled = false;
+                                                btnStart.innerHTML = '🚀 START LIVE';
+                                            }}
+                                            if (btnStop) btnStop.style.display = 'none';
+                                        }}
+                                    }}
                                     if (data && data.queue_length !== undefined) {{
                                         const qb = document.getElementById('queueBadge');
                                         if (qb) qb.innerText = data.queue_length;
@@ -3302,6 +3638,34 @@ let compositorConfig = {compositor_cfg_json};
                                         const eg = document.getElementById('vpnEgressIp');
                                         if (eg && v.egress_ip) eg.innerText = v.egress_ip;
                                     }}
+                                    if (data && data.cookies) {{
+                                        const c = data.cookies;
+                                        const badge = document.getElementById('cookieStatusBadge');
+                                        if (badge) {{
+                                            if (c.exists && c.count > 0) {{
+                                                if (c.session_valid) {{
+                                                    badge.style.background = 'rgba(52, 199, 89, 0.15)';
+                                                    badge.style.borderColor = '#34c759';
+                                                    badge.style.color = '#34c759';
+                                                    badge.innerText = '🟢 Valid (' + c.count + ' Cookies)';
+                                                }} else {{
+                                                    badge.style.background = 'rgba(255, 184, 0, 0.15)';
+                                                    badge.style.borderColor = '#ffb800';
+                                                    badge.style.color = '#ffb800';
+                                                    badge.innerText = '🟡 Terpasang (' + c.count + ' Cookies) - Perlu Validasi';
+                                                }}
+                                            }} else {{
+                                                badge.style.background = 'rgba(255, 59, 48, 0.15)';
+                                                badge.style.borderColor = '#ff3b30';
+                                                badge.style.color = '#ff3b30';
+                                                badge.innerText = '🔴 Belum Ada Cookies';
+                                            }}
+                                        }}
+                                        const mtimeEl = document.getElementById('cookieLastUpdated');
+                                        if (mtimeEl && c.mtime && mtimeEl.innerText === '-') {{
+                                            mtimeEl.innerText = c.mtime;
+                                        }}
+                                    }}
                                     if (data && data.recent_gifts && data.recent_gifts.length > 0) {{
                                         const container = document.getElementById('giftLogsContainer');
                                         if (container) {{
@@ -3335,35 +3699,183 @@ let compositorConfig = {compositor_cfg_json};
                                 }})
                                 .catch(() => {{}});
                         }}
-                        function triggerAccountValidation(e) {{
-                            const btn = e ? e.target : document.getElementById('btnValidateAcc');
-                            const origText = btn ? btn.innerText : 'Memvalidasi...';
+                        window.showCookiesFeedback = function(msg, type) {{
+                            const banner = document.getElementById('cookiesFeedbackBanner');
+                            if (!banner) return;
+                            banner.style.display = 'block';
+                            banner.innerText = msg;
+                            if (type === 'success') {{
+                                banner.style.background = 'rgba(52, 199, 89, 0.15)';
+                                banner.style.border = '1px solid #34c759';
+                                banner.style.color = '#34c759';
+                            }} else if (type === 'error') {{
+                                banner.style.background = 'rgba(255, 59, 48, 0.15)';
+                                banner.style.border = '1px solid #ff3b30';
+                                banner.style.color = '#ff3b30';
+                            }} else {{
+                                banner.style.background = 'rgba(255, 184, 0, 0.15)';
+                                banner.style.border = '1px solid #ffb800';
+                                banner.style.color = '#ffb800';
+                            }}
+                            setTimeout(() => {{
+                                if (banner) banner.style.display = 'none';
+                            }}, 7000);
+                        }};
+
+                        window.clearJsonCookies = function() {{
+                            const ta = document.getElementById('json-cookies-input');
+                            if (ta) {{
+                                if (ta.value.trim().length > 0 && !confirm("Apakah Anda yakin ingin mengosongkan box cookies?")) {{
+                                    return;
+                                }}
+                                ta.value = '';
+                                window.showCookiesFeedback("Input cookies telah dikosongkan.", "warn");
+                            }}
+                        }};
+
+                        window.formatJsonCookies = function() {{
+                            const ta = document.getElementById('json-cookies-input');
+                            if (!ta || !ta.value.trim()) {{
+                                window.showCookiesFeedback("Box cookies masih kosong. Harap isi terlebih dahulu.", "warn");
+                                return;
+                            }}
+                            try {{
+                                const parsed = JSON.parse(ta.value.trim());
+                                ta.value = JSON.stringify(parsed, null, 2);
+                                window.showCookiesFeedback("✨ Format JSON Cookies rapi dan valid!", "success");
+                            }} catch (err) {{
+                                window.showCookiesFeedback("❌ Format JSON tidak valid: " + err.message, "error");
+                            }}
+                        }};
+
+                        window.saveJsonCookies = async function(e) {{
+                            const btn = e ? (e.target.closest('button') || e.target) : document.getElementById('btnSaveCookies');
+                            const ta = document.getElementById('json-cookies-input');
+                            if (!ta) return;
+                            const rawVal = ta.value.trim();
+                            if (!rawVal) {{
+                                window.showCookiesFeedback("⚠️ Box cookies kosong! Harap tempelkan JSON cookies terlebih dahulu.", "warn");
+                                return;
+                            }}
+
+                            // Defensive client-side JSON parsing validation
+                            let parsedCookies;
+                            try {{
+                                parsedCookies = JSON.parse(rawVal);
+                            }} catch (err) {{
+                                window.showCookiesFeedback("❌ Format JSON Tidak Valid: " + err.message, "error");
+                                return;
+                            }}
+
+                            if (!Array.isArray(parsedCookies) && (typeof parsedCookies !== 'object' || parsedCookies === null)) {{
+                                window.showCookiesFeedback("❌ Cookies harus berupa JSON array ([...]) atau JSON object!", "error");
+                                return;
+                            }}
+
+                            const count = Array.isArray(parsedCookies) ? parsedCookies.length : Object.keys(parsedCookies).length;
+                            const origHtml = btn ? btn.innerHTML : 'Simpan';
                             if (btn) {{
-                                btn.innerText = "⏳ Memvalidasi via WARP Proxy...";
+                                btn.innerHTML = "⏳ Menyimpan & Memvalidasi...";
+                                btn.disabled = true;
+                            }}
+
+                            try {{
+                                const res = await fetch('/save-account-config', {{
+                                    method: 'POST',
+                                    headers: {{
+                                        'Content-Type': 'application/json',
+                                        'Accept': 'application/json'
+                                    }},
+                                    body: JSON.stringify({{
+                                        cookies: parsedCookies
+                                    }})
+                                }});
+
+                                const data = await res.json();
+                                if (res.ok && data.success) {{
+                                    const badge = document.getElementById('cookieStatusBadge');
+                                    if (badge) {{
+                                        const isValid = data.val_res && data.val_res.success;
+                                        badge.style.background = isValid ? 'rgba(52, 199, 89, 0.15)' : 'rgba(255, 184, 0, 0.15)';
+                                        badge.style.borderColor = isValid ? '#34c759' : '#ffb800';
+                                        badge.style.color = isValid ? '#34c759' : '#ffb800';
+                                        badge.innerText = (isValid ? '🟢 Valid (' : '🟡 Terpasang (') + count + ' Cookies)';
+                                    }}
+                                    const updatedEl = document.getElementById('cookieLastUpdated');
+                                    if (updatedEl) {{
+                                        updatedEl.innerText = new Date().toLocaleTimeString('id-ID') + ' WIB';
+                                    }}
+                                    window.showCookiesFeedback("✅ Cookies berhasil disimpan! " + (data.message || "") + " (" + count + " entries)", "success");
+                                    if (typeof syncListenerStatus === 'function') {{
+                                        syncListenerStatus();
+                                    }}
+                                }} else {{
+                                    window.showCookiesFeedback("❌ Gagal menyimpan cookies: " + (data.message || 'Error server'), "error");
+                                }}
+                            }} catch (err) {{
+                                // Fallback for form-encoded URLSearchParams
+                                try {{
+                                    const formBody = new URLSearchParams();
+                                    formBody.append('cookies', rawVal);
+                                    const fallbackRes = await fetch('/save-account-config', {{
+                                        method: 'POST',
+                                        headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                                        body: formBody.toString()
+                                    }});
+                                    if (fallbackRes.ok) {{
+                                        window.showCookiesFeedback("✅ Cookies berhasil disimpan (" + count + " entries)", "success");
+                                        setTimeout(() => location.reload(), 1500);
+                                    }} else {{
+                                        window.showCookiesFeedback("❌ Gagal menyimpan cookies: HTTP " + fallbackRes.status, "error");
+                                    }}
+                                }} catch (fbErr) {{
+                                    window.showCookiesFeedback("🚨 Error koneksi: " + err.message, "error");
+                                }}
+                            }} finally {{
+                                if (btn) {{
+                                    btn.innerHTML = origHtml;
+                                    btn.disabled = false;
+                                }}
+                            }}
+                        }};
+
+                        function triggerAccountValidation(e) {{
+                            const btn = e ? (e.target.closest('button') || e.target) : (document.getElementById('btnValidateCookies') || document.getElementById('btnValidateAcc'));
+                            const origText = btn ? btn.innerHTML : 'Memvalidasi...';
+                            if (btn) {{
+                                btn.innerHTML = "⏳ Memvalidasi via WARP...";
                                 btn.disabled = true;
                             }}
                             fetch('/validate-account', {{ method: 'POST' }})
                                 .then(r => r.json())
                                 .then(res => {{
                                     if (btn) {{
-                                        btn.innerText = origText;
+                                        btn.innerHTML = origText;
                                         btn.disabled = false;
                                     }}
                                     if (res.success) {{
-                                        alert("✅ VALIDASI SESSION BERHASIL!\\n\\n" + (res.message || "") + "\\nSession Route: " + res.via + " (" + res.egress_ip + ")\\nAkun: @" + res.username);
+                                        window.showCookiesFeedback("✅ VALIDASI BERHASIL! " + (res.message || "") + " | Akun: @" + (res.username || '-'), "success");
+                                        const badge = document.getElementById('cookieStatusBadge');
+                                        if (badge) {{
+                                            badge.style.background = 'rgba(52, 199, 89, 0.15)';
+                                            badge.style.borderColor = '#34c759';
+                                            badge.style.color = '#34c759';
+                                            badge.innerText = '🟢 Valid (Terkonfirmasi)';
+                                        }}
                                     }} else {{
-                                        alert("❌ VALIDASI GAGAL!\\n\\n" + (res.message || "Gagal memverifikasi session.") + "\\nRoute: " + (res.via || '-') + "\\nIP: " + (res.egress_ip || '-'));
+                                        window.showCookiesFeedback("❌ VALIDASI GAGAL: " + (res.message || "Session expired") + " | Route: " + (res.via || '-') + " (" + (res.egress_ip || '-') + ")", "error");
                                     }}
-                                    location.reload();
+                                    if (typeof syncListenerStatus === 'function') syncListenerStatus();
                                 }})
                                 .catch(err => {{
                                     if (btn) {{
-                                        btn.innerText = origText;
+                                        btn.innerHTML = origText;
                                         btn.disabled = false;
                                     }}
-                                    alert("🚨 Gagal menghubungi endpoint /validate-account: " + err);
+                                    window.showCookiesFeedback("🚨 Gagal menghubungi endpoint /validate-account: " + err.message, "error");
                                 }});
                         }}
+                        window.triggerAccountValidation = triggerAccountValidation;
                         function showSimStatus(msg, isSuccess, isQueue) {{
                             const el = document.getElementById('sim-status-banner');
                             if (!el) return;
@@ -3607,6 +4119,13 @@ let compositorConfig = {compositor_cfg_json};
                         let dualCamFitMode = 'fill';
                         let dualTickWorker = null;
 
+                        // Pre-loaded Video Pool for 0ms Cut-to-Cut Switching
+                        const slotVideoPool = {{}};
+                        const slotAudioSources = {{}};
+                        const slotAudioGains = {{}};
+                        window.slotVideoPool = slotVideoPool;
+                        window.activeSlotVideo = null;
+
                         // Dynamic Overlay State (Slot 1 - 10)
                         let dualOverlayConfig = {dyn_cfg_for_js};
                         let dualActiveOverlayVid = null;
@@ -3645,6 +4164,27 @@ let compositorConfig = {compositor_cfg_json};
                                     dualOverlayConfig = res.config;
                                 }}
                             }}).catch(err => console.warn('[DynamicOverlay] Error saving setting:', err));
+                        }}
+
+                        function toggleDynamicOverlaySlot(slot, isChecked) {{
+                            const lbl = document.getElementById('dynSlotLabel_' + slot);
+                            if (lbl) {{
+                                lbl.innerText = isChecked ? 'Aktif' : 'Nonaktif';
+                                lbl.style.color = isChecked ? '#25f4ee' : '#71717a';
+                            }}
+                            if (dualOverlayConfig && dualOverlayConfig.slots && dualOverlayConfig.slots[slot]) {{
+                                dualOverlayConfig.slots[slot].enabled = Boolean(isChecked);
+                            }}
+                            fetch('/update-dynamic-overlay-config', {{
+                                method: 'POST',
+                                headers: {{ 'Content-Type': 'application/json' }},
+                                body: JSON.stringify({{ key: 'slot_enabled', slot: slot, val: Boolean(isChecked) }})
+                            }}).then(r => r.json()).then(res => {{
+                                if (res.config) {{
+                                    dualOverlayConfig = res.config;
+                                }}
+                                showToast('Layer ' + slot + (isChecked ? ' Diaktifkan' : ' Dinonaktifkan'));
+                            }}).catch(err => console.warn('[DynamicOverlay] Error toggling slot:', err));
                         }}
 
                         function editDynamicOverlayName(slot, currentName) {{
@@ -3819,19 +4359,57 @@ let compositorConfig = {compositor_cfg_json};
                             }}
                         }}
 
+                        function initSlotVideoPool() {{
+                            for (let s = 1; s <= 6; s++) {{
+                                let vid = document.getElementById('dualSlotVideo_' + s);
+                                if (!vid) {{
+                                    vid = document.createElement('video');
+                                    vid.id = 'dualSlotVideo_' + s;
+                                    vid.playsInline = true;
+                                    vid.muted = true;
+                                    vid.preload = 'auto';
+                                    vid.crossOrigin = 'anonymous';
+                                    vid.src = '/video-stream?name=video_' + s + '.mp4';
+                                    vid.style.display = 'none';
+                                    const container = document.getElementById('persistent-media-engine') || document.body;
+                                    container.appendChild(vid);
+                                }}
+                                vid.loop = (s === 1);
+                                vid.preload = 'auto';
+                                vid.playsInline = true;
+                                vid.crossOrigin = 'anonymous';
+
+                                // Pre-warm first frame into decoder memory
+                                vid.addEventListener('loadeddata', () => {{
+                                    console.log('[VideoPool] Slot ' + s + ' pre-warmed & ready in decoder memory (dur: ' + (vid.duration ? vid.duration.toFixed(2) : 0) + 's)');
+                                    try {{
+                                        vid.currentTime = 0;
+                                    }} catch(e) {{}}
+                                }}, {{ once: true }});
+
+                                vid.addEventListener('error', (e) => {{
+                                    console.warn('[VideoPool] Error loading slot ' + s + ':', e);
+                                }});
+
+                                try {{
+                                    if (vid.readyState === 0) vid.load();
+                                }} catch(e) {{}}
+
+                                slotVideoPool[s] = vid;
+                            }}
+
+                            if (!window.activeSlotVideo) {{
+                                window.activeSlotVideo = slotVideoPool[1];
+                            }}
+                        }}
+
                         function startRenderLoop() {{
                             if (isRenderLoopRunning) return;
                             isRenderLoopRunning = true;
-                            const catVid = document.getElementById('dualCatVideo');
-                            if (catVid) {{
-                                if (!catVid.src || catVid.src === '' || catVid.src.endsWith('/')) {{
-                                    catVid.crossOrigin = "anonymous";
-                                    catVid.src = '/video-stream?name=video_' + dualCurrentSlot + '.mp4';
-                                    catVid.loop = (dualCurrentSlot === 1);
-                                }}
-                                if (catVid.paused) {{
-                                    catVid.play().catch(e => console.warn('catVid play on startRenderLoop:', e));
-                                }}
+                            initSlotVideoPool();
+                            const activeVid = window.activeSlotVideo || slotVideoPool[1];
+                            if (activeVid && activeVid.paused) {{
+                                activeVid.play().catch(e => console.warn('activeVid play on startRenderLoop:', e));
                             }}
                             const camVid = document.getElementById('dualCamVideo');
                             if (camVid && dualMediaStream && camVid.paused) {{
@@ -3856,9 +4434,14 @@ let compositorConfig = {compositor_cfg_json};
                                 clearInterval(window._dualFallbackTimer);
                                 window._dualFallbackTimer = null;
                             }}
+                            for (let s = 1; s <= 6; s++) {{
+                                if (slotVideoPool[s]) {{
+                                    try {{ slotVideoPool[s].pause(); }} catch(e) {{}}
+                                }}
+                            }}
                             const catVid = document.getElementById('dualCatVideo');
                             if (catVid) {{
-                                catVid.pause();
+                                try {{ catVid.pause(); }} catch(e) {{}}
                             }}
                             unloadDynamicOverlay();
                             if (dualOverlaySchedulerTimer) {{
@@ -3909,9 +4492,11 @@ let compositorConfig = {compositor_cfg_json};
                         }}
 
                         function playSlotImmediate(slot, giftName) {{
-                            const catVid = document.getElementById('dualCatVideo');
-                            if (!catVid) return;
+                            if (!slot || slot < 1 || slot > 6) slot = 1;
+                            initSlotVideoPool();
+                            const prevSlot = dualCurrentSlot;
                             dualCurrentSlot = slot;
+
                             const badge = document.getElementById('dualCurrentSlotBadge');
                             if (badge) {{
                                 badge.innerText = (slot === 1 ? '🐱 Slot 1 (Standby)' : '🎁 Slot ' + slot + ' (' + (giftName || 'Reaksi') + ')');
@@ -3919,60 +4504,96 @@ let compositorConfig = {compositor_cfg_json};
                                 badge.style.borderColor = (slot === 1 ? '#34c759' : '#ffb800');
                             }}
 
-                            if (dualReactionTimer) clearTimeout(dualReactionTimer);
-
-                            catVid.crossOrigin = "anonymous";
-                            const targetSrc = '/video-stream?name=video_' + slot + '.mp4';
-                            if (!catVid.src || !catVid.src.endsWith(targetSrc)) {{
-                                catVid.src = targetSrc;
+                            if (dualReactionTimer) {{
+                                clearTimeout(dualReactionTimer);
+                                dualReactionTimer = null;
                             }}
-                            catVid.loop = (slot === 1);
 
-                            catVid.onended = function() {{
+                            const targetVid = slotVideoPool[slot];
+                            if (!targetVid) return;
+
+                            // 1. Instant Audio Gain Switching via Web Audio API (0ms gap, zero click/pop)
+                            if (dualAudioCtx) {{
+                                const curTime = dualAudioCtx.currentTime;
+                                for (let s = 1; s <= 6; s++) {{
+                                    if (slotAudioGains[s]) {{
+                                        const targetGain = (s === slot) ? 1.0 : 0.0;
+                                        slotAudioGains[s].gain.cancelScheduledValues(curTime);
+                                        slotAudioGains[s].gain.setValueAtTime(targetGain, curTime);
+                                    }}
+                                }}
+                            }}
+
+                            // 2. Instant Video Pointer Switching (Cut-to-Cut in 1 frame)
+                            window.activeSlotVideo = targetVid;
+
+                            // 3. Pause previous video if different (Slot 1 hanya di-pause tanpa reset currentTime)
+                            if (prevSlot !== slot && slotVideoPool[prevSlot]) {{
+                                try {{
+                                    slotVideoPool[prevSlot].pause();
+                                }} catch(e) {{}}
+                            }}
+
+                            // 4. Reset currentTime HANYA untuk video reaksi (slot !== 1).
+                            // Untuk Slot 1 (video utama), langsung lanjutkan pemutaran (resume) tanpa reset/seek.
+                            if (slot !== 1) {{
+                                try {{
+                                    targetVid.currentTime = 0;
+                                }} catch(e) {{}}
+                            }}
+
+                            targetVid.play().catch(e => {{
+                                console.warn('[VideoPool] Play warning for slot ' + slot, e);
+                            }});
+
+                            // 5. Onended callback: Instantly return pointer to Slot 1 on next frame (0ms gap)
+                            targetVid.onended = function() {{
                                 if (slot !== 1) {{
-                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                    if (dualReactionTimer) {{
+                                        clearTimeout(dualReactionTimer);
+                                        dualReactionTimer = null;
+                                    }}
+                                    // Reset reaction video in background for instant re-trigger
+                                    try {{
+                                        targetVid.pause();
+                                        targetVid.currentTime = 0;
+                                    }} catch(e) {{}}
                                     dualIsReactionPlaying = false;
                                     processDualScreenQueue();
                                 }}
                             }};
 
-                            catVid.onerror = function(err) {{
-                                console.warn('[DualScreen] Cat video error loading slot ' + slot, err);
+                            targetVid.onerror = function(err) {{
+                                console.warn('[VideoPool] Error during playback of slot ' + slot, err);
                                 if (slot !== 1) {{
-                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                    if (dualReactionTimer) {{
+                                        clearTimeout(dualReactionTimer);
+                                        dualReactionTimer = null;
+                                    }}
                                     dualIsReactionPlaying = false;
                                     processDualScreenQueue();
                                 }}
                             }};
 
-                            catVid.onloadedmetadata = function() {{
-                                if (slot !== 1) {{
-                                    const dur = (catVid.duration && !isNaN(catVid.duration) && catVid.duration > 0) ? catVid.duration : 15;
-                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
-                                    dualReactionTimer = setTimeout(() => {{
-                                        if (dualIsReactionPlaying && dualCurrentSlot === slot) {{
-                                            console.log('[DualScreen] Safety timer auto-advance for slot ' + slot);
-                                            dualIsReactionPlaying = false;
-                                            processDualScreenQueue();
-                                        }}
-                                    }}, (dur + 1.5) * 1000);
-                                }}
-                            }};
+                            // 6. Safety auto-advance timer if onended is delayed
+                            if (slot !== 1) {{
+                                const dur = (targetVid.duration && !isNaN(targetVid.duration) && targetVid.duration > 0) ? targetVid.duration : 15;
+                                dualReactionTimer = setTimeout(() => {{
+                                    if (dualIsReactionPlaying && dualCurrentSlot === slot) {{
+                                        console.log('[DualScreen] Safety timer auto-advance for slot ' + slot);
+                                        dualIsReactionPlaying = false;
+                                        processDualScreenQueue();
+                                    }}
+                                }}, (dur + 0.5) * 1000);
+                            }}
 
                             if (isMonitorOutputVisible && !isRenderLoopRunning && !dualIsStreaming) {{
                                 startRenderLoop();
                             }}
-
-                            try {{
-                                catVid.currentTime = 0;
-                            }} catch(e) {{}}
-
-                            catVid.play().catch(e => {{
-                                console.warn('Cat video play warning:', e);
-                            }});
                         }}
 
                         function initDualScreenStudio() {{
+                            initSlotVideoPool();
                             const canvas = document.getElementById('dualCompositeCanvas');
                             if (!canvas) return;
 
@@ -4011,7 +4632,6 @@ let compositorConfig = {compositor_cfg_json};
                             const canvas = document.getElementById('dualCompositeCanvas');
                             if (!canvas) return;
                             const ctx = canvas.getContext('2d');
-                            const catVid = document.getElementById('dualCatVideo');
                             const camVid = document.getElementById('dualCamVideo');
                             let guideOverlayImg = new Image();
                             guideOverlayImg.src = '/overlay-preview?v=' + Date.now();
@@ -4025,7 +4645,8 @@ let compositorConfig = {compositor_cfg_json};
                                 ctx.fillStyle = '#0a0a0f';
                                 ctx.fillRect(0, 0, 720, 1280);
 
-                                // 1. Full-Screen Video (720x1280) with 1:1 sharp drawing optimization
+                                // 1. Full-Screen Video (720x1280) Cut-to-Cut via activeSlotVideo pointer
+                                const catVid = window.activeSlotVideo || (typeof slotVideoPool !== 'undefined' && slotVideoPool[dualCurrentSlot]) || (typeof slotVideoPool !== 'undefined' && slotVideoPool[1]) || document.getElementById('dualCatVideo');
                                 if (catVid && catVid.readyState >= 2) {{
                                     const vW = catVid.videoWidth || 720;
                                     const vH = catVid.videoHeight || 1280;
@@ -4299,19 +4920,18 @@ let compositorConfig = {compositor_cfg_json};
                                     camVid.play().catch(e => console.warn(e));
                                 }}
 
-                                if (catVid) {{
-                                    catVid.crossOrigin = "anonymous";
-                                    if (!catVid.src || catVid.src === '' || catVid.src.endsWith('/')) {{
-                                        catVid.src = '/video-stream?name=video_1.mp4';
-                                        catVid.loop = true;
+                                initSlotVideoPool();
+                                for (let s = 1; s <= 6; s++) {{
+                                    if (slotVideoPool[s]) {{
+                                        slotVideoPool[s].muted = false;
                                     }}
-                                    catVid.muted = false;
                                 }}
 
                                 setupDualAudioMixing(stream, catVid);
 
-                                if (catVid && (isRenderLoopRunning || dualIsStreaming || isMonitorOutputVisible)) {{
-                                    catVid.play().catch(e => console.warn(e));
+                                const activeVid = window.activeSlotVideo || slotVideoPool[1];
+                                if (activeVid && (isRenderLoopRunning || dualIsStreaming || isMonitorOutputVisible)) {{
+                                    activeVid.play().catch(e => console.warn(e));
                                 }}
 
                                 if (btn) {{
@@ -4378,7 +4998,28 @@ let compositorConfig = {compositor_cfg_json};
                                     updateVu();
                                 }}
 
-                                if (catVid && !dualCatAudioSource) {{
+                                // Hubungkan semua slot di slotVideoPool ke Web Audio graph dengan individual GainNodes
+                                initSlotVideoPool();
+                                for (let s = 1; s <= 6; s++) {{
+                                    const sVid = slotVideoPool[s];
+                                    if (sVid && !slotAudioSources[s]) {{
+                                        try {{
+                                            sVid.muted = false;
+                                            const sSrc = dualAudioCtx.createMediaElementSource(sVid);
+                                            const sGain = dualAudioCtx.createGain();
+                                            sGain.gain.value = (s === dualCurrentSlot) ? 1.0 : 0.0;
+                                            sSrc.connect(sGain);
+                                            sGain.connect(dualAudioDest);
+                                            sGain.connect(dualMonitorGain);
+                                            slotAudioSources[s] = sSrc;
+                                            slotAudioGains[s] = sGain;
+                                        }} catch (e) {{
+                                            console.warn('[VideoPool Audio] setup error slot ' + s + ':', e);
+                                        }}
+                                    }}
+                                }}
+
+                                if (catVid && !dualCatAudioSource && !slotAudioSources[1]) {{
                                     try {{
                                         dualCatAudioSource = dualAudioCtx.createMediaElementSource(catVid);
 
@@ -4649,6 +5290,67 @@ let compositorConfig = {compositor_cfg_json};
                             }}
                         }}
 
+                        async function handleStopLiveClick(ev) {{
+                            if (ev) ev.preventDefault();
+                            if (!confirm('Yakin ingin menghentikan siaran TikTok Live sekarang? FFmpeg dan room TikTok akan ditutup.')) {{
+                                return;
+                            }}
+                            const btnStop = document.getElementById('btnMainStopLive');
+                            const btnStart = document.getElementById('btnMainStartLive');
+                            if (btnStop) {{
+                                btnStop.disabled = true;
+                                btnStop.innerHTML = '⏳ Menghentikan...';
+                            }}
+
+                            try {{
+                                // 1. Hentikan Dual Stream & Dynamic Overlay lokal
+                                stopDualStream();
+                                unloadDynamicOverlay();
+
+                                // 2. Panggil endpoint /stop-stream backend via AJAX
+                                const resp = await fetch('/stop-stream', {{
+                                    method: 'POST',
+                                    headers: {{
+                                        'Accept': 'application/json',
+                                        'X-Requested-With': 'XMLHttpRequest'
+                                    }}
+                                }});
+                                const data = await resp.json().catch(() => ({{ status: 'ok' }}));
+                                console.log('[StopLive] Berhasil stop stream:', data);
+
+                                showToast('🛑 Siaran Live Berhasil Dihentikan');
+
+                                // 3. Update status UI seketika
+                                const topBadge = document.getElementById('topLiveStatusBadge');
+                                const topText = document.getElementById('topLiveStatusText');
+                                if (topBadge) {{
+                                    topBadge.style.color = '#ff3b30';
+                                    topBadge.style.borderColor = '#ff3b30';
+                                    topBadge.style.background = 'rgba(255, 59, 48, 0.15)';
+                                }}
+                                if (topText) topText.innerText = 'OFFLINE';
+
+                                if (btnStop) {{
+                                    btnStop.style.display = 'none';
+                                    btnStop.disabled = false;
+                                    btnStop.innerHTML = '⏹️ STOP STREAMING';
+                                }}
+                                if (btnStart) {{
+                                    btnStart.style.display = 'inline-flex';
+                                    btnStart.disabled = false;
+                                    btnStart.innerHTML = '🚀 START LIVE';
+                                }}
+                                syncListenerStatus();
+                            }} catch (err) {{
+                                console.error('[StopLive] Error stopping live:', err);
+                                alert('Terjadi kendala saat menghentikan live: ' + err.message);
+                                if (btnStop) {{
+                                    btnStop.disabled = false;
+                                    btnStop.innerHTML = '⏹️ STOP STREAMING';
+                                }}
+                            }}
+                        }}
+
                         window.addEventListener('DOMContentLoaded', initDualScreenStudio);
                     
                         // --- Mobile Chrome Resilience & Reconnect Camera ---
@@ -4741,19 +5443,20 @@ let compositorConfig = {compositor_cfg_json};
                         }}
 
                         // --- Router & Toast Helpers ---
-                        function switchMenu(menuId) {{
+                        window.switchMenu = function(menuId) {{
+                            if (!menuId) return;
                             document.querySelectorAll('.spa-view').forEach(el => el.classList.remove('active'));
                             document.querySelectorAll('.nav-item, .bottom-nav-item').forEach(el => el.classList.remove('active'));
 
                             const view = document.getElementById('view-' + menuId);
-                            if(view) view.classList.add('active');
+                            if (view) view.classList.add('active');
 
                             document.querySelectorAll('[data-menu="' + menuId + '"]').forEach(el => el.classList.add('active'));
                             localStorage.setItem('tiktok_active_menu', menuId);
                             if (menuId === 'compositor' && typeof updateMiniCompositorPreview === 'function') {{
                                 updateMiniCompositorPreview();
                             }}
-                        }}
+                        }};
 
                         function showToast(msg) {{
                             const t = document.getElementById('globalToast');
@@ -4775,39 +5478,53 @@ let compositorConfig = {compositor_cfg_json};
                                 }}).catch(e => console.warn(e));
                         }}
 
-                        window.addEventListener('DOMContentLoaded', () => {{
-                            const saved = localStorage.getItem('tiktok_active_menu') || 'studio';
-                            switchMenu(saved);
-                            if (typeof fetchFfmpegLogs === 'function') fetchFfmpegLogs();
+                        // Event Delegation untuk navigasi tab (sidebar .nav-item & .bottom-nav-item)
+                        document.addEventListener('click', (e) => {{
+                            const item = e.target.closest('[data-menu]');
+                            if (item) {{
+                                e.preventDefault();
+                                window.switchMenu(item.dataset.menu);
+                            }}
                         }});
 
-                        document.querySelectorAll('.nav-item, .bottom-nav-item').forEach(item => {{
-                            item.addEventListener('click', (e) => {{
-                                e.preventDefault();
-                                switchMenu(item.dataset.menu);
-                            }});
+                        window.addEventListener('DOMContentLoaded', () => {{
+                            const saved = localStorage.getItem('tiktok_active_menu') || 'studio';
+                            window.switchMenu(saved);
+                            if (typeof fetchFfmpegLogs === 'function') fetchFfmpegLogs();
+                            if (typeof initSlotVideoPool === 'function') initSlotVideoPool();
                         }});
 
 </script>
 </head>
 <body>
 
-<!-- Persistent Media Engine (Offscreen DOM Elements) -->
+<!-- Persistent Media Engine (Pre-loaded Video Pool for 0ms Cut-to-Cut Switching) -->
 <div id="persistent-media-engine">
-    <video id="dualCatVideo" playsinline loop muted crossorigin="anonymous"></video>
+    <video id="dualCatVideo" playsinline loop muted crossorigin="anonymous" style="display:none;"></video>
+    <video id="dualSlotVideo_1" playsinline loop muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_1.mp4" style="display:none;"></video>
+    <video id="dualSlotVideo_2" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_2.mp4" style="display:none;"></video>
+    <video id="dualSlotVideo_3" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_3.mp4" style="display:none;"></video>
+    <video id="dualSlotVideo_4" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_4.mp4" style="display:none;"></video>
+    <video id="dualSlotVideo_5" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_5.mp4" style="display:none;"></video>
+    <video id="dualSlotVideo_6" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_6.mp4" style="display:none;"></video>
     <video id="dualCamVideo" playsinline autoplay muted></video>
 </div>
 
 <!-- Sticky Top Bar -->
 <div class="top-bar">
     <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-        <span style="color:var(--crimson); font-weight:bold; font-size:14px;">● LIVE STATUS: {stream_status_text}</span>
+        <span id="topLiveStatusBadge" style="display:inline-flex; align-items:center; gap:6px; font-weight:bold; font-size:13px; padding:4px 10px; border-radius:6px; background:{'rgba(52,199,89,0.15)' if is_live else 'rgba(255,59,48,0.15)'}; color:{live_color}; border:1px solid {live_color};">
+            ● LIVE STATUS: <span id="topLiveStatusText">{stream_status_text}</span>
+        </span>
         <span id="camStatusBadge" style="background:rgba(113,113,122,0.2); border:1px solid #71717a; color:#a1a1aa; padding:3px 8px; border-radius:6px; font-size:12px; font-weight:bold;">📷 Cam: OFF</span>
         <span style="font-family:var(--font-mono); font-size:12px; background:rgba(255,255,255,0.06); padding:3px 8px; border-radius:6px;">Q:<span id="queueCountVal">{queueCountVal}</span> | BR:1.2Mbps</span>
     </div>
     <div style="display:flex; gap:8px; align-items:center;">
         <button type="button" class="btn btn-secondary" onclick="reconnectCamera()" style="font-size:12px; padding:6px 12px; display:inline-flex; align-items:center; gap:6px;">📷 Reconnect</button>
-        <button id="btnMainStartLive" type="button" class="btn btn-primary" onclick="handleStartLiveClick(event)">🚀 START LIVE</button>
+        <button id="btnMainStartLive" type="button" class="btn btn-primary" onclick="handleStartLiveClick(event)" style="display:{'none' if is_live else 'inline-flex'};">🚀 START LIVE</button>
+        <button id="btnMainStopLive" type="button" class="shimmer-btn" onclick="handleStopLiveClick(event)" style="--shimmer-color:#ff3b30; --bg:rgba(255, 59, 48, 0.25); border:1px solid #ff3b30; color:#ff3b30; font-weight:bold; font-size:12px; padding:6px 14px; display:{'inline-flex' if is_live else 'none'}; align-items:center; gap:6px; cursor:pointer;">
+            ⏹️ STOP STREAMING
+        </button>
     </div>
 </div>
 
@@ -4834,6 +5551,8 @@ let compositorConfig = {compositor_cfg_json};
             </div>
 
             {live_status_html}
+
+            {cookies_card_html}
 
             <!-- Studio Deck Dual-Screen Box -->
             <div class="card" style="margin-top: 15px;">
@@ -4942,7 +5661,7 @@ let compositorConfig = {compositor_cfg_json};
                                     <button type="button" id="btnStartDualStream" onclick="startDualStream()" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.18); flex: 1; font-weight: bold; padding: 12px 18px;">
                                         🚀 Mulai Stream Live (Full-Screen + PiP)
                                     </button>
-                                    <button type="button" id="btnStopDualStream" onclick="stopDualStream()" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.18); padding: 12px 18px; display: none;">
+                                    <button type="button" id="btnStopDualStream" onclick="handleStopLiveClick(event)" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.18); padding: 12px 18px; display: none;">
                                         ⏹️ Stop Stream Live
                                     </button>
                                 </div>
@@ -5412,6 +6131,28 @@ let compositorConfig = {compositor_cfg_json};
             self.end_headers()
             return
 
+        elif parsed_url.path == '/stop-stream':
+            try:
+                stop_ffmpeg_stream(close_tiktok_room=True)
+                with queue_lock:
+                    gift_queue.clear()
+                with watchdog_lock:
+                    watchdog_status["is_reconnecting"] = False
+                    watchdog_status["emergency_shutdown"] = False
+                    vpn_cfg = load_vpn_config()
+                    auto_vpn = vpn_cfg.get("auto_vpn", True)
+                    if auto_vpn and is_wireproxy_running():
+                        watchdog_status["state"] = "PROTECTED"
+                    else:
+                        watchdog_status["state"] = "IDLE"
+                ensure_live_listener(force_restart=True)
+            except Exception as e:
+                print(f"[StopStream GET Error] {e}")
+            self.send_response(303)
+            self.send_header('Location', '/')
+            self.end_headers()
+            return
+
         elif parsed_url.path == '/stream-dynamic-overlay':
             query = urllib.parse.parse_qs(parsed_url.query)
             slot = query.get('slot', [''])[0]
@@ -5604,6 +6345,19 @@ let compositorConfig = {compositor_cfg_json};
             sec_ago = max(0, int(time.time() - last_chk)) if last_chk else None
 
             account_cfg = load_account_config()
+            cookies_exist = os.path.exists(COOKIES_FILE)
+            cookie_count = 0
+            cookie_mtime_str = "-"
+            if cookies_exist:
+                try:
+                    with open(COOKIES_FILE, 'r', encoding='utf-8') as cf:
+                        ck_data = json.load(cf)
+                        if isinstance(ck_data, (list, dict)):
+                            cookie_count = len(ck_data)
+                    cookie_mtime_str = time.strftime('%Y-%m-%d %H:%M:%S WIB', time.localtime(os.path.getmtime(COOKIES_FILE)))
+                except Exception:
+                    pass
+
             resp_data = {
                 "status": "ok",
                 "listener": listener_status,
@@ -5618,6 +6372,12 @@ let compositorConfig = {compositor_cfg_json};
                     "last_verified_ip": account_cfg.get("last_verified_ip", ""),
                     "last_verified_via": account_cfg.get("last_verified_via", ""),
                     "last_verified_time": account_cfg.get("last_verified_str", ""),
+                    "session_valid": account_cfg.get("session_valid", False)
+                },
+                "cookies": {
+                    "exists": cookies_exist,
+                    "count": cookie_count,
+                    "mtime": cookie_mtime_str,
                     "session_valid": account_cfg.get("session_valid", False)
                 },
                 "vpn": {
@@ -5648,6 +6408,32 @@ let compositorConfig = {compositor_cfg_json};
                 self.send_header("Content-type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": False, "message": str(e), "via": "ERROR"}).encode('utf-8'))
+        elif parsed_url.path == '/api/cookies':
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            cookies_exist = os.path.exists(COOKIES_FILE)
+            cookie_count = 0
+            cookie_mtime_str = "-"
+            cookies_data = []
+            if cookies_exist:
+                try:
+                    with open(COOKIES_FILE, 'r', encoding='utf-8') as cf:
+                        cookies_data = json.load(cf)
+                        if isinstance(cookies_data, (list, dict)):
+                            cookie_count = len(cookies_data)
+                    cookie_mtime_str = time.strftime('%Y-%m-%d %H:%M:%S WIB', time.localtime(os.path.getmtime(COOKIES_FILE)))
+                except Exception:
+                    pass
+            account_cfg = load_account_config()
+            self.wfile.write(json.dumps({
+                "exists": cookies_exist,
+                "count": cookie_count,
+                "mtime": cookie_mtime_str,
+                "session_valid": account_cfg.get("session_valid", False),
+                "cookies": cookies_data
+            }).encode('utf-8'))
         elif parsed_url.path in ('/simulate-gift', '/switch-slot'):
             return self.do_POST()
         else:
@@ -5772,33 +6558,70 @@ let compositorConfig = {compositor_cfg_json};
         if parsed_url.path == '/save-account-config':
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode('utf-8')
-            parsed = urllib.parse.parse_qs(body)
-            username = parsed.get('username', [''])[0].strip()
-            cookies_raw = parsed.get('cookies', [''])[0].strip()
+            is_json_req = 'application/json' in self.headers.get('Content-Type', '') or body.strip().startswith('{')
+            
+            if is_json_req:
+                try:
+                    data = json.loads(body)
+                    username = str(data.get('username', '')).strip()
+                    cookies_val = data.get('cookies', '')
+                    if isinstance(cookies_val, (list, dict)):
+                        cookies_raw = json.dumps(cookies_val)
+                    else:
+                        cookies_raw = str(cookies_val).strip()
+                except Exception:
+                    username = ''
+                    cookies_raw = ''
+            else:
+                parsed = urllib.parse.parse_qs(body)
+                username = parsed.get('username', [''])[0].strip()
+                cookies_raw = parsed.get('cookies', [''])[0].strip()
             
             try:
                 # 1. Simpan username & cookies
-                save_account_config({"username": username})
+                if username:
+                    save_account_config({"username": username})
+                num_cookies = 0
                 if cookies_raw:
                     parsed_json = json.loads(cookies_raw)
+                    if isinstance(parsed_json, (list, dict)):
+                        num_cookies = len(parsed_json)
                     with open(COOKIES_FILE, 'w', encoding='utf-8') as f:
                         json.dump(parsed_json, f, indent=2)
 
                 # 2. Lakukan validasi session TikTok via Centralized Gateway WARP Proxy
-                val_res = validate_tiktok_session(username)
+                val_res = validate_tiktok_session(username if username else None)
                 print(f"[SaveAccountConfig] Hasil validasi akun via {val_res.get('via')} ({val_res.get('egress_ip')}): {val_res.get('message')}")
                 
                 # Restart listener agar memuat sesi/username baru
                 ensure_live_listener(force_restart=True)
 
-                self.send_response(303)
-                self.send_header('Location', '/')
-                self.end_headers()
+                if is_json_req or 'application/json' in self.headers.get('Accept', ''):
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    resp_payload = {
+                        "success": True,
+                        "message": val_res.get("message", "Cookies berhasil disimpan dan divalidasi"),
+                        "entries_count": num_cookies,
+                        "val_res": val_res
+                    }
+                    self.wfile.write(json.dumps(resp_payload).encode('utf-8'))
+                else:
+                    self.send_response(303)
+                    self.send_header('Location', '/')
+                    self.end_headers()
             except Exception as e:
-                self.send_response(400)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2 style='color:#ff3b30;'>Gagal Menyimpan / Memvalidasi Akun: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
+                if is_json_req or 'application/json' in self.headers.get('Accept', ''):
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "message": str(e)}).encode('utf-8'))
+                else:
+                    self.send_response(400)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2 style='color:#ff3b30;'>Gagal Menyimpan / Memvalidasi Akun: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
             return
 
         if parsed_url.path == '/upload-video':
@@ -5840,27 +6663,42 @@ let compositorConfig = {compositor_cfg_json};
                     slot = "1"
 
                 if file_data:
-                    ext = ".webm"
                     clean_orig_name = os.path.basename(orig_filename).strip() if orig_filename else ""
-                    if clean_orig_name.lower().endswith('.mp4'):
-                        ext = ".mp4"
+                    temp_input_path = os.path.join(VIDEOS_DIR, f".temp_upload_{slot}_{int(time.time())}.tmp")
+                    with open(temp_input_path, 'wb') as f:
+                        f.write(file_data)
+
+                    saved_filename = f"video_{slot}.mp4"
+                    filepath = os.path.join(VIDEOS_DIR, saved_filename)
                     
                     for old_ext in (".webm", ".mp4"):
                         old_p = os.path.join(VIDEOS_DIR, f"video_{slot}{old_ext}")
-                        if os.path.exists(old_p):
-                            os.remove(old_p)
-                            
-                    saved_filename = f"video_{slot}{ext}"
-                    filepath = os.path.join(VIDEOS_DIR, saved_filename)
-                    with open(filepath, 'wb') as f:
-                        f.write(file_data)
+                        if os.path.exists(old_p) and os.path.realpath(old_p) != os.path.realpath(temp_input_path):
+                            try:
+                                os.remove(old_p)
+                            except Exception:
+                                pass
 
+                    bypass_info = normalize_slot_video(temp_input_path, filepath)
+                    if os.path.exists(temp_input_path):
+                        try:
+                            os.remove(temp_input_path)
+                        except Exception:
+                            pass
+
+                    final_size = os.path.getsize(filepath) if os.path.exists(filepath) else len(file_data)
                     meta = load_video_meta()
                     meta[str(slot)] = {
                         "filename": saved_filename,
                         "original_name": clean_orig_name or saved_filename,
                         "uploaded_at": int(time.time()),
-                        "size_bytes": len(file_data)
+                        "size_bytes": final_size,
+                        "bypass_mode": bypass_info.get("mode", "DIRECT_COPY_BYPASS"),
+                        "resolution": f"{bypass_info.get('width', 720)}x{bypass_info.get('height', 1280)}",
+                        "codec": bypass_info.get("codec", "h264"),
+                        "fps": str(bypass_info.get("fps", "24/1")),
+                        "audio": bypass_info.get("audio", "AAC"),
+                        "cpu_saved": bypass_info.get("cpu_saved", "100%")
                     }
                     save_video_meta(meta)
             except Exception as e:
@@ -5954,6 +6792,14 @@ let compositorConfig = {compositor_cfg_json};
                         cfg["layer_position"] = val
                 elif key == "scheduler_enabled":
                     cfg["scheduler"]["enabled"] = bool(val)
+                elif key == "slot_enabled":
+                    slot = str(data.get("slot", "")).strip()
+                    if slot in [str(i) for i in range(1, 11)]:
+                        if "slots" not in cfg:
+                            cfg["slots"] = {}
+                        if slot not in cfg["slots"]:
+                            cfg["slots"][slot] = {}
+                        cfg["slots"][slot]["enabled"] = bool(val)
                 elif key == "min_interval":
                     try:
                         cfg["scheduler"]["min_interval_sec"] = max(5, int(val))
@@ -6344,25 +7190,53 @@ let compositorConfig = {compositor_cfg_json};
                         watchdog_status["state"] = "IDLE"
 
                 ensure_live_listener(force_restart=True)
-                self.send_response(200)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                html = """<!DOCTYPE html>
-                <html>
-                    <body style='background:#0f0f11; color:#fff; text-align:center; padding-top:40px; font-family:sans-serif;'>
-                        <h2 style='color:#34c759;'>Stream Berhasil Dihentikan (Stop Live)</h2>
-                        <p style='color:#a1a1aa; font-size:14px; margin-top:8px;'>FFmpeg dihentikan & sinyal room finish telah dikirim ke server TikTok.</p>
-                        <br/><br/>
-                        <a href='/' style='color:#25f4ee; font-size:16px; text-decoration:none; background:#27272a; padding:10px 20px; border-radius:6px;'>Kembali ke Dashboard</a>
-                    </body>
-                </html>
-                """
-                self.wfile.write(html.encode('utf-8'))
+                is_ajax = (
+                    "application/json" in self.headers.get("Accept", "") or
+                    self.headers.get("X-Requested-With") == "XMLHttpRequest"
+                )
+                if is_ajax:
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "ok",
+                        "message": "Stream berhasil dihentikan."
+                    }).encode('utf-8'))
+                    return
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    html = """<!DOCTYPE html>
+                    <html>
+                        <body style='background:#0f0f11; color:#fff; text-align:center; padding-top:40px; font-family:sans-serif;'>
+                            <h2 style='color:#34c759;'>Stream Berhasil Dihentikan (Stop Live)</h2>
+                            <p style='color:#a1a1aa; font-size:14px; margin-top:8px;'>FFmpeg dihentikan & sinyal room finish telah dikirim ke server TikTok.</p>
+                            <br/><br/>
+                            <a href='/' style='color:#25f4ee; font-size:16px; text-decoration:none; background:#27272a; padding:10px 20px; border-radius:6px;'>Kembali ke Dashboard</a>
+                        </body>
+                    </html>
+                    """
+                    self.wfile.write(html.encode('utf-8'))
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2>Gagal stop stream: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
+                is_ajax = (
+                    "application/json" in self.headers.get("Accept", "") or
+                    self.headers.get("X-Requested-With") == "XMLHttpRequest"
+                )
+                if is_ajax:
+                    self.send_response(500)
+                    self.send_header("Content-type", "application/json; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "error",
+                        "message": str(e)
+                    }).encode('utf-8'))
+                    return
+                else:
+                    self.send_response(500)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2>Gagal stop stream: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
                 
         elif parsed_url.path == '/simulate-gift':
             global global_gift_seq, latest_gift_event, recent_gift_logs
