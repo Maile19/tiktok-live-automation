@@ -1242,8 +1242,8 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     has_audio = check_has_audio(video_path)
 
     loop_args = ["-stream_loop", "-1"] if loop else []
-    # Full-screen 720x1280 layout + Floating top-right PiP webcam box (200x200 at x=496, y=160)
-    scale_filter = "scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=496:y=160:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=496:y=160:w=200:h=200:color=0x25f4ee:t=2"
+    # Full-screen 720x1280 layout + Floating top-right PiP webcam box (200x200 at x=476, y=160)
+    scale_filter = "scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=476:y=160:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=476:y=160:w=200:h=200:color=0x25f4ee:t=2"
 
     cmd = [
         "ffmpeg",
@@ -3933,11 +3933,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ctx.drawImage(guideOverlayImg, 60, 150);
                                 }}
 
-                                // 3. Single Webcam Box at Top-Right (200x200 at x=496, y=160)
+                                // 3. Single Webcam Box at Top-Right (200x200 at x=476, y=160)
                                 function renderWebcamBox() {{
                                     const camW = 200;
                                     const camH = 200;
-                                    const camX = 496;
+                                    const camX = 476;
                                     const camY = 160;
 
                                     if (camVid && camVid.readyState >= 2) {{
