@@ -20,6 +20,7 @@ import http.cookies
 import shutil
 import asyncio
 import websockets
+import copy
 from PIL import Image, ImageDraw, ImageFont
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -35,6 +36,8 @@ CONFIG_FILE = os.path.join(BASE_DIR, "gift_config.json")
 VIDEO_META_FILE = os.path.join(BASE_DIR, "video_metadata.json")
 AVATARS_DIR = os.path.join(BASE_DIR, "uploads", "avatars")
 OVERLAYS_DIR = os.path.join(BASE_DIR, "uploads", "overlays")
+DYNAMIC_OVERLAYS_DIR = os.path.join(BASE_DIR, "uploads", "dynamic_overlays")
+DYNAMIC_OVERLAY_CONFIG_FILE = os.path.join(BASE_DIR, "dynamic_overlay_config.json")
 CHARACTER_CONFIG_FILE = os.path.join(BASE_DIR, "character_config.json")
 GUIDE_OVERLAY_FILE = os.path.join(OVERLAYS_DIR, "guide_overlay.png")
 FFMPEG_LOG_FILE = os.path.join(BASE_DIR, "ffmpeg_stream.log")
@@ -50,7 +53,50 @@ WIREPROXY_CONF = os.path.join(VPN_DIR, "wireproxy.conf")
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 os.makedirs(AVATARS_DIR, exist_ok=True)
 os.makedirs(OVERLAYS_DIR, exist_ok=True)
+os.makedirs(DYNAMIC_OVERLAYS_DIR, exist_ok=True)
 os.makedirs(VPN_DIR, exist_ok=True)
+
+DEFAULT_DYNAMIC_OVERLAY_CONFIG = {
+    "layer_position": "above_webcam",
+    "scheduler": {
+        "enabled": True,
+        "min_interval_sec": 15,
+        "max_interval_sec": 60
+    },
+    "slots": {
+        str(i): {
+            "name": f"Layer Animasi {i}",
+            "enabled": True
+        } for i in range(1, 11)
+    }
+}
+
+def load_dynamic_overlay_config():
+    if os.path.exists(DYNAMIC_OVERLAY_CONFIG_FILE):
+        try:
+            with open(DYNAMIC_OVERLAY_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                cfg = copy.deepcopy(DEFAULT_DYNAMIC_OVERLAY_CONFIG)
+                if "layer_position" in data:
+                    cfg["layer_position"] = data["layer_position"]
+                if "scheduler" in data and isinstance(data["scheduler"], dict):
+                    cfg["scheduler"].update(data["scheduler"])
+                if "slots" in data and isinstance(data["slots"], dict):
+                    for k in [str(i) for i in range(1, 11)]:
+                        if k in data["slots"]:
+                            cfg["slots"][k] = dict(DEFAULT_DYNAMIC_OVERLAY_CONFIG["slots"][k])
+                            cfg["slots"][k].update(data["slots"][k])
+                return cfg
+        except Exception as e:
+            print(f"[DynamicOverlay] Error loading: {e}")
+    return copy.deepcopy(DEFAULT_DYNAMIC_OVERLAY_CONFIG)
+
+def save_dynamic_overlay_config(cfg):
+    try:
+        with open(DYNAMIC_OVERLAY_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[DynamicOverlay] Error saving: {e}")
 
 DEFAULT_VPN_CONFIG = {
     "auto_vpn": True,
@@ -1193,8 +1239,8 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     has_audio = check_has_audio(video_path)
 
     loop_args = ["-stream_loop", "-1"] if loop else []
-    # Full-screen 720x1280 layout + Floating top-right PiP webcam box (200x200 at x=496, y=24)
-    scale_filter = "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=496:y=24:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=496:y=24:w=200:h=200:color=0x25f4ee:t=2"
+    # Full-screen 720x1280 layout + Floating bottom-center PiP webcam box (400x400 at x=160, y=840)
+    scale_filter = "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=160:y=840:w=400:h=400:color=0x181820@0.85:t=fill,drawbox=x=160:y=840:w=400:h=400:color=0x25f4ee:t=2"
 
     cmd = [
         "ffmpeg",
@@ -2586,6 +2632,115 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
             overlay_enabled_checked = "checked" if overlay_is_on else ""
 
+            # --- Dynamic Random Overlay Layers (Slot 1 - 10) ---
+            dyn_cfg = load_dynamic_overlay_config()
+            dyn_slots_cfg = dyn_cfg.get("slots", {})
+            dyn_sched_cfg = dyn_cfg.get("scheduler", {})
+            dyn_sched_enabled = dyn_sched_cfg.get("enabled", True)
+            dyn_min_int = dyn_sched_cfg.get("min_interval_sec", 15)
+            dyn_max_int = dyn_sched_cfg.get("max_interval_sec", 60)
+            dyn_layer_pos = dyn_cfg.get("layer_position", "above_webcam")
+
+            dyn_overlay_slots_html = ""
+            for s in range(1, 11):
+                s_str = str(s)
+                s_meta = dyn_slots_cfg.get(s_str, {})
+                s_name = s_meta.get("name", f"Layer Animasi {s}")
+                s_name_escaped = s_name.replace("'", "\\'")
+                
+                existing_dyn_file = None
+                for ext in ("webm", "mp4"):
+                    cand = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{s}.{ext}")
+                    if os.path.exists(cand):
+                        existing_dyn_file = f"overlay_{s}.{ext}"
+                        break
+                
+                if existing_dyn_file:
+                    size_mb = round(os.path.getsize(os.path.join(DYNAMIC_OVERLAYS_DIR, existing_dyn_file)) / (1024 * 1024), 2)
+                    dyn_status_ui = f"""
+                    <span style='color:#34c759; margin-right:8px; font-size:12px;'>✅ <b>File Siap</b> ({size_mb} MB)</span>
+                    <button type="button" class="modern-btn" style="padding:4px 10px; font-size:11px; margin-right:6px; background:#27272a; color:#25f4ee; border:1px solid #3f3f46; cursor:pointer;" onclick="editDynamicOverlayName('{s}', '{s_name_escaped}')">✏️ Ubah Nama</button>
+                    <button type="button" class="modern-btn" style="padding:4px 10px; font-size:11px; margin-right:6px; background:rgba(37,244,238,0.15); color:#25f4ee; border:1px solid #25f4ee; cursor:pointer;" onclick="testDynamicOverlay('{s}')">▶ Test Layer</button>
+                    <a href='/delete-dynamic-overlay?slot={s}' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:4px 10px; font-size:11px; text-decoration:none;' onclick="return confirm('Hapus overlay slot {s}?');">Hapus</a>
+                    """
+                else:
+                    dyn_status_ui = f"""
+                    <form action="/upload-dynamic-overlay" method="POST" enctype="multipart/form-data" style='display:flex; align-items:center; gap:8px; margin:0;'>
+                        <input type="hidden" name="slot" value="{s}" />
+                        <span style="color:#a1a1aa; font-size:11px;">Format .webm (Alpha VP8/VP9)</span>
+                        <input type="file" name="overlayfile" accept="video/webm,video/mp4,.webm,.mp4" style="color:#aaa; font-size:11px;" required />
+                        <button type="submit" class="modern-btn btn-upload" style="padding:4px 12px; font-size:11px;">Upload</button>
+                    </form>
+                    """
+
+                dyn_overlay_slots_html += f"""
+                <div style='background:#181820; padding:10px 14px; margin:8px 0; border-radius:8px; border:1px solid #27272a; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;'>
+                    <div style='display:flex; align-items:center; gap:10px;'>
+                        <span style='font-size:13px; font-weight:bold; color:#25f4ee;'>Slot {s}</span>
+                        <span style='color:#fff; font-size:13px; font-weight:500;'>{s_name}</span>
+                    </div>
+                    <div style='display:flex; align-items:center;'>
+                        {dyn_status_ui}
+                    </div>
+                </div>
+                """
+
+            selected_above = "selected" if dyn_layer_pos == "above_webcam" else ""
+            selected_below = "selected" if dyn_layer_pos == "below_webcam" else ""
+            sched_checked = "checked" if dyn_sched_enabled else ""
+
+            dynamic_overlay_card_html = f"""
+            <div class="shine-border-card" style="animation-delay: 1.1s;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:8px;">
+                    <div>
+                        <h3 style="margin:0; color:#fff; display:flex; align-items:center; gap:8px;">
+                            <span>🎭</span> Dynamic Random Overlay Layers (Slot 1 - 10)
+                        </h3>
+                        <p style="color:#a1a1aa; font-size:13px; margin:4px 0 0 0;">
+                            Lapisan animasi transparan (.webm VP8/VP9 dengan Alpha Channel) yang dipicu secara random untuk menjaga variasi visual anti-bot TikTok.
+                        </p>
+                    </div>
+                    <div>
+                        <span id="overlaySchedulerStatusBadge" style="font-size:11px; padding:4px 10px; border-radius:12px; background:rgba(37,244,238,0.12); color:#25f4ee; border:1px solid #25f4ee; font-weight:bold;">
+                            ⏱️ Scheduler Standby
+                        </span>
+                    </div>
+                </div>
+
+                <!-- Global Settings: Posisi Layer & Random Scheduler -->
+                <div style="background:#121216; padding:12px 16px; border-radius:8px; border:1px solid #27272a; margin-bottom:14px; display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px;">
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <label style="color:#a1a1aa; font-size:12px; font-weight:bold;">Posisi Layer:</label>
+                        <select id="overlayLayerPosSelect" onchange="updateDynamicOverlaySetting('layer_position', this.value)" style="padding:6px 10px; background:#1c1c22; color:#25f4ee; border:1px solid #3f3f46; border-radius:6px; font-size:12px; font-weight:bold;">
+                            <option value="above_webcam" {selected_above}>✨ Di Atas Webcam (Menyatu - Default)</option>
+                            <option value="below_webcam" {selected_below}>⏹️ Di Bawah Webcam</option>
+                        </select>
+                    </div>
+
+                    <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
+                        <label style="color:#fff; font-size:12px; font-weight:bold; display:flex; align-items:center; gap:6px; cursor:pointer;">
+                            <input type="checkbox" id="overlaySchedulerEnabled" {sched_checked} onchange="updateDynamicOverlaySetting('scheduler_enabled', this.checked)" style="transform:scale(1.2);">
+                            Aktifkan Random Trigger
+                        </label>
+                        <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:#a1a1aa;">
+                            <span>Jeda:</span>
+                            <input type="number" id="overlayMinInterval" value="{dyn_min_int}" min="5" max="300" style="width:50px; padding:4px 6px; background:#1c1c22; color:#fff; border:1px solid #3f3f46; border-radius:6px; font-size:12px; text-align:center;" onchange="updateDynamicOverlaySetting('min_interval', this.value)">
+                            <span>s/d</span>
+                            <input type="number" id="overlayMaxInterval" value="{dyn_max_int}" min="5" max="300" style="width:50px; padding:4px 6px; background:#1c1c22; color:#fff; border:1px solid #3f3f46; border-radius:6px; font-size:12px; text-align:center;" onchange="updateDynamicOverlaySetting('max_interval', this.value)">
+                            <span>detik</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 10 Slots List -->
+                <div>
+                    {dyn_overlay_slots_html}
+                </div>
+            </div>
+            """
+
+            dyn_cfg_for_js = json.dumps(load_dynamic_overlay_config())
+
             overlay_card_html = f"""
             <div class="shine-border-card" style="animation-delay: 1.2s;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
@@ -3305,6 +3460,174 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         let dualCamFitMode = 'fill';
                         let dualTickWorker = null;
 
+                        // Dynamic Overlay State (Slot 1 - 10)
+                        let dualOverlayConfig = {dyn_cfg_for_js};
+                        let dualActiveOverlayVid = null;
+                        let dualIsOverlayPlaying = false;
+                        let dualOverlaySchedulerTimer = null;
+                        let dualOverlayLayerPos = (dualOverlayConfig && dualOverlayConfig.layer_position) || 'above_webcam';
+                        let dualOverlaySchedulerEnabled = dualOverlayConfig && dualOverlayConfig.scheduler && dualOverlayConfig.scheduler.enabled !== false;
+                        let dualOverlayMinSec = (dualOverlayConfig && dualOverlayConfig.scheduler && dualOverlayConfig.scheduler.min_interval_sec) || 15;
+                        let dualOverlayMaxSec = (dualOverlayConfig && dualOverlayConfig.scheduler && dualOverlayConfig.scheduler.max_interval_sec) || 60;
+
+                        function updateDynamicOverlaySetting(key, val) {{
+                            if (key === 'layer_position') {{
+                                dualOverlayLayerPos = val;
+                            }} else if (key === 'scheduler_enabled') {{
+                                dualOverlaySchedulerEnabled = Boolean(val);
+                                if (!dualOverlaySchedulerEnabled && dualOverlaySchedulerTimer) {{
+                                    clearTimeout(dualOverlaySchedulerTimer);
+                                    dualOverlaySchedulerTimer = null;
+                                    const badge = document.getElementById('overlaySchedulerStatusBadge');
+                                    if (badge) badge.innerText = '⏸️ Scheduler Nonaktif';
+                                }} else if (dualOverlaySchedulerEnabled && (dualIsStreaming || isMonitorOutputVisible)) {{
+                                    scheduleNextDynamicOverlay();
+                                }}
+                            }} else if (key === 'min_interval') {{
+                                dualOverlayMinSec = parseInt(val) || 15;
+                            }} else if (key === 'max_interval') {{
+                                dualOverlayMaxSec = parseInt(val) || 60;
+                            }}
+
+                            fetch('/update-dynamic-overlay-config', {{
+                                method: 'POST',
+                                headers: {{ 'Content-Type': 'application/json' }},
+                                body: JSON.stringify({{ key: key, val: val }})
+                            }}).then(r => r.json()).then(res => {{
+                                if (res.config) {{
+                                    dualOverlayConfig = res.config;
+                                }}
+                            }}).catch(err => console.warn('[DynamicOverlay] Error saving setting:', err));
+                        }}
+
+                        function editDynamicOverlayName(slot, currentName) {{
+                            const newName = prompt('Masukkan nama layer animasi untuk Slot ' + slot + ':', currentName);
+                            if (newName && newName.trim() !== '') {{
+                                fetch('/update-dynamic-overlay-name', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ slot: slot, name: newName.trim() }})
+                                }}).then(r => r.json()).then(res => {{
+                                    if (res.success) {{
+                                        window.location.reload();
+                                    }}
+                                }}).catch(e => alert('Gagal mengubah nama: ' + e));
+                            }}
+                        }}
+
+                        function testDynamicOverlay(slot) {{
+                            console.log('[DynamicOverlay] Manual test trigger slot:', slot);
+                            playDynamicOverlaySlot(slot, true);
+                        }}
+
+                        function unloadDynamicOverlay() {{
+                            dualIsOverlayPlaying = false;
+                            if (dualActiveOverlayVid) {{
+                                try {{
+                                    dualActiveOverlayVid.pause();
+                                    dualActiveOverlayVid.removeAttribute('src');
+                                    while (dualActiveOverlayVid.firstChild) {{
+                                        dualActiveOverlayVid.removeChild(dualActiveOverlayVid.firstChild);
+                                    }}
+                                    dualActiveOverlayVid.load();
+                                }} catch(e) {{}}
+                                dualActiveOverlayVid = null;
+                            }}
+                            const badge = document.getElementById('overlaySchedulerStatusBadge');
+                            if (badge) {{
+                                badge.innerText = dualOverlaySchedulerEnabled ? '⏱️ Scheduler Standby' : '⏸️ Scheduler Nonaktif';
+                            }}
+                        }}
+
+                        function playDynamicOverlaySlot(slot, isTest) {{
+                            unloadDynamicOverlay();
+
+                            const vid = document.createElement('video');
+                            vid.crossOrigin = "anonymous";
+                            vid.playsInline = true;
+                            vid.muted = true;
+                            vid.autoplay = true;
+                            vid.src = '/stream-dynamic-overlay?slot=' + slot + '&t=' + Date.now();
+
+                            vid.oncanplay = function() {{
+                                dualActiveOverlayVid = vid;
+                                dualIsOverlayPlaying = true;
+                                vid.play().catch(e => console.warn('[DynamicOverlay] Play error:', e));
+                                showCanvasToast('🎭 Layer ' + slot + ' Aktif');
+                                const badge = document.getElementById('overlaySchedulerStatusBadge');
+                                if (badge) badge.innerText = '▶ Sedang Tayang: Slot ' + slot;
+                            }};
+
+                            vid.onended = function() {{
+                                console.log('[DynamicOverlay] Selesai memutar slot ' + slot);
+                                unloadDynamicOverlay();
+                                if (!isTest && dualOverlaySchedulerEnabled && (dualIsStreaming || isMonitorOutputVisible)) {{
+                                    scheduleNextDynamicOverlay();
+                                }}
+                            }};
+
+                            vid.onerror = function(err) {{
+                                console.warn('[DynamicOverlay] Gagal memuat video slot ' + slot, err);
+                                unloadDynamicOverlay();
+                                if (!isTest && dualOverlaySchedulerEnabled && (dualIsStreaming || isMonitorOutputVisible)) {{
+                                    scheduleNextDynamicOverlay();
+                                }}
+                            }};
+
+                            setTimeout(() => {{
+                                if (dualActiveOverlayVid === vid && dualIsOverlayPlaying) {{
+                                    console.log('[DynamicOverlay] Safety timeout reached for slot ' + slot);
+                                    unloadDynamicOverlay();
+                                    if (!isTest && dualOverlaySchedulerEnabled && (dualIsStreaming || isMonitorOutputVisible)) {{
+                                        scheduleNextDynamicOverlay();
+                                    }}
+                                }}
+                            }}, 35000);
+                        }}
+
+                        function scheduleNextDynamicOverlay() {{
+                            if (dualOverlaySchedulerTimer) {{
+                                clearTimeout(dualOverlaySchedulerTimer);
+                                dualOverlaySchedulerTimer = null;
+                            }}
+                            if (!dualOverlaySchedulerEnabled) return;
+
+                            fetch('/api/dynamic-overlays')
+                                .then(r => r.json())
+                                .then(data => {{
+                                    dualOverlayConfig = data;
+                                    const availSlots = [];
+                                    if (data && data.slots) {{
+                                        for (let s = 1; s <= 10; s++) {{
+                                            const sd = data.slots[String(s)];
+                                            if (sd && sd.file && sd.enabled !== false) {{
+                                                availSlots.push(s);
+                                            }}
+                                        }}
+                                    }}
+                                    if (availSlots.length === 0) {{
+                                        const badge = document.getElementById('overlaySchedulerStatusBadge');
+                                        if (badge) badge.innerText = '⚠️ Belum ada file overlay';
+                                        return;
+                                    }}
+
+                                    const minS = Math.max(5, dualOverlayMinSec);
+                                    const maxS = Math.max(minS, dualOverlayMaxSec);
+                                    const delayS = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
+
+                                    const badge = document.getElementById('overlaySchedulerStatusBadge');
+                                    if (badge) badge.innerText = '⏱️ Next layer in ' + delayS + 's';
+
+                                    dualOverlaySchedulerTimer = setTimeout(() => {{
+                                        if (!dualOverlaySchedulerEnabled) return;
+                                        if (!dualIsStreaming && !isMonitorOutputVisible) return;
+                                        const chosen = availSlots[Math.floor(Math.random() * availSlots.length)];
+                                        playDynamicOverlaySlot(chosen, false);
+                                    }}, delayS * 1000);
+                                }})
+                                .catch(err => console.warn('[DynamicOverlay] Sync error:', err));
+                        }}
+
                         function toggleMonitorOutput() {{
                             isMonitorOutputVisible = !isMonitorOutputVisible;
                             const stage = document.getElementById('dualPreviewStage');
@@ -3356,6 +3679,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 camVid.play().catch(e => console.warn('camVid play on startRenderLoop:', e));
                             }}
                             startCanvasLoop();
+                            if (dualOverlaySchedulerEnabled && !dualOverlaySchedulerTimer && !dualIsOverlayPlaying) {{
+                                scheduleNextDynamicOverlay();
+                            }}
                         }}
 
                         function stopRenderLoop() {{
@@ -3370,6 +3696,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             const catVid = document.getElementById('dualCatVideo');
                             if (catVid) {{
                                 catVid.pause();
+                            }}
+                            unloadDynamicOverlay();
+                            if (dualOverlaySchedulerTimer) {{
+                                clearTimeout(dualOverlaySchedulerTimer);
+                                dualOverlaySchedulerTimer = null;
                             }}
                         }}
 
@@ -3571,56 +3902,75 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ctx.fillText('🐱 Video Standby / Reaksi', 360, 640);
                                 }}
 
-                                // 2. Floating Webcam PiP Box: 200x200 px at Top-Right (x=496, y=24)
-                                const pipW = 200;
-                                const pipH = 200;
-                                const pipX = 496;
-                                const pipY = 24;
+                                // Function to draw Webcam Box (400x400 at Bottom-Center: x=160, y=840)
+                                function renderWebcamBox() {{
+                                    const pipW = 400;
+                                    const pipH = 400;
+                                    const pipX = 160;
+                                    const pipY = 840;
 
-                                if (camVid && camVid.readyState >= 2) {{
-                                    const cW = camVid.videoWidth || 240;
-                                    const cH = camVid.videoHeight || 240;
-                                    const minDim = Math.min(cW, cH);
-                                    const sX = (cW - minDim) * 0.5;
-                                    const sY = (cH - minDim) * 0.5;
+                                    if (camVid && camVid.readyState >= 2) {{
+                                        const cW = camVid.videoWidth || 480;
+                                        const cH = camVid.videoHeight || 480;
+                                        const minDim = Math.min(cW, cH);
+                                        const sX = (cW - minDim) * 0.5;
+                                        const sY = (cH - minDim) * 0.5;
 
-                                    ctx.save();
-                                    ctx.beginPath();
-                                    ctx.rect(pipX, pipY, pipW, pipH);
-                                    ctx.clip();
+                                        ctx.save();
+                                        ctx.beginPath();
+                                        ctx.rect(pipX, pipY, pipW, pipH);
+                                        ctx.clip();
 
-                                    if (dualIsMirror) {{
-                                        ctx.translate(pipX + pipW, pipY);
-                                        ctx.scale(-1, 1);
-                                        ctx.drawImage(camVid, sX, sY, minDim, minDim, 0, 0, pipW, pipH);
+                                        if (dualIsMirror) {{
+                                            ctx.translate(pipX + pipW, pipY);
+                                            ctx.scale(-1, 1);
+                                            ctx.drawImage(camVid, sX, sY, minDim, minDim, 0, 0, pipW, pipH);
+                                        }} else {{
+                                            ctx.drawImage(camVid, sX, sY, minDim, minDim, pipX, pipY, pipW, pipH);
+                                        }}
+                                        ctx.restore();
+
+                                        // Neon border 2px
+                                        ctx.strokeStyle = '#25f4ee';
+                                        ctx.lineWidth = 2;
+                                        ctx.strokeRect(pipX, pipY, pipW, pipH);
+
+                                        // Host indicator badge
+                                        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                                        ctx.fillRect(pipX, pipY + pipH - 26, pipW, 26);
+                                        ctx.fillStyle = '#25f4ee';
+                                        ctx.font = 'bold 13px sans-serif';
+                                        ctx.textAlign = 'center';
+                                        ctx.fillText('🔴 LIVE HOST', pipX + pipW * 0.5, pipY + pipH - 8);
                                     }} else {{
-                                        ctx.drawImage(camVid, sX, sY, minDim, minDim, pipX, pipY, pipW, pipH);
+                                        ctx.fillStyle = 'rgba(18, 18, 24, 0.85)';
+                                        ctx.fillRect(pipX, pipY, pipW, pipH);
+                                        ctx.strokeStyle = '#25f4ee';
+                                        ctx.lineWidth = 2;
+                                        ctx.strokeRect(pipX, pipY, pipW, pipH);
+
+                                        ctx.fillStyle = '#71717a';
+                                        ctx.font = 'bold 14px sans-serif';
+                                        ctx.textAlign = 'center';
+                                        ctx.fillText('📷 Cam Standby', pipX + pipW * 0.5, pipY + pipH * 0.5 + 4);
                                     }}
-                                    ctx.restore();
+                                }}
 
-                                    // Neon border 2px
-                                    ctx.strokeStyle = '#25f4ee';
-                                    ctx.lineWidth = 2;
-                                    ctx.strokeRect(pipX, pipY, pipW, pipH);
+                                // Function to draw Dynamic Overlay Layer (.webm Transparan VP8/VP9)
+                                function renderDynamicOverlay() {{
+                                    if (dualActiveOverlayVid && dualIsOverlayPlaying && dualActiveOverlayVid.readyState >= 2) {{
+                                        ctx.drawImage(dualActiveOverlayVid, 0, 0, 720, 1280);
+                                    }}
+                                }}
 
-                                    // Host indicator badge
-                                    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-                                    ctx.fillRect(pipX, pipY + pipH - 22, pipW, 22);
-                                    ctx.fillStyle = '#25f4ee';
-                                    ctx.font = 'bold 11px sans-serif';
-                                    ctx.textAlign = 'center';
-                                    ctx.fillText('🔴 LIVE HOST', pipX + pipW * 0.5, pipY + pipH - 6);
+                                // Dynamic Z-Index Compositing between Webcam and Dynamic Overlay:
+                                if (dualOverlayLayerPos === 'below_webcam') {{
+                                    renderDynamicOverlay();
+                                    renderWebcamBox();
                                 }} else {{
-                                    ctx.fillStyle = 'rgba(18, 18, 24, 0.85)';
-                                    ctx.fillRect(pipX, pipY, pipW, pipH);
-                                    ctx.strokeStyle = '#25f4ee';
-                                    ctx.lineWidth = 2;
-                                    ctx.strokeRect(pipX, pipY, pipW, pipH);
-
-                                    ctx.fillStyle = '#71717a';
-                                    ctx.font = 'bold 12px sans-serif';
-                                    ctx.textAlign = 'center';
-                                    ctx.fillText('📷 Cam Standby', pipX + pipW * 0.5, pipY + pipH * 0.5 + 4);
+                                    // Default: 'above_webcam' (menyatu secara organik di seluruh layar)
+                                    renderWebcamBox();
+                                    renderDynamicOverlay();
                                 }}
 
                                 // 3. Dynamic Watermark Badge at Top-Left (x=24, y=24)
@@ -3633,17 +3983,19 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 ctx.textAlign = 'left';
                                 ctx.fillText(dualCurrentSlot === 1 ? '🐱 STANDBY (SLOT 1)' : '🎁 REAKSI (SLOT ' + dualCurrentSlot + ')', 34, 46);
 
-                                // 4. Toast Notification at Bottom (x=30, y=1140)
+                                // 4. Toast Notification right above Webcam (x=30, y=760)
                                 if (dualActiveToast) {{
-                                    ctx.fillStyle = 'rgba(15, 15, 24, 0.9)';
-                                    ctx.fillRect(30, 1140, 660, 50);
+                                    ctx.fillStyle = 'rgba(15, 15, 24, 0.92)';
+                                    ctx.beginPath();
+                                    ctx.roundRect(30, 760, 660, 52, 8);
+                                    ctx.fill();
                                     ctx.strokeStyle = '#fe2c55';
-                                    ctx.lineWidth = 1.5;
-                                    ctx.strokeRect(30, 1140, 660, 50);
+                                    ctx.lineWidth = 2;
+                                    ctx.stroke();
                                     ctx.fillStyle = '#25f4ee';
                                     ctx.font = 'bold 16px sans-serif';
                                     ctx.textAlign = 'center';
-                                    ctx.fillText(dualActiveToast, 360, 1172);
+                                    ctx.fillText(dualActiveToast, 360, 792);
                                 }}
                             }}
 
@@ -3739,8 +4091,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 const constraints = {{
                                     video: {{
                                         ...(camId ? {{ deviceId: {{ exact: camId }} }} : {{ facingMode: 'user' }}),
-                                        width: {{ ideal: 240, max: 320 }},
-                                        height: {{ ideal: 240, max: 240 }},
+                                        width: {{ ideal: 480, max: 480 }},
+                                        height: {{ ideal: 480, max: 480 }},
                                         frameRate: {{ ideal: 24, max: 24 }}
                                     }},
                                     audio: micId ? {{ deviceId: {{ exact: micId }} }} : true
@@ -4123,6 +4475,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             </div>
                         </div>
 
+                        {dynamic_overlay_card_html}
+
                         {overlay_card_html}
 
                         {vpn_card_html}
@@ -4146,7 +4500,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         <span>🎥</span> Dual-Screen Live Studio (Full-Screen + PiP Host)
                                     </h3>
                                     <p style="color: #a1a1aa; font-size: 13px; margin: 4px 0 0 0;">
-                                        Video utama Full-Screen 9:16 (720x1280) dengan floating webcam Picture-in-Picture (200x200 di kanan atas). Pipeline 24 FPS ringan & hemat sumber daya perangkat.
+                                        Video utama Full-Screen 9:16 (720x1280) dengan floating webcam Picture-in-Picture (400x400 di bawah tengah). Pipeline 24 FPS ringan & hemat sumber daya perangkat.
                                     </p>
                                 </div>
                                 <div style="display: flex; gap: 8px; align-items: center;">
@@ -4445,6 +4799,146 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             filepath = os.path.realpath(os.path.join(VIDEOS_DIR, filename))
             real_videos_dir = os.path.realpath(VIDEOS_DIR)
             if not filepath.startswith(real_videos_dir) or not os.path.exists(filepath):
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            mime = "video/mp4" if filename.lower().endswith(".mp4") else "video/webm"
+            file_size = os.path.getsize(filepath)
+            
+            range_header = self.headers.get('Range')
+            if range_header:
+                bytes_range = range_header.replace('bytes=', '').strip()
+                parts = bytes_range.split('-')
+                start = int(parts[0]) if parts[0] else 0
+                end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+                if start >= file_size:
+                    self.send_response(416)
+                    self.send_header('Content-Range', f'bytes */{file_size}')
+                    self.end_headers()
+                    return
+                end = min(end, file_size - 1)
+                content_length = end - start + 1
+                
+                self.send_response(206)
+                self.send_header('Content-Type', mime)
+                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                self.send_header('Content-Length', str(content_length))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
+                self.end_headers()
+                
+                if head_only:
+                    return
+
+                with open(filepath, 'rb') as f:
+                    f.seek(start)
+                    chunk_size = 64 * 1024
+                    bytes_remaining = content_length
+                    while bytes_remaining > 0:
+                        to_read = min(chunk_size, bytes_remaining)
+                        data = f.read(to_read)
+                        if not data:
+                            break
+                        try:
+                            self.wfile.write(data)
+                        except (BrokenPipeError, ConnectionResetError):
+                            break
+                        bytes_remaining -= len(data)
+            else:
+                self.send_response(200)
+                self.send_header('Content-Type', mime)
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
+                self.end_headers()
+                
+                if head_only:
+                    return
+
+                with open(filepath, 'rb') as f:
+                    try:
+                        shutil.copyfileobj(f, self.wfile)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+            return
+
+        elif parsed_url.path == '/api/dynamic-overlays':
+            cfg = load_dynamic_overlay_config()
+            slots_info = {}
+            for s in range(1, 11):
+                slot_str = str(s)
+                s_cfg = cfg.get("slots", {}).get(slot_str, {})
+                file_name = None
+                size_mb = 0
+                for ext in (".webm", ".mp4"):
+                    cand = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{s}{ext}")
+                    if os.path.exists(cand):
+                        file_name = f"overlay_{s}{ext}"
+                        size_mb = round(os.path.getsize(cand) / (1024 * 1024), 2)
+                        break
+                slots_info[slot_str] = {
+                    "name": s_cfg.get("name", f"Layer Animasi {s}"),
+                    "file": file_name,
+                    "size_mb": size_mb,
+                    "enabled": s_cfg.get("enabled", True)
+                }
+            resp = {
+                "layer_position": cfg.get("layer_position", "above_webcam"),
+                "scheduler": cfg.get("scheduler", {
+                    "enabled": True,
+                    "min_interval_sec": 15,
+                    "max_interval_sec": 60
+                }),
+                "slots": slots_info
+            }
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
+            return
+
+        elif parsed_url.path == '/delete-dynamic-overlay':
+            query = urllib.parse.parse_qs(parsed_url.query)
+            slot = query.get('slot', [''])[0]
+            if slot and slot in [str(i) for i in range(1, 11)]:
+                for ext in (".webm", ".mp4"):
+                    fp = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{slot}{ext}")
+                    if os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception as e:
+                            print(f"[DynamicOverlay Delete Error] {e}")
+                cfg = load_dynamic_overlay_config()
+                if "slots" in cfg and slot in cfg["slots"]:
+                    cfg["slots"][slot]["file"] = None
+                    save_dynamic_overlay_config(cfg)
+            self.send_response(303)
+            self.send_header('Location', '/')
+            self.end_headers()
+            return
+
+        elif parsed_url.path == '/stream-dynamic-overlay':
+            query = urllib.parse.parse_qs(parsed_url.query)
+            slot = query.get('slot', [''])[0]
+            filename = query.get('file', [''])[0]
+            if slot and not filename:
+                for ext in (".webm", ".mp4"):
+                    cand = f"overlay_{slot}{ext}"
+                    if os.path.exists(os.path.join(DYNAMIC_OVERLAYS_DIR, cand)):
+                        filename = cand
+                        break
+            if not filename:
+                self.send_response(404)
+                self.end_headers()
+                return
+            filename = os.path.basename(filename)
+            filepath = os.path.realpath(os.path.join(DYNAMIC_OVERLAYS_DIR, filename))
+            real_dir = os.path.realpath(DYNAMIC_OVERLAYS_DIR)
+            if not filepath.startswith(real_dir) or not os.path.exists(filepath):
                 self.send_response(404)
                 self.end_headers()
                 return
@@ -4884,6 +5378,140 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_response(303)
             self.send_header('Location', '/')
             self.end_headers()
+
+        elif parsed_url.path == '/upload-dynamic-overlay':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                if content_length > 100 * 1024 * 1024:
+                    self.send_response(413)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(b"<html><body style='background:#0f0f11; color:#ff3b30; text-align:center; padding-top:50px;'><h2>File terlalu besar! Maksimum 100 MB.</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>")
+                    return
+
+                content_type = self.headers.get('Content-Type', '')
+                body = self.rfile.read(content_length)
+                headers = f"Content-Type: {content_type}\n\n".encode('utf-8')
+                msg = email.parser.BytesParser().parsebytes(headers + body)
+                
+                slot = "1"
+                file_data = None
+                orig_filename = ""
+                
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        cd = part.get("Content-Disposition", "")
+                        if 'name="slot"' in cd:
+                            payload = part.get_payload(decode=True)
+                            if isinstance(payload, bytes):
+                                slot = payload.decode('utf-8', errors='ignore').strip()
+                        elif 'name="overlayfile"' in cd:
+                            fn_param = part.get_filename()
+                            if fn_param:
+                                orig_filename = fn_param
+                            payload = part.get_payload(decode=True)
+                            if isinstance(payload, bytes):
+                                file_data = payload
+                
+                if slot not in [str(i) for i in range(1, 11)]:
+                    slot = "1"
+
+                if file_data:
+                    ext = ".webm"
+                    clean_orig_name = os.path.basename(orig_filename).strip() if orig_filename else ""
+                    if clean_orig_name.lower().endswith('.mp4'):
+                        ext = ".mp4"
+                    
+                    for old_ext in (".webm", ".mp4"):
+                        old_p = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{slot}{old_ext}")
+                        if os.path.exists(old_p):
+                            try:
+                                os.remove(old_p)
+                            except Exception:
+                                pass
+                                
+                    saved_filename = f"overlay_{slot}{ext}"
+                    filepath = os.path.join(DYNAMIC_OVERLAYS_DIR, saved_filename)
+                    with open(filepath, 'wb') as f:
+                        f.write(file_data)
+
+                    cfg = load_dynamic_overlay_config()
+                    if "slots" not in cfg:
+                        cfg["slots"] = {}
+                    if slot not in cfg["slots"]:
+                        cfg["slots"][slot] = {}
+                    cfg["slots"][slot]["file"] = saved_filename
+                    save_dynamic_overlay_config(cfg)
+            except Exception as e:
+                print(f"[Upload Dynamic Overlay Error] {e}")
+
+            self.send_response(303)
+            self.send_header('Location', '/')
+            self.end_headers()
+            return
+
+        elif parsed_url.path == '/update-dynamic-overlay-config':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else "{}"
+                data = json.loads(body)
+                cfg = load_dynamic_overlay_config()
+                key = data.get("key")
+                val = data.get("val")
+                if key == "layer_position":
+                    if val in ("above_webcam", "below_webcam"):
+                        cfg["layer_position"] = val
+                elif key == "scheduler_enabled":
+                    cfg["scheduler"]["enabled"] = bool(val)
+                elif key == "min_interval":
+                    try:
+                        cfg["scheduler"]["min_interval_sec"] = max(5, int(val))
+                    except Exception:
+                        pass
+                elif key == "max_interval":
+                    try:
+                        cfg["scheduler"]["max_interval_sec"] = max(5, int(val))
+                    except Exception:
+                        pass
+                save_dynamic_overlay_config(cfg)
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "config": cfg}).encode('utf-8'))
+                return
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                return
+
+        elif parsed_url.path == '/update-dynamic-overlay-name':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else "{}"
+                data = json.loads(body)
+                slot = str(data.get("slot", "")).strip()
+                name = str(data.get("name", "")).strip()
+                if slot and slot in [str(i) for i in range(1, 11)]:
+                    cfg = load_dynamic_overlay_config()
+                    if "slots" not in cfg:
+                        cfg["slots"] = {}
+                    if slot not in cfg["slots"]:
+                        cfg["slots"][slot] = {}
+                    cfg["slots"][slot]["name"] = name or f"Layer Animasi {slot}"
+                    save_dynamic_overlay_config(cfg)
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+                return
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                return
 
         elif parsed_url.path == '/upload-avatar':
             try:
