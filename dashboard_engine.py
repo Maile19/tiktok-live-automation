@@ -1239,8 +1239,8 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     has_audio = check_has_audio(video_path)
 
     loop_args = ["-stream_loop", "-1"] if loop else []
-    # Full-screen 720x1280 layout + Side-by-Side 200x200 (Left: Dynamic Overlay at x=120, Right: Webcam at x=400 at y=1040)
-    scale_filter = "scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=120:y=1040:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=120:y=1040:w=200:h=200:color=0xff2b54:t=2,drawbox=x=400:y=1040:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=400:y=1040:w=200:h=200:color=0x25f4ee:t=2"
+    # Full-screen 720x1280 layout + Floating top-right PiP webcam box (200x200 at x=496, y=160)
+    scale_filter = "scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=496:y=160:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=496:y=160:w=200:h=200:color=0x25f4ee:t=2"
 
     cmd = [
         "ffmpeg",
@@ -3082,6 +3082,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         }}
                     </style>
                     <script>
+                        let lastProcessedGiftSeq = 0;
                         function validateUpload(form) {{
                             const fileInput = form.querySelector('input[type="file"]');
                             if (!fileInput || fileInput.files.length === 0) {{
@@ -3290,6 +3291,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}
 
                                 if (data.success) {{
+                                    if (!isMonitorOutputVisible && typeof toggleMonitorOutput === 'function') {{
+                                        toggleMonitorOutput();
+                                    }} else if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
+                                        startRenderLoop();
+                                    }}
                                     if (typeof queueDualScreenSlot === 'function') {{
                                         queueDualScreenSlot(slot, data.giftName, 'Simulasi');
                                     }}
@@ -3452,7 +3458,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         let dualAnimFrame = null;
                         let dualGiftQueue = [];
                         let dualIsReactionPlaying = false;
-                        let lastProcessedGiftSeq = 0;
                         let dualActiveToast = null;
                         let dualToastTimeout = null;
                         let dualReactionTimer = null;
@@ -3793,16 +3798,18 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}
                             }};
 
-                            if (isRenderLoopRunning || dualIsStreaming || isMonitorOutputVisible) {{
-                                catVid.play().catch(e => {{
-                                    console.warn('Cat video play warning:', e);
-                                    if (slot !== 1) {{
-                                        if (dualReactionTimer) clearTimeout(dualReactionTimer);
-                                        dualIsReactionPlaying = false;
-                                        processDualScreenQueue();
-                                    }}
-                                }});
+                            if (isMonitorOutputVisible && !isRenderLoopRunning && !dualIsStreaming) {{
+                                startRenderLoop();
                             }}
+
+                            catVid.play().catch(e => {{
+                                console.warn('Cat video play warning:', e);
+                                if (slot !== 1) {{
+                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                    dualIsReactionPlaying = false;
+                                    processDualScreenQueue();
+                                }}
+                            }});
                         }}
 
                         function initDualScreenStudio() {{
@@ -3911,63 +3918,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ctx.drawImage(guideOverlayImg, 60, 150);
                                 }}
 
-                                // 3. Side-by-Side 200x200 Layout at Bottom Screen (y=1040)
-                                // Left Box: Dynamic Overlay (.webm Transparan) 200x200 (x=120, y=1040)
-                                function renderDynamicOverlayBox() {{
-                                    const ovW = 200;
-                                    const ovH = 200;
-                                    const ovX = 120;
-                                    const ovY = 1040;
-
-                                    if (dualActiveOverlayVid && dualIsOverlayPlaying && dualActiveOverlayVid.readyState >= 2) {{
-                                        const vW = dualActiveOverlayVid.videoWidth || 200;
-                                        const vH = dualActiveOverlayVid.videoHeight || 200;
-                                        const minDim = Math.min(vW, vH);
-                                        const sX = (vW - minDim) * 0.5;
-                                        const sY = (vH - minDim) * 0.5;
-
-                                        ctx.fillStyle = 'rgba(18, 18, 24, 0.85)';
-                                        ctx.fillRect(ovX, ovY, ovW, ovH);
-
-                                        ctx.save();
-                                        ctx.beginPath();
-                                        ctx.rect(ovX, ovY, ovW, ovH);
-                                        ctx.clip();
-                                        ctx.drawImage(dualActiveOverlayVid, sX, sY, minDim, minDim, ovX, ovY, ovW, ovH);
-                                        ctx.restore();
-
-                                        // TikTok Pink Neon border 2px
-                                        ctx.strokeStyle = '#ff2b54';
-                                        ctx.lineWidth = 2;
-                                        ctx.strokeRect(ovX, ovY, ovW, ovH);
-
-                                        // Overlay active badge
-                                        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-                                        ctx.fillRect(ovX, ovY + ovH - 22, ovW, 22);
-                                        ctx.fillStyle = '#ff2b54';
-                                        ctx.font = 'bold 11px sans-serif';
-                                        ctx.textAlign = 'center';
-                                        ctx.fillText('✨ DYNAMIC OVERLAY', ovX + ovW * 0.5, ovY + ovH - 6);
-                                    }} else {{
-                                        ctx.fillStyle = 'rgba(18, 18, 24, 0.85)';
-                                        ctx.fillRect(ovX, ovY, ovW, ovH);
-                                        ctx.strokeStyle = '#ff2b54';
-                                        ctx.lineWidth = 2;
-                                        ctx.strokeRect(ovX, ovY, ovW, ovH);
-
-                                        ctx.fillStyle = '#a1a1aa';
-                                        ctx.font = 'bold 12px sans-serif';
-                                        ctx.textAlign = 'center';
-                                        ctx.fillText('🎭 Overlay Standby', ovX + ovW * 0.5, ovY + ovH * 0.5 + 4);
-                                    }}
-                                }}
-
-                                // Right Box: Monitor Webcam 200x200 (x=400, y=1040)
+                                // 3. Single Webcam Box at Top-Right (200x200 at x=496, y=160)
                                 function renderWebcamBox() {{
                                     const camW = 200;
                                     const camH = 200;
-                                    const camX = 400;
-                                    const camY = 1040;
+                                    const camX = 496;
+                                    const camY = 160;
 
                                     if (camVid && camVid.readyState >= 2) {{
                                         const cW = camVid.videoWidth || 320;
@@ -4016,9 +3972,22 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     }}
                                 }}
 
-                                // Draw Side-by-Side Elements (Left: Overlay, Right: Webcam)
-                                renderDynamicOverlayBox();
-                                renderWebcamBox();
+                                // Function to draw Dynamic Overlay Layer (.webm Transparan VP8/VP9) across full screen
+                                function renderDynamicOverlay() {{
+                                    if (dualActiveOverlayVid && dualIsOverlayPlaying && dualActiveOverlayVid.readyState >= 2) {{
+                                        ctx.drawImage(dualActiveOverlayVid, 0, 0, 720, 1280);
+                                    }}
+                                }}
+
+                                // Dynamic Z-Index Compositing between Webcam and Dynamic Overlay:
+                                if (dualOverlayLayerPos === 'below_webcam') {{
+                                    renderDynamicOverlay();
+                                    renderWebcamBox();
+                                }} else {{
+                                    // Default: 'above_webcam' (menyatu secara organik di seluruh layar)
+                                    renderWebcamBox();
+                                    renderDynamicOverlay();
+                                }}
 
                                 // 4. Dynamic Watermark Badge at Top-Left (x=24, y=24)
                                 ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
@@ -4030,11 +3999,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 ctx.textAlign = 'left';
                                 ctx.fillText(dualCurrentSlot === 1 ? '🐱 STANDBY (SLOT 1)' : '🎁 REAKSI (SLOT ' + dualCurrentSlot + ')', 34, 46);
 
-                                // 5. Toast Notification right above Side-by-Side Boxes (x=30, y=960)
+                                // 5. Toast Notification / Gift Banner at Center-Top (x=30, y=400)
                                 if (dualActiveToast) {{
                                     ctx.fillStyle = 'rgba(15, 15, 24, 0.92)';
                                     ctx.beginPath();
-                                    ctx.roundRect(30, 960, 660, 52, 8);
+                                    ctx.roundRect(30, 400, 660, 52, 8);
                                     ctx.fill();
                                     ctx.strokeStyle = '#fe2c55';
                                     ctx.lineWidth = 2;
@@ -4042,7 +4011,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ctx.fillStyle = '#25f4ee';
                                     ctx.font = 'bold 16px sans-serif';
                                     ctx.textAlign = 'center';
-                                    ctx.fillText(dualActiveToast, 360, 992);
+                                    ctx.fillText(dualActiveToast, 360, 432);
                                 }}
                             }}
 
@@ -4544,10 +4513,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px;">
                                 <div>
                                     <h3 style="margin: 0; color: #25f4ee; font-size: 18px; display: flex; align-items: center; gap: 8px;">
-                                        <span>🎥</span> Dual-Screen Live Studio (Full-Screen + Side-by-Side 200x200)
+                                        <span>🎥</span> Dual-Screen Live Studio (Full-Screen + Top-Right PiP Host)
                                     </h3>
                                     <p style="color: #a1a1aa; font-size: 13px; margin: 4px 0 0 0;">
-                                        Video utama Full-Screen 9:16 (720x1280) dengan komposisi Side-by-Side 200x200 di area bawah (Kiri: Dynamic Overlay, Kanan: Webcam Host). Pipeline 24 FPS ringan & hemat sumber daya perangkat.
+                                        Video utama Full-Screen 9:16 (720x1280) dengan floating webcam Picture-in-Picture (200x200 di kanan atas y=160). Pipeline 24 FPS ringan & hemat sumber daya perangkat.
                                     </p>
                                 </div>
                                 <div style="display: flex; gap: 8px; align-items: center;">
@@ -5923,7 +5892,25 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     detail_msg = f"Simulasi diterima, namun tidak ada slot reaksi yang cocok ({res.get('reason')})."
             else:
-                detail_msg = f"Stream sedang offline. Simulasi Gift {gift_name} (Slot {target_slot}) dicatat tanpa memicu FFmpeg."
+                global global_gift_seq, latest_gift_event, recent_gift_logs
+                global_gift_seq += 1
+                event_id = f"{int(time.time()*1000)}_{target_slot}_{global_gift_seq}"
+                gift_info = {
+                    "id": event_id,
+                    "seq": global_gift_seq,
+                    "time": time.strftime("%H:%M:%S"),
+                    "sender": "PenontonSimulasi",
+                    "giftName": gift_name,
+                    "giftId": str(sim_gift_id or cfg_gift_id),
+                    "count": 1,
+                    "slot": target_slot,
+                    "slotName": f"Slot {target_slot}",
+                    "status": "Sedang Diputar"
+                }
+                latest_gift_event = gift_info
+                recent_gift_logs.appendleft(gift_info)
+                listener_status["totalGiftsReceived"] += 1
+                detail_msg = f"Simulasi Gift {gift_name} (Slot {target_slot}) berhasil dicatat & dipicu."
 
             resp_data = {
                 "success": True,
