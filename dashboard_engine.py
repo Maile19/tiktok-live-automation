@@ -3366,9 +3366,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     if (data.id) {{
                                         recentlyLocalQueuedEventIds.add(data.id);
                                     }}
-                                    if (!isMonitorOutputVisible && typeof toggleMonitorOutput === 'function') {{
-                                        toggleMonitorOutput();
-                                    }} else if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
+                                    if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
                                         startRenderLoop();
                                     }}
                                     if (typeof queueDualScreenSlot === 'function') {{
@@ -3531,6 +3529,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         let dualAudioDest = null;
                         let dualMicGain = null;
                         let dualCatAudioSource = null;
+                        let dualMonitorGain = null;
                         let dualCanvasStream = null;
                         let dualMediaRecorder = null;
                         let dualStreamWs = null;
@@ -3605,9 +3604,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                         function testDynamicOverlay(slot) {{
                             console.log('[DynamicOverlay] Manual test trigger slot:', slot);
-                            if (!isMonitorOutputVisible && typeof toggleMonitorOutput === 'function') {{
-                                toggleMonitorOutput();
-                            }} else if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
+                            if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
                                 startRenderLoop();
                             }}
                             playDynamicOverlaySlot(slot, true);
@@ -3736,6 +3733,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     btn.style.color = '#ff9500';
                                     btn.style.background = 'rgba(255, 149, 0, 0.12)';
                                 }}
+                                if (dualAudioCtx && dualAudioCtx.state === 'suspended') {{
+                                    dualAudioCtx.resume();
+                                }}
+                                if (dualMonitorGain) {{
+                                    dualMonitorGain.gain.value = 1.0;
+                                }}
                                 startRenderLoop();
                             }} else {{
                                 if (stage) stage.style.display = 'none';
@@ -3745,6 +3748,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     btn.style.borderColor = '#25f4ee';
                                     btn.style.color = '#25f4ee';
                                     btn.style.background = 'rgba(37, 244, 238, 0.12)';
+                                }}
+                                if (dualMonitorGain) {{
+                                    dualMonitorGain.gain.value = 0.0;
                                 }}
                                 // If NOT live streaming, stop rendering loop completely to free 100% CPU/GPU
                                 if (!dualIsStreaming) {{
@@ -4208,12 +4214,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                         catVid.loop = true;
                                     }}
                                     catVid.muted = false;
-                                    if (isRenderLoopRunning || dualIsStreaming || isMonitorOutputVisible) {{
-                                        catVid.play().catch(e => console.warn(e));
-                                    }}
                                 }}
 
                                 setupDualAudioMixing(stream, catVid);
+
+                                if (catVid && (isRenderLoopRunning || dualIsStreaming || isMonitorOutputVisible)) {{
+                                    catVid.play().catch(e => console.warn(e));
+                                }}
 
                                 if (btn) {{
                                     btn.innerHTML = '🛑 Matikan Kamera & Mic';
@@ -4241,9 +4248,20 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 if (dualAudioCtx.state === 'suspended') {{
                                     dualAudioCtx.resume();
                                 }}
-                                dualAudioDest = dualAudioCtx.createMediaStreamDestination();
+                                if (!dualAudioDest) {{
+                                    dualAudioDest = dualAudioCtx.createMediaStreamDestination();
+                                }}
 
-                                if (micStream.getAudioTracks().length > 0) {{
+                                // Monitor Gain Node (Jalur Speaker Lokal Browser)
+                                if (!dualMonitorGain) {{
+                                    dualMonitorGain = dualAudioCtx.createGain();
+                                    dualMonitorGain.gain.value = isMonitorOutputVisible ? 1.0 : 0.0;
+                                    dualMonitorGain.connect(dualAudioCtx.destination);
+                                }} else {{
+                                    dualMonitorGain.gain.value = isMonitorOutputVisible ? 1.0 : 0.0;
+                                }}
+
+                                if (micStream && micStream.getAudioTracks().length > 0) {{
                                     const micSrc = dualAudioCtx.createMediaStreamSource(micStream);
                                     dualMicGain = dualAudioCtx.createGain();
                                     dualMicGain.gain.value = dualIsMicMuted ? 0 : 1.0;
@@ -4271,11 +4289,15 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 if (catVid && !dualCatAudioSource) {{
                                     try {{
                                         dualCatAudioSource = dualAudioCtx.createMediaElementSource(catVid);
-                                        const catGain = dualAudioCtx.createGain();
-                                        catGain.gain.value = 1.0;
-                                        dualCatAudioSource.connect(catGain);
-                                        dualCatAudioSource.connect(dualAudioCtx.destination);
-                                        catGain.connect(dualAudioDest);
+
+                                        // Jalur 1 (Ke Stream Server / TikTok): Volume penuh 1.0 selalu aktif
+                                        const catStreamGain = dualAudioCtx.createGain();
+                                        catStreamGain.gain.value = 1.0;
+                                        dualCatAudioSource.connect(catStreamGain);
+                                        catStreamGain.connect(dualAudioDest);
+
+                                        // Jalur 2 (Ke Speaker Lokal Browser): Melewati dualMonitorGain (0.0 saat hidden, 1.0 saat aktif)
+                                        dualCatAudioSource.connect(dualMonitorGain);
                                     }} catch (e) {{
                                         console.warn('AudioElementSource warning:', e);
                                     }}
@@ -4486,6 +4508,17 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 if (!isDualScreenActive || !dualMediaStream) {{
                                     console.log('[StartLive] Mengaktifkan Kamera & Mic otomatis...');
                                     await toggleCamera();
+                                }}
+
+                                // Pastikan status monitor output dan audio speaker lokal tetap terkontrol sesuai preferensi user
+                                if (dualMonitorGain) {{
+                                    dualMonitorGain.gain.value = isMonitorOutputVisible ? 1.0 : 0.0;
+                                }}
+                                const stage = document.getElementById('dualPreviewStage');
+                                const placeholder = document.getElementById('dualPreviewPlaceholder');
+                                if (!isMonitorOutputVisible) {{
+                                    if (stage) stage.style.display = 'none';
+                                    if (placeholder) placeholder.style.display = 'flex';
                                 }}
 
                                 if (btn) btn.innerHTML = '🚀 Mengambil RTMP TikTok...';
