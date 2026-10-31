@@ -40,6 +40,7 @@ OVERLAYS_DIR = os.path.join(BASE_DIR, "uploads", "overlays")
 DYNAMIC_OVERLAYS_DIR = os.path.join(BASE_DIR, "uploads", "dynamic_overlays")
 DYNAMIC_OVERLAY_CONFIG_FILE = os.path.join(BASE_DIR, "dynamic_overlay_config.json")
 CHARACTER_CONFIG_FILE = os.path.join(BASE_DIR, "character_config.json")
+COMPOSITOR_CONFIG_FILE = os.path.join(BASE_DIR, "compositor_config.json")
 GUIDE_OVERLAY_FILE = os.path.join(OVERLAYS_DIR, "guide_overlay.png")
 FFMPEG_LOG_FILE = os.path.join(BASE_DIR, "ffmpeg_stream.log")
 STREAM_META_FILE = os.path.join(BASE_DIR, "stream_metadata.json")
@@ -98,6 +99,47 @@ def save_dynamic_overlay_config(cfg):
             json.dump(cfg, f, indent=2)
     except Exception as e:
         print(f"[DynamicOverlay] Error saving: {e}")
+
+DEFAULT_COMPOSITOR_CONFIG = {
+    "webcam": {
+        "x": 440,
+        "y": 160,
+        "width": 200,
+        "height": 200
+    },
+    "guide": {
+        "x": 60,
+        "y": 150
+    }
+}
+
+def load_compositor_config():
+    if os.path.exists(COMPOSITOR_CONFIG_FILE):
+        try:
+            with open(COMPOSITOR_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                res = dict(DEFAULT_COMPOSITOR_CONFIG)
+                res["webcam"] = dict(DEFAULT_COMPOSITOR_CONFIG["webcam"])
+                res["guide"] = dict(DEFAULT_COMPOSITOR_CONFIG["guide"])
+                if isinstance(data, dict):
+                    if "webcam" in data and isinstance(data["webcam"], dict):
+                        res["webcam"].update(data["webcam"])
+                    if "guide" in data and isinstance(data["guide"], dict):
+                        res["guide"].update(data["guide"])
+                return res
+        except Exception as e:
+            print(f"[CompositorConfig] Error loading: {e}")
+    res = dict(DEFAULT_COMPOSITOR_CONFIG)
+    res["webcam"] = dict(DEFAULT_COMPOSITOR_CONFIG["webcam"])
+    res["guide"] = dict(DEFAULT_COMPOSITOR_CONFIG["guide"])
+    return res
+
+def save_compositor_config(cfg):
+    try:
+        with open(COMPOSITOR_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[CompositorConfig] Error saving: {e}")
 
 DEFAULT_VPN_CONFIG = {
     "auto_vpn": True,
@@ -1229,9 +1271,17 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     
     char_cfg = load_character_config()
     overlay_enabled = char_cfg.get("overlay_enabled", True)
-    pos = char_cfg.get("position", {"x": 60, "y": 150})
-    pos_x = pos.get("x", 60)
-    pos_y = pos.get("y", 150)
+
+    comp_cfg = load_compositor_config()
+    cam_cfg = comp_cfg.get("webcam", {"x": 440, "y": 160, "width": 200, "height": 200})
+    cam_x = int(cam_cfg.get("x", 440))
+    cam_y = int(cam_cfg.get("y", 160))
+    cam_w = int(cam_cfg.get("width", 200))
+    cam_h = int(cam_cfg.get("height", 200))
+
+    guide_pos = comp_cfg.get("guide", char_cfg.get("position", {"x": 60, "y": 150}))
+    pos_x = int(guide_pos.get("x", 60))
+    pos_y = int(guide_pos.get("y", 150))
 
     if overlay_enabled and not os.path.exists(GUIDE_OVERLAY_FILE):
         try:
@@ -1243,8 +1293,8 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     has_audio = check_has_audio(video_path)
 
     loop_args = ["-stream_loop", "-1"] if loop else []
-    # Full-screen 720x1280 layout + Floating top-right PiP webcam box (200x200 at x=476, y=160)
-    scale_filter = "scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=476:y=160:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=476:y=160:w=200:h=200:color=0x25f4ee:t=2"
+    # Full-screen 720x1280 layout + Floating top-right PiP webcam box (dynamic coords from compositor_config.json)
+    scale_filter = f"scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x={cam_x}:y={cam_y}:w={cam_w}:h={cam_h}:color=0x181820@0.85:t=fill,drawbox=x={cam_x}:y={cam_y}:w={cam_w}:h={cam_h}:color=0x25f4ee:t=2"
 
     cmd = [
         "ffmpeg",
@@ -2963,6 +3013,17 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             stream_status_text = live_text
             queueCountVal = q_len
 
+            comp_cfg = load_compositor_config()
+            cam_cfg = comp_cfg.get("webcam", {"x": 440, "y": 160, "width": 200, "height": 200})
+            cam_x = int(cam_cfg.get("x", 440))
+            cam_y = int(cam_cfg.get("y", 160))
+            cam_w = int(cam_cfg.get("width", 200))
+            cam_h = int(cam_cfg.get("height", 200))
+            guide_pos = comp_cfg.get("guide", {"x": 60, "y": 150})
+            guide_x = int(guide_pos.get("x", 60))
+            guide_y = int(guide_pos.get("y", 150))
+            compositor_cfg_json = json.dumps(comp_cfg)
+
             html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -2971,157 +3032,2129 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 <title>TikTok Live Studio - Bento 2.0</title>
 <style>
 :root {{
---bg-main: #07080C; --bg-card: #11131A; --border: rgba(255,255,255,0.08);
---cyan: #25F4EE; --crimson: #FF2B54; --emerald: #10B981; --amber: #F59E0B;
---font-mono: 'JetBrains Mono', monospace;
+    --bg-main: #07080C; --bg-card: #11131A; --border: rgba(255,255,255,0.08);
+    --cyan: #25F4EE; --crimson: #FF2B54; --emerald: #10B981; --amber: #F59E0B;
+    --font-mono: 'JetBrains Mono', monospace;
 }}
-body {{ margin:0; background:var(--bg-main); color:#fff; font-family:sans-serif; overflow-x:hidden; }}
-.app-shell {{ display:flex; min-height:100vh; }}
-.sidebar {{ width:260px; background:var(--bg-card); border-right:1px solid var(--border); padding:20px; flex-shrink:0; }}
-.main-content {{ flex:1; padding:20px; position:relative; }}
-.top-bar {{ position:sticky; top:0; z-index:100; background:rgba(17,19,26,0.95); backdrop-filter:blur(10px); border-bottom:1px solid var(--border); padding:15px 20px; display:flex; justify-content:space-between; align-items:center; }}
-.nav-item {{ display:block; padding:12px 15px; margin-bottom:8px; border-radius:10px; cursor:pointer; transition:all 0.2s; color:#aaa; text-decoration:none; }}
-.nav-item:hover, .nav-item.active {{ background:rgba(37,244,238,0.1); color:var(--cyan); }}
-.spa-view {{ display:none; animation:fadeIn 0.3s ease; }}
+body {{ margin:0; background:var(--bg-main); color:#fff; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow-x:hidden; }}
+.app-shell {{ display:flex; min-height:calc(100vh - 60px); }}
+.sidebar {{ width:250px; background:var(--bg-card); border-right:1px solid var(--border); padding:20px 15px; flex-shrink:0; }}
+.main-content {{ flex:1; padding:20px; position:relative; max-width:1400px; box-sizing:border-box; }}
+.top-bar {{ position:sticky; top:0; z-index:100; background:rgba(17,19,26,0.95); backdrop-filter:blur(10px); border-bottom:1px solid var(--border); padding:12px 20px; display:flex; justify-content:space-between; align-items:center; }}
+.nav-item {{ display:block; padding:12px 15px; margin-bottom:8px; border-radius:10px; cursor:pointer; transition:all 0.2s; color:#aaa; text-decoration:none; font-weight:600; font-size:14px; }}
+.nav-item:hover, .nav-item.active {{ background:rgba(37,244,238,0.1); color:var(--cyan); border-left:3px solid var(--cyan); }}
+.spa-view {{ display:none; animation:fadeIn 0.25s ease; }}
 .spa-view.active {{ display:block; }}
 .card {{ background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:20px; margin-bottom:20px; }}
-.btn {{ padding:10px 18px; border-radius:8px; border:none; cursor:pointer; font-weight:bold; font-family:var(--font-mono); }}
+.btn {{ padding:10px 18px; border-radius:8px; border:none; cursor:pointer; font-weight:bold; font-family:var(--font-mono); font-size:13px; }}
 .btn-primary {{ background:var(--crimson); color:white; }}
-.btn-secondary {{ background:transparent; border:1px solid var(--border); color:white; }}
-.toast {{ position:fixed; bottom:80px; left:50%; transform:translateX(-50%); background:var(--bg-card); border:1px solid var(--cyan); color:var(--cyan); padding:12px 24px; border-radius:8px; font-family:var(--font-mono); opacity:0; transition:opacity 0.3s; pointer-events:none; z-index:9999; }}
+.btn-secondary {{ background:#1e1e24; border:1px solid var(--border); color:white; }}
+.toast {{ position:fixed; bottom:80px; left:50%; transform:translateX(-50%); background:var(--bg-card); border:1px solid var(--cyan); color:var(--cyan); padding:12px 24px; border-radius:8px; font-family:var(--font-mono); opacity:0; transition:opacity 0.3s; pointer-events:none; z-index:9999; box-shadow:0 10px 30px rgba(0,0,0,0.8); }}
 .toast.show {{ opacity:1; }}
-/* Persistent Media Engine */
+
+/* Persistent Media Engine offscreen */
 #persistent-media-engine {{ position:fixed; top:-9999px; left:-9999px; width:1px; height:1px; opacity:0.01; pointer-events:none; z-index:-1; }}
+
 @media (max-width: 768px) {{
-.sidebar {{ display:none; }}
-.bottom-nav {{ display:flex !important; }}
+    .sidebar {{ display:none; }}
+    .bottom-nav {{ display:flex !important; }}
+    .main-content {{ padding:15px; padding-bottom:80px; }}
 }}
 .bottom-nav {{ display:none; position:fixed; bottom:0; left:0; right:0; background:var(--bg-card); border-top:1px solid var(--border); height:60px; justify-content:space-around; align-items:center; z-index:100; }}
-.bottom-nav-item {{ flex:1; text-align:center; color:#aaa; font-size:10px; padding:5px; cursor:pointer; }}
-.bottom-nav-item.active {{ color:var(--cyan); }}
-@keyframes fadeIn {{ from{{opacity:0;}} to{{opacity:1;}} }}
+.bottom-nav-item {{ flex:1; text-align:center; color:#aaa; font-size:10px; padding:6px 2px; cursor:pointer; text-decoration:none; }}
+.bottom-nav-item.active {{ color:var(--cyan); font-weight:bold; }}
+@keyframes fadeIn {{ from{{opacity:0; transform:translateY(4px);}} to{{opacity:1; transform:translateY(0);}} }}
+
+/* Cards & Buttons Animation */
+@keyframes shine {{
+    0% {{ background-position: 0% 0%; }}
+    50% {{ background-position: 100% 100%; }}
+    100% {{ background-position: 0% 0%; }}
+}}
+@keyframes spin-around {{
+    0% {{ transform: translateZ(0) rotate(0deg); }}
+    100% {{ transform: translateZ(0) rotate(360deg); }}
+}}
+.shine-border-card {{
+    position: relative;
+    border-radius: 14px;
+    background: var(--bg-card);
+    padding: 20px;
+    margin-bottom: 20px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+}}
+.shine-border-card::before {{
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1.5px;
+    background-image: radial-gradient(transparent, transparent, #A07CFE, #FE8FB5, #FFBE7B, transparent, transparent);
+    background-size: 300% 300%;
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    animation: shine 14s infinite linear;
+    pointer-events: none;
+}}
+.shimmer-btn {{
+    --spread: 90deg;
+    --shimmer-color: #ffffff;
+    --radius: 8px;
+    --speed: 3s;
+    --cut: 1.5px;
+    --bg: rgba(18, 18, 24, 0.95);
+    position: relative;
+    z-index: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    white-space: nowrap;
+    cursor: pointer;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: #ffffff;
+    padding: 9px 18px;
+    font-weight: 600;
+    font-size: 13px;
+    transition: transform 0.2s, box-shadow 0.2s;
+    text-decoration: none;
+}}
+.shimmer-btn:hover {{ box-shadow: inset 0 -6px 10px #ffffff2f; }}
+.shimmer-btn:active {{ transform: translateY(1px); }}
+.shimmer-btn::before {{
+    content: "";
+    position: absolute;
+    inset: calc(var(--cut) * -1);
+    z-index: -1;
+    border-radius: inherit;
+    background: conic-gradient(from calc(270deg - (var(--spread) / 2)), transparent 0, var(--shimmer-color) var(--spread), transparent var(--spread));
+    animation: spin-around var(--speed) infinite linear;
+}}
+.modern-btn {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 13px;
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    transition: background 0.2s ease, border-color 0.2s ease;
+    text-decoration: none;
+}}
+.btn-upload {{ background: #1e293b; }}
+.btn-upload:hover {{ background: #334155; border-color: rgba(255, 255, 255, 0.3); }}
+.btn-gift {{ background: #2e1065; }}
+.btn-gift:hover {{ background: #4c1d95; border-color: rgba(255, 255, 255, 0.3); }}
+
+/* Modal */
+.modal-overlay {{
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(8px);
+    z-index: 1000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}}
+.modal-content {{
+    background: #18181b;
+    border: 1px solid #3f3f46;
+    border-radius: 16px;
+    width: 100%;
+    max-width: 500px;
+    max-height: 85vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.8);
+}}
+.modal-header {{
+    padding: 15px 20px;
+    border-bottom: 1px solid #27272a;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}}
+.modal-body {{
+    padding: 20px;
+    overflow-y: auto;
+    max-height: calc(85vh - 70px);
+}}
+.close-btn {{ font-size:24px; color:#aaa; cursor:pointer; border:none; background:none; line-height:1; }}
+.close-btn:hover {{ color:#fff; }}
+input[type="text"], input[type="number"], select, textarea {{
+    background: #121216;
+    color: #fff;
+    border: 1px solid #3f3f46;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+}}
 </style>
+<script>
+let compositorConfig = {compositor_cfg_json};
+
+                        let lastProcessedGiftSeq = -1;
+                        const recentlyLocalQueuedEventIds = new Set();
+                        function validateUpload(form) {{
+                            const fileInput = form.querySelector('input[type="file"]');
+                            if (!fileInput || fileInput.files.length === 0) {{
+                                alert("Peringatan: Tidak ada file yang dipilih. Silakan pilih file video (.webm atau .mp4).");
+                                return false;
+                            }}
+                            const filename = fileInput.files[0].name.toLowerCase();
+                            if (!filename.endsWith('.webm') && !filename.endsWith('.mp4')) {{
+                                alert("Peringatan: Format file harus .webm atau .mp4!");
+                                return false;
+                            }}
+                            return true;
+                        }}
+                        function validateStartLive() {{
+                            const username = "{tiktok_username}";
+                            if (!username) {{
+                                alert("Peringatan: Akun TikTok belum dikonfigurasi! Harap isi Username TikTok dan simpan konfigurasi akun terlebih dahulu.");
+                                return false;
+                            }}
+                            return true;
+                        }}
+                        function openGiftModal(slot) {{
+                            const modal = document.getElementById('giftModal');
+                            const iframe = document.getElementById('giftIframe');
+                            iframe.src = '/gift-selector?slot=' + slot;
+                            modal.style.display = 'flex';
+                        }}
+                        function closeGiftModal() {{
+                            const modal = document.getElementById('giftModal');
+                            modal.style.display = 'none';
+                            location.reload();
+                        }}
+                        function editVideoName(slot, currentName) {{
+                            const newName = prompt("Ubah nama tampilan file video Slot " + slot + ":", currentName);
+                            if (newName && newName.trim() && newName.trim() !== currentName) {{
+                                fetch('/update-video-name?slot=' + slot + '&name=' + encodeURIComponent(newName.trim()))
+                                    .then(res => res.text())
+                                    .then(() => {{
+                                        location.reload();
+                                    }});
+                            }}
+                        }}
+                        function selectAllChars(rowIndex, selectAll) {{
+                            for (let c = 1; c <= 4; c++) {{
+                                const el = document.querySelector(`input[name="row_${{rowIndex}}_char_${{c}}"]`);
+                                if (el) el.checked = selectAll;
+                            }}
+                        }}
+                        function syncListenerStatus() {{
+                            fetch('/api/listener-status')
+                                .then(r => r.json())
+                                .then(data => {{
+                                    if (data && data.queue_length !== undefined) {{
+                                        const qb = document.getElementById('queueBadge');
+                                        if (qb) qb.innerText = data.queue_length;
+                                        const qc = document.getElementById('queueCountVal');
+                                        if (qc) qc.innerText = data.queue_length;
+                                    }}
+                                    if (data && data.watchdog) {{
+                                        const wd = data.watchdog;
+                                        let wdText = "IDLE (Offline)";
+                                        let wdColor = "#71717a";
+                                        let wdShadow = "none";
+                                        if (wd.state === "PROTECTED") {{
+                                            wdText = "PROTECTED (Kill-Switch Ready)";
+                                            wdColor = "#34c759";
+                                            wdShadow = "0 0 10px #34c759";
+                                        }} else if (wd.state === "RECONNECTING") {{
+                                            wdText = "RECONNECTING... (Kill-Switch Active)";
+                                            wdColor = "#ff9500";
+                                            wdShadow = "0 0 12px #ff9500";
+                                        }} else if (wd.state === "EMERGENCY_STOPPED") {{
+                                            wdText = "EMERGENCY STOPPED (VPN DOWN)";
+                                            wdColor = "#ff3b30";
+                                            wdShadow = "0 0 12px #ff3b30";
+                                        }}
+                                        const wb = document.getElementById('watchdogBadge');
+                                        if (wb) {{ wb.innerText = wdText; wb.style.color = wdColor; }}
+                                        const wdot = document.getElementById('watchdogDot');
+                                        if (wdot) {{ wdot.style.background = wdColor; wdot.style.boxShadow = wdShadow; }}
+                                        const wm = document.getElementById('watchdogMeta');
+                                        const chkStr = (wd.last_check_ago !== null && wd.last_check_ago !== undefined) ? (wd.last_check_ago + 'd lalu') : '-';
+                                        if (wm) wm.innerText = `(Recon: ${{wd.reconnect_count}} | Cek: ${{chkStr}})`;
+                                        
+                                        const cwState = document.getElementById('vpnCardWdState');
+                                        if (cwState) {{ cwState.innerText = wdText; cwState.style.color = wdColor; }}
+                                        const cwDot = document.getElementById('vpnCardWdDot');
+                                        if (cwDot) cwDot.style.background = wdColor;
+                                        const cwCount = document.getElementById('vpnCardWdCount');
+                                        if (cwCount) cwCount.innerText = wd.reconnect_count;
+                                        const cwCheck = document.getElementById('vpnCardWdLastCheck');
+                                        if (cwCheck) cwCheck.innerText = chkStr;
+                                    }}
+                                    if (data && data.vpn) {{
+                                        const v = data.vpn;
+                                        const eg = document.getElementById('vpnEgressIp');
+                                        if (eg && v.egress_ip) eg.innerText = v.egress_ip;
+                                    }}
+                                    if (data && data.recent_gifts && data.recent_gifts.length > 0) {{
+                                        const container = document.getElementById('giftLogsContainer');
+                                        if (container) {{
+                                            let html = '<table style="width: 100%; border-collapse: collapse; background: #121214; border-radius: 8px; overflow: hidden; border: 1px solid #27272a; text-align: left;"><thead><tr style="background: #1c1c1e; color: #888; font-size: 12px; border-bottom: 1px solid #333;"><th style="padding: 8px 12px;">WAKTU</th><th style="padding: 8px 12px;">PENONTON</th><th style="padding: 8px 12px;">GIFT</th><th style="padding: 8px 12px;">SLOT TERPICU</th><th style="padding: 8px 12px;">STATUS</th></tr></thead><tbody>';
+                                            data.recent_gifts.forEach(g => {{
+                                                let badge = '<span style="background:rgba(52,199,89,0.18); color:#34c759; border:1px solid #34c759; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold;">✅ Selesai</span>';
+                                                if (g.status === 'Sedang Diputar') {{
+                                                    badge = '<span style="background:rgba(37,244,238,0.18); color:#25f4ee; border:1px solid #25f4ee; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold;">▶️ Sedang Diputar</span>';
+                                                }} else if (g.status === 'Dalam Antrean') {{
+                                                    badge = '<span style="background:rgba(255,184,0,0.18); color:#ffb800; border:1px solid #ffb800; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold;">⏳ Dalam Antrean</span>';
+                                                }}
+                                                html += `<tr style="border-bottom: 1px solid #27272a;"><td style="padding: 10px 12px; color: #aaa; font-size: 12px;">${{g.time || ''}}</td><td style="padding: 10px 12px; color: #fff; font-weight: bold; font-size: 13px;">@${{g.sender || ''}}</td><td style="padding: 10px 12px; color: #25f4ee; font-size: 13px;"><b>${{g.giftName || ''}}</b> <span style="color:#888; font-size:11px;">(x${{g.count || 1}})</span></td><td style="padding: 10px 12px; color: #ffb800; font-weight: 600; font-size: 13px;">Slot ${{g.slot || ''}}</td><td style="padding: 10px 12px;">${{badge}}</td></tr>`;
+                                            }});
+                                            html += '</tbody></table>';
+                                            container.innerHTML = html;
+                                        }}
+                                    }}
+                                    if (typeof queueDualScreenSlot === 'function' && data) {{
+                                        if (lastProcessedGiftSeq === -1) {{
+                                            lastProcessedGiftSeq = data.gift_seq || 0;
+                                        }} else if (data.gift_seq && data.gift_seq > lastProcessedGiftSeq) {{
+                                            lastProcessedGiftSeq = data.gift_seq;
+                                            if (data.latest_gift && data.latest_gift.slot) {{
+                                                const g = data.latest_gift;
+                                                if (!recentlyLocalQueuedEventIds.has(g.id)) {{
+                                                    queueDualScreenSlot(g.slot, g.giftName, g.sender);
+                                                }}
+                                            }}
+                                        }}
+                                    }}
+                                }})
+                                .catch(() => {{}});
+                        }}
+                        function triggerAccountValidation(e) {{
+                            const btn = e ? e.target : document.getElementById('btnValidateAcc');
+                            const origText = btn ? btn.innerText : 'Memvalidasi...';
+                            if (btn) {{
+                                btn.innerText = "⏳ Memvalidasi via WARP Proxy...";
+                                btn.disabled = true;
+                            }}
+                            fetch('/validate-account', {{ method: 'POST' }})
+                                .then(r => r.json())
+                                .then(res => {{
+                                    if (btn) {{
+                                        btn.innerText = origText;
+                                        btn.disabled = false;
+                                    }}
+                                    if (res.success) {{
+                                        alert("✅ VALIDASI SESSION BERHASIL!\\n\\n" + (res.message || "") + "\\nSession Route: " + res.via + " (" + res.egress_ip + ")\\nAkun: @" + res.username);
+                                    }} else {{
+                                        alert("❌ VALIDASI GAGAL!\\n\\n" + (res.message || "Gagal memverifikasi session.") + "\\nRoute: " + (res.via || '-') + "\\nIP: " + (res.egress_ip || '-'));
+                                    }}
+                                    location.reload();
+                                }})
+                                .catch(err => {{
+                                    if (btn) {{
+                                        btn.innerText = origText;
+                                        btn.disabled = false;
+                                    }}
+                                    alert("🚨 Gagal menghubungi endpoint /validate-account: " + err);
+                                }});
+                        }}
+                        function showSimStatus(msg, isSuccess, isQueue) {{
+                            const el = document.getElementById('sim-status-banner');
+                            if (!el) return;
+                            el.style.display = 'block';
+                            const color = isQueue ? '#ffb800' : (isSuccess ? '#34c759' : '#ff3b30');
+                            const bg = isQueue ? 'rgba(255, 184, 0, 0.12)' : (isSuccess ? 'rgba(52, 199, 89, 0.12)' : 'rgba(255, 59, 48, 0.12)');
+                            el.style.borderColor = color;
+                            el.style.color = color;
+                            el.style.background = bg;
+                            el.innerHTML = (isQueue ? '📥 ' : (isSuccess ? '🟢 ' : '⚠️ ')) + msg;
+                        }}
+
+                        let isSimulatingGift = false;
+                        function simulateGift(e, slot) {{
+                            if (e) {{
+                                if (e.preventDefault) e.preventDefault();
+                                if (e.stopPropagation) e.stopPropagation();
+                            }}
+                            if (isSimulatingGift) {{
+                                console.log('[SimulateGift] Request sedang berjalan, cegah double trigger.');
+                                return;
+                            }}
+                            isSimulatingGift = true;
+                            console.log('[SimulateGift] Tombol Slot ' + slot + ' diklik.');
+
+                            const btn = (e && (e.currentTarget || e.target)) ? (e.currentTarget || e.target) : document.getElementById('btn-sim-slot-' + slot);
+                            const origHtml = btn ? btn.innerHTML : ('Slot ' + slot);
+                            
+                            if (btn) {{
+                                btn.disabled = true;
+                                btn.innerHTML = '<span>⏳</span> Mengirim...';
+                            }}
+
+                            fetch('/simulate-gift?slot=' + slot, {{
+                                method: 'POST',
+                                headers: {{ 'Accept': 'application/json' }}
+                            }})
+                            .then(r => {{
+                                if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+                                return r.json();
+                            }})
+                            .then(data => {{
+                                console.log('[SimulateGift] Response dari server:', data);
+                                if (btn) {{
+                                    btn.disabled = false;
+                                    if (data.queued) {{
+                                        btn.innerHTML = '📥 Antrean #' + (data.queue_length || 1);
+                                        btn.style.borderColor = '#ffb800';
+                                    }} else {{
+                                        btn.innerHTML = '🟢 Sedang Diputar';
+                                        btn.style.borderColor = '#34c759';
+                                    }}
+                                    setTimeout(() => {{
+                                        btn.innerHTML = origHtml;
+                                        btn.style.borderColor = '';
+                                    }}, 2500);
+                                }}
+
+                                if (data.success) {{
+                                    if (data.id) {{
+                                        recentlyLocalQueuedEventIds.add(data.id);
+                                    }}
+                                    if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
+                                        startRenderLoop();
+                                    }}
+                                    if (typeof queueDualScreenSlot === 'function') {{
+                                        queueDualScreenSlot(slot, data.giftName, 'Simulasi');
+                                    }}
+                                    showSimStatus(data.message || ('Simulasi Slot ' + slot + ' diterima!'), true, data.queued);
+                                }} else {{
+                                    showSimStatus(data.message || 'Gagal memicu simulasi', false, false);
+                                }}
+                                if (typeof syncListenerStatus === 'function') syncListenerStatus();
+                            }})
+                            .catch(err => {{
+                                console.error('[SimulateGift] Error:', err);
+                                if (btn) {{
+                                    btn.disabled = false;
+                                    btn.innerHTML = '⚠️ Error';
+                                    setTimeout(() => {{
+                                        btn.innerHTML = origHtml;
+                                        btn.style.borderColor = '';
+                                    }}, 2500);
+                                }}
+                                showSimStatus('Gagal request simulasi: ' + err.message, false, false);
+                            }})
+                            .finally(() => {{
+                                setTimeout(() => {{
+                                    isSimulatingGift = false;
+                                }}, 400);
+                            }});
+                        }}
+
+                        function resetStandby(e) {{
+                            if (e) {{
+                                if (e.preventDefault) e.preventDefault();
+                                if (e.stopPropagation) e.stopPropagation();
+                            }}
+                            console.log('[ResetStandby] Reset antrean & kembali ke Standby Slot 1.');
+                            const btn = (e && (e.currentTarget || e.target)) ? (e.currentTarget || e.target) : document.getElementById('btn-reset-standby');
+                            const origHtml = btn ? btn.innerHTML : 'Reset ke Standby';
+                            
+                            if (btn) {{
+                                btn.disabled = true;
+                                btn.innerHTML = '<span>⏳</span> Mereset...';
+                            }}
+
+                            fetch('/switch-slot?slot=1', {{
+                                method: 'POST',
+                                headers: {{ 'Accept': 'application/json' }}
+                            }})
+                            .then(r => {{
+                                if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+                                return r.json();
+                            }})
+                            .then(data => {{
+                                if (btn) {{
+                                    btn.disabled = false;
+                                    btn.innerHTML = '✅ Standby Aktif!';
+                                    btn.style.borderColor = '#34c759';
+                                    setTimeout(() => {{
+                                        btn.innerHTML = origHtml;
+                                        btn.style.borderColor = '';
+                                    }}, 2500);
+                                }}
+                                if (typeof queueDualScreenSlot === 'function') queueDualScreenSlot(1, 'Standby Loop', '');
+                                showSimStatus('Antrean dikosongkan. Kembali ke Standby Loop (Slot 1).', true, false);
+                                if (typeof syncListenerStatus === 'function') syncListenerStatus();
+                            }})
+                            .catch(err => {{
+                                console.error('[ResetStandby] Error:', err);
+                                if (btn) {{
+                                    btn.disabled = false;
+                                    btn.innerHTML = '⚠️ Error';
+                                    setTimeout(() => {{
+                                        btn.innerHTML = origHtml;
+                                        btn.style.borderColor = '';
+                                    }}, 2500);
+                                }}
+                                showSimStatus('Gagal reset: ' + err.message, false, false);
+                            }});
+                        }}
+                        setInterval(syncListenerStatus, 1000);
+
+                        // --- On-Demand Slot Preview Controls (0% Hardware Decoder Footprint by Default) ---
+                        let activeSlotPreview = null;
+
+                        function toggleSlotPreview(slot, filename, mime, displayName, sizeMb) {{
+                            const container = document.getElementById('preview-container-' + slot);
+                            const btn = document.getElementById('btn-preview-slot-' + slot);
+                            if (!container || !btn) return;
+
+                            if (container.style.display !== 'none' && container.innerHTML.trim() !== '') {{
+                                destroySlotPreview(slot);
+                                return;
+                            }}
+
+                            // Destroy any other open slot previews to strictly conserve hardware decoders
+                            for (let s = 1; s <= 6; s++) {{
+                                if (s !== parseInt(slot)) {{
+                                    destroySlotPreview(s);
+                                }}
+                            }}
+
+                            // Mount video dynamically on-demand
+                            container.innerHTML = '<div style="background:#121216; padding:10px; border-radius:8px; border:1px solid #27272a;">' +
+                                '<video id="slot-preview-vid-' + slot + '" controls playsinline preload="metadata" style="width:100%; max-height:260px; border-radius:6px; background:#000;">' +
+                                '<source src="/video-stream?name=' + encodeURIComponent(filename) + '&t=' + Date.now() + '" type="' + mime + '">' +
+                                'Browser tidak mendukung pemutaran video.' +
+                                '</video>' +
+                                '<div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px; font-size:11px; color:#888;">' +
+                                '<span>File: <b style="color:#eee;">' + displayName + '</b> (' + sizeMb + ' MB)</span>' +
+                                '<button type="button" class="modern-btn" style="padding:3px 8px; font-size:11px; background:#27272a; color:#ff3b30; border:1px solid #ff3b30; cursor:pointer;" onclick="destroySlotPreview(\\'' + slot + '\\')">Tutup</button>' +
+                                '</div>' +
+                                '</div>';
+                            container.style.display = 'block';
+                            btn.innerHTML = '🙈 Tutup Preview';
+                            btn.style.borderColor = '#ff3b30';
+                            btn.style.color = '#ff3b30';
+                            btn.style.background = 'rgba(255, 59, 48, 0.12)';
+                            activeSlotPreview = slot;
+                        }}
+
+                        function destroySlotPreview(slot) {{
+                            const container = document.getElementById('preview-container-' + slot);
+                            const btn = document.getElementById('btn-preview-slot-' + slot);
+                            if (container) {{
+                                const vid = container.querySelector('video');
+                                if (vid) {{
+                                    try {{
+                                        vid.pause();
+                                        vid.removeAttribute('src');
+                                        while (vid.firstChild) {{
+                                            vid.removeChild(vid.firstChild);
+                                        }}
+                                        vid.load();
+                                    }} catch(e) {{}}
+                                }}
+                                container.innerHTML = '';
+                                container.style.display = 'none';
+                            }}
+                            if (btn) {{
+                                btn.innerHTML = '👁️ Tampilkan Preview';
+                                btn.style.borderColor = '#25f4ee';
+                                btn.style.color = '#25f4ee';
+                                btn.style.background = 'rgba(37, 244, 238, 0.1)';
+                            }}
+                            if (activeSlotPreview === slot) activeSlotPreview = null;
+                        }}
+
+                        function destroyAllSlotPreviews() {{
+                            for (let s = 1; s <= 6; s++) {{
+                                destroySlotPreview(s);
+                            }}
+                        }}
+
+                        // --- Dual-Screen Live Studio (Client-Side Canvas Compositing - PiP Layout) ---
+                        let isDualScreenActive = false;
+                        let isMonitorOutputVisible = false;
+                        let isRenderLoopRunning = false;
+                        let dualMediaStream = null;
+                        let dualAudioCtx = null;
+                        let dualAudioDest = null;
+                        let dualMicGain = null;
+                        let dualCatAudioSource = null;
+                        let dualMonitorGain = null;
+                        let dualCanvasStream = null;
+                        let dualMediaRecorder = null;
+                        let dualStreamWs = null;
+                        let dualIsStreaming = false;
+                        let dualCurrentSlot = 1;
+                        let dualIsMirror = true;
+                        let dualIsMicMuted = false;
+                        let dualAnimFrame = null;
+                        let dualGiftQueue = [];
+                        let dualIsReactionPlaying = false;
+                        let dualActiveToast = null;
+                        let dualToastTimeout = null;
+                        let dualReactionTimer = null;
+                        let dualCatFitMode = 'fill';
+                        let dualCamFitMode = 'fill';
+                        let dualTickWorker = null;
+
+                        // Dynamic Overlay State (Slot 1 - 10)
+                        let dualOverlayConfig = {dyn_cfg_for_js};
+                        let dualActiveOverlayVid = null;
+                        let dualIsOverlayPlaying = false;
+                        let dualOverlaySchedulerTimer = null;
+                        let dualOverlayLayerPos = (dualOverlayConfig && dualOverlayConfig.layer_position) || 'above_webcam';
+                        let dualOverlaySchedulerEnabled = dualOverlayConfig && dualOverlayConfig.scheduler && dualOverlayConfig.scheduler.enabled !== false;
+                        let dualOverlayMinSec = (dualOverlayConfig && dualOverlayConfig.scheduler && dualOverlayConfig.scheduler.min_interval_sec) || 15;
+                        let dualOverlayMaxSec = (dualOverlayConfig && dualOverlayConfig.scheduler && dualOverlayConfig.scheduler.max_interval_sec) || 60;
+
+                        function updateDynamicOverlaySetting(key, val) {{
+                            if (key === 'layer_position') {{
+                                dualOverlayLayerPos = val;
+                            }} else if (key === 'scheduler_enabled') {{
+                                dualOverlaySchedulerEnabled = Boolean(val);
+                                if (!dualOverlaySchedulerEnabled && dualOverlaySchedulerTimer) {{
+                                    clearTimeout(dualOverlaySchedulerTimer);
+                                    dualOverlaySchedulerTimer = null;
+                                    const badge = document.getElementById('overlaySchedulerStatusBadge');
+                                    if (badge) badge.innerText = '⏸️ Scheduler Nonaktif';
+                                }} else if (dualOverlaySchedulerEnabled && (dualIsStreaming || isMonitorOutputVisible)) {{
+                                    scheduleNextDynamicOverlay();
+                                }}
+                            }} else if (key === 'min_interval') {{
+                                dualOverlayMinSec = parseInt(val) || 15;
+                            }} else if (key === 'max_interval') {{
+                                dualOverlayMaxSec = parseInt(val) || 60;
+                            }}
+
+                            fetch('/update-dynamic-overlay-config', {{
+                                method: 'POST',
+                                headers: {{ 'Content-Type': 'application/json' }},
+                                body: JSON.stringify({{ key: key, val: val }})
+                            }}).then(r => r.json()).then(res => {{
+                                if (res.config) {{
+                                    dualOverlayConfig = res.config;
+                                }}
+                            }}).catch(err => console.warn('[DynamicOverlay] Error saving setting:', err));
+                        }}
+
+                        function editDynamicOverlayName(slot, currentName) {{
+                            const newName = prompt('Masukkan nama layer animasi untuk Slot ' + slot + ':', currentName);
+                            if (newName && newName.trim() !== '') {{
+                                fetch('/update-dynamic-overlay-name', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ slot: slot, name: newName.trim() }})
+                                }}).then(r => r.json()).then(res => {{
+                                    if (res.success) {{
+                                        window.location.reload();
+                                    }}
+                                }}).catch(e => alert('Gagal mengubah nama: ' + e));
+                            }}
+                        }}
+
+                        function testDynamicOverlay(slot) {{
+                            console.log('[DynamicOverlay] Manual test trigger slot:', slot);
+                            if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
+                                startRenderLoop();
+                            }}
+                            playDynamicOverlaySlot(slot, true);
+                        }}
+
+                        function unloadDynamicOverlay() {{
+                            dualIsOverlayPlaying = false;
+                            if (dualActiveOverlayVid) {{
+                                try {{
+                                    dualActiveOverlayVid.pause();
+                                    dualActiveOverlayVid.removeAttribute('src');
+                                    while (dualActiveOverlayVid.firstChild) {{
+                                        dualActiveOverlayVid.removeChild(dualActiveOverlayVid.firstChild);
+                                    }}
+                                    dualActiveOverlayVid.load();
+                                }} catch(e) {{}}
+                                dualActiveOverlayVid = null;
+                            }}
+                            const badge = document.getElementById('overlaySchedulerStatusBadge');
+                            if (badge) {{
+                                badge.innerText = dualOverlaySchedulerEnabled ? '⏱️ Scheduler Standby' : '⏸️ Scheduler Nonaktif';
+                            }}
+                        }}
+
+                        function playDynamicOverlaySlot(slot, isTest) {{
+                            unloadDynamicOverlay();
+
+                            const vid = document.createElement('video');
+                            vid.crossOrigin = "anonymous";
+                            vid.playsInline = true;
+                            vid.muted = true;
+                            vid.autoplay = true;
+                            vid.src = '/stream-dynamic-overlay?slot=' + slot + '&t=' + Date.now();
+
+                            vid.oncanplay = function() {{
+                                dualActiveOverlayVid = vid;
+                                dualIsOverlayPlaying = true;
+                                vid.play().catch(e => console.warn('[DynamicOverlay] Play error:', e));
+                                showCanvasToast('🎭 Layer ' + slot + ' Aktif');
+                                const badge = document.getElementById('overlaySchedulerStatusBadge');
+                                if (badge) badge.innerText = '▶ Sedang Tayang: Slot ' + slot;
+                            }};
+
+                            vid.onended = function() {{
+                                console.log('[DynamicOverlay] Selesai memutar slot ' + slot);
+                                unloadDynamicOverlay();
+                                if (!isTest && dualOverlaySchedulerEnabled && (dualIsStreaming || isMonitorOutputVisible)) {{
+                                    scheduleNextDynamicOverlay();
+                                }}
+                            }};
+
+                            vid.onerror = function(err) {{
+                                console.warn('[DynamicOverlay] Gagal memuat video slot ' + slot, err);
+                                unloadDynamicOverlay();
+                                if (!isTest && dualOverlaySchedulerEnabled && (dualIsStreaming || isMonitorOutputVisible)) {{
+                                    scheduleNextDynamicOverlay();
+                                }}
+                            }};
+
+                            setTimeout(() => {{
+                                if (dualActiveOverlayVid === vid && dualIsOverlayPlaying) {{
+                                    console.log('[DynamicOverlay] Safety timeout reached for slot ' + slot);
+                                    unloadDynamicOverlay();
+                                    if (!isTest && dualOverlaySchedulerEnabled && (dualIsStreaming || isMonitorOutputVisible)) {{
+                                        scheduleNextDynamicOverlay();
+                                    }}
+                                }}
+                            }}, 35000);
+                        }}
+
+                        function scheduleNextDynamicOverlay() {{
+                            if (dualOverlaySchedulerTimer) {{
+                                clearTimeout(dualOverlaySchedulerTimer);
+                                dualOverlaySchedulerTimer = null;
+                            }}
+                            if (!dualOverlaySchedulerEnabled) return;
+
+                            fetch('/api/dynamic-overlays')
+                                .then(r => r.json())
+                                .then(data => {{
+                                    dualOverlayConfig = data;
+                                    const availSlots = [];
+                                    if (data && data.slots) {{
+                                        for (let s = 1; s <= 10; s++) {{
+                                            const sd = data.slots[String(s)];
+                                            if (sd && sd.file && sd.enabled !== false) {{
+                                                availSlots.push(s);
+                                            }}
+                                        }}
+                                    }}
+                                    if (availSlots.length === 0) {{
+                                        const badge = document.getElementById('overlaySchedulerStatusBadge');
+                                        if (badge) badge.innerText = '⚠️ Belum ada file overlay';
+                                        return;
+                                    }}
+
+                                    const minS = Math.max(5, dualOverlayMinSec);
+                                    const maxS = Math.max(minS, dualOverlayMaxSec);
+                                    const delayS = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
+
+                                    const badge = document.getElementById('overlaySchedulerStatusBadge');
+                                    if (badge) badge.innerText = '⏱️ Next layer in ' + delayS + 's';
+
+                                    dualOverlaySchedulerTimer = setTimeout(() => {{
+                                        if (!dualOverlaySchedulerEnabled) return;
+                                        if (!dualIsStreaming && !isMonitorOutputVisible) return;
+                                        const chosen = availSlots[Math.floor(Math.random() * availSlots.length)];
+                                        playDynamicOverlaySlot(chosen, false);
+                                    }}, delayS * 1000);
+                                }})
+                                .catch(err => console.warn('[DynamicOverlay] Sync error:', err));
+                        }}
+
+                        function toggleMonitorOutput() {{
+                            isMonitorOutputVisible = !isMonitorOutputVisible;
+                            const stage = document.getElementById('dualPreviewStage');
+                            const placeholder = document.getElementById('dualPreviewPlaceholder');
+                            const btn = document.getElementById('btnToggleMonitorOutput');
+
+                            if (isMonitorOutputVisible) {{
+                                if (stage) stage.style.display = 'block';
+                                if (placeholder) placeholder.style.display = 'none';
+                                if (btn) {{
+                                    btn.innerHTML = '<span>🙈</span> <span>Sembunyikan Monitor Output</span>';
+                                    btn.style.borderColor = '#ff9500';
+                                    btn.style.color = '#ff9500';
+                                    btn.style.background = 'rgba(255, 149, 0, 0.12)';
+                                }}
+                                if (dualAudioCtx && dualAudioCtx.state === 'suspended') {{
+                                    dualAudioCtx.resume();
+                                }}
+                                if (dualMonitorGain) {{
+                                    dualMonitorGain.gain.value = 1.0;
+                                }}
+                                startRenderLoop();
+                            }} else {{
+                                if (stage) stage.style.display = 'none';
+                                if (placeholder) placeholder.style.display = 'flex';
+                                if (btn) {{
+                                    btn.innerHTML = '<span>👁️</span> <span>Tampilkan Monitor Output</span>';
+                                    btn.style.borderColor = '#25f4ee';
+                                    btn.style.color = '#25f4ee';
+                                    btn.style.background = 'rgba(37, 244, 238, 0.12)';
+                                }}
+                                if (dualMonitorGain) {{
+                                    dualMonitorGain.gain.value = 0.0;
+                                }}
+                                // If NOT live streaming, stop rendering loop completely to free 100% CPU/GPU
+                                if (!dualIsStreaming) {{
+                                    stopRenderLoop();
+                                }}
+                            }}
+                        }}
+
+                        function startRenderLoop() {{
+                            if (isRenderLoopRunning) return;
+                            isRenderLoopRunning = true;
+                            const catVid = document.getElementById('dualCatVideo');
+                            if (catVid) {{
+                                if (!catVid.src || catVid.src === '' || catVid.src.endsWith('/')) {{
+                                    catVid.crossOrigin = "anonymous";
+                                    catVid.src = '/video-stream?name=video_' + dualCurrentSlot + '.mp4';
+                                    catVid.loop = (dualCurrentSlot === 1);
+                                }}
+                                if (catVid.paused) {{
+                                    catVid.play().catch(e => console.warn('catVid play on startRenderLoop:', e));
+                                }}
+                            }}
+                            const camVid = document.getElementById('dualCamVideo');
+                            if (camVid && dualMediaStream && camVid.paused) {{
+                                camVid.play().catch(e => console.warn('camVid play on startRenderLoop:', e));
+                            }}
+                            startCanvasLoop();
+                            if (dualOverlaySchedulerEnabled && !dualOverlaySchedulerTimer && !dualIsOverlayPlaying) {{
+                                scheduleNextDynamicOverlay();
+                            }}
+                        }}
+
+                        function stopRenderLoop() {{
+                            isRenderLoopRunning = false;
+                            if (dualAnimFrame) {{
+                                cancelAnimationFrame(dualAnimFrame);
+                                dualAnimFrame = null;
+                            }}
+                            if (dualTickWorker) {{
+                                dualTickWorker.postMessage('stop');
+                            }}
+                            if (window._dualFallbackTimer) {{
+                                clearInterval(window._dualFallbackTimer);
+                                window._dualFallbackTimer = null;
+                            }}
+                            const catVid = document.getElementById('dualCatVideo');
+                            if (catVid) {{
+                                catVid.pause();
+                            }}
+                            unloadDynamicOverlay();
+                            if (dualOverlaySchedulerTimer) {{
+                                clearTimeout(dualOverlaySchedulerTimer);
+                                dualOverlaySchedulerTimer = null;
+                            }}
+                        }}
+
+                        function showCanvasToast(msg) {{
+                            dualActiveToast = msg;
+                            if (dualToastTimeout) clearTimeout(dualToastTimeout);
+                            dualToastTimeout = setTimeout(() => {{
+                                dualActiveToast = null;
+                            }}, 4500);
+                        }}
+
+                        function queueDualScreenSlot(slot, giftName, sender) {{
+                            if (!slot) return;
+                            if (slot === 1) {{
+                                dualGiftQueue = [];
+                                dualIsReactionPlaying = false;
+                                if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                playSlotImmediate(1, 'Standby Loop');
+                                return;
+                            }}
+                            dualGiftQueue.push({{
+                                slot: slot,
+                                giftName: giftName || ('Gift Slot ' + slot),
+                                sender: sender || 'Penonton'
+                            }});
+                            showCanvasToast('🎁 Gift: ' + (giftName || 'Slot ' + slot) + (sender ? ' (@' + sender + ')' : ''));
+                            processDualScreenQueue();
+                        }}
+
+                        function processDualScreenQueue() {{
+                            if (dualIsReactionPlaying) return;
+                            
+                            if (dualGiftQueue.length > 0) {{
+                                const nextItem = dualGiftQueue.shift();
+                                dualIsReactionPlaying = true;
+                                playSlotImmediate(nextItem.slot, nextItem.giftName);
+                            }} else {{
+                                dualIsReactionPlaying = false;
+                                if (dualCurrentSlot !== 1) {{
+                                    playSlotImmediate(1, 'Standby Loop');
+                                }}
+                            }}
+                        }}
+
+                        function playSlotImmediate(slot, giftName) {{
+                            const catVid = document.getElementById('dualCatVideo');
+                            if (!catVid) return;
+                            dualCurrentSlot = slot;
+                            const badge = document.getElementById('dualCurrentSlotBadge');
+                            if (badge) {{
+                                badge.innerText = (slot === 1 ? '🐱 Slot 1 (Standby)' : '🎁 Slot ' + slot + ' (' + (giftName || 'Reaksi') + ')');
+                                badge.style.color = (slot === 1 ? '#34c759' : '#ffb800');
+                                badge.style.borderColor = (slot === 1 ? '#34c759' : '#ffb800');
+                            }}
+
+                            if (dualReactionTimer) clearTimeout(dualReactionTimer);
+
+                            catVid.crossOrigin = "anonymous";
+                            const targetSrc = '/video-stream?name=video_' + slot + '.mp4';
+                            if (!catVid.src || !catVid.src.endsWith(targetSrc)) {{
+                                catVid.src = targetSrc;
+                            }}
+                            catVid.loop = (slot === 1);
+
+                            catVid.onended = function() {{
+                                if (slot !== 1) {{
+                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                    dualIsReactionPlaying = false;
+                                    processDualScreenQueue();
+                                }}
+                            }};
+
+                            catVid.onerror = function(err) {{
+                                console.warn('[DualScreen] Cat video error loading slot ' + slot, err);
+                                if (slot !== 1) {{
+                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                    dualIsReactionPlaying = false;
+                                    processDualScreenQueue();
+                                }}
+                            }};
+
+                            catVid.onloadedmetadata = function() {{
+                                if (slot !== 1) {{
+                                    const dur = (catVid.duration && !isNaN(catVid.duration) && catVid.duration > 0) ? catVid.duration : 15;
+                                    if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                    dualReactionTimer = setTimeout(() => {{
+                                        if (dualIsReactionPlaying && dualCurrentSlot === slot) {{
+                                            console.log('[DualScreen] Safety timer auto-advance for slot ' + slot);
+                                            dualIsReactionPlaying = false;
+                                            processDualScreenQueue();
+                                        }}
+                                    }}, (dur + 1.5) * 1000);
+                                }}
+                            }};
+
+                            if (isMonitorOutputVisible && !isRenderLoopRunning && !dualIsStreaming) {{
+                                startRenderLoop();
+                            }}
+
+                            try {{
+                                catVid.currentTime = 0;
+                            }} catch(e) {{}}
+
+                            catVid.play().catch(e => {{
+                                console.warn('Cat video play warning:', e);
+                            }});
+                        }}
+
+                        function initDualScreenStudio() {{
+                            const canvas = document.getElementById('dualCompositeCanvas');
+                            if (!canvas) return;
+
+                            if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
+                                navigator.mediaDevices.enumerateDevices().then(devices => {{
+                                    const camSelect = document.getElementById('cameraSourceSelect');
+                                    const micSelect = document.getElementById('micSourceSelect');
+                                    if (camSelect) camSelect.innerHTML = '<option value="">Default Kamera Depan</option>';
+                                    if (micSelect) micSelect.innerHTML = '<option value="">Default Mikrofon</option>';
+                                    let camCount = 0;
+                                    let micCount = 0;
+                                    devices.forEach(d => {{
+                                        if (d.kind === 'videoinput') {{
+                                            camCount++;
+                                            const opt = document.createElement('option');
+                                            opt.value = d.deviceId;
+                                            opt.text = d.label || ('Kamera ' + camCount);
+                                            if (camSelect) camSelect.appendChild(opt);
+                                        }} else if (d.kind === 'audioinput') {{
+                                            micCount++;
+                                            const opt = document.createElement('option');
+                                            opt.value = d.deviceId;
+                                            opt.text = d.label || ('Mikrofon ' + micCount);
+                                            if (micSelect) micSelect.appendChild(opt);
+                                        }}
+                                    }});
+                                }}).catch(err => console.warn('enumerateDevices error:', err));
+                            }}
+
+                            // Default 0% load: Do NOT call startCanvasLoop() on page load
+                            isMonitorOutputVisible = false;
+                            isRenderLoopRunning = false;
+                        }}
+
+                        function startCanvasLoop() {{
+                            const canvas = document.getElementById('dualCompositeCanvas');
+                            if (!canvas) return;
+                            const ctx = canvas.getContext('2d');
+                            const catVid = document.getElementById('dualCatVideo');
+                            const camVid = document.getElementById('dualCamVideo');
+                            let guideOverlayImg = new Image();
+                            guideOverlayImg.src = '/overlay-preview?v=' + Date.now();
+
+                            // High-quality bicubic image smoothing for maximum crispness
+                            ctx.imageSmoothingEnabled = true;
+                            ctx.imageSmoothingQuality = 'high';
+
+                            function draw() {{
+                                // Base dark background
+                                ctx.fillStyle = '#0a0a0f';
+                                ctx.fillRect(0, 0, 720, 1280);
+
+                                // 1. Full-Screen Video (720x1280) with 1:1 sharp drawing optimization
+                                if (catVid && catVid.readyState >= 2) {{
+                                    const vW = catVid.videoWidth || 720;
+                                    const vH = catVid.videoHeight || 1280;
+
+                                    if (vW === 720 && vH === 1280) {{
+                                        ctx.drawImage(catVid, 0, 0, 720, 1280);
+                                    }} else if (dualCatFitMode === 'fit') {{
+                                        const fitScale = Math.min(720 / vW, 1280 / vH);
+                                        const drawW = vW * fitScale;
+                                        const drawH = vH * fitScale;
+                                        const drawX = (720 - drawW) * 0.5;
+                                        const drawY = (1280 - drawH) * 0.5;
+                                        ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
+                                    }} else {{
+                                        const fillScale = Math.max(720 / vW, 1280 / vH);
+                                        const drawW = vW * fillScale;
+                                        const drawH = vH * fillScale;
+                                        const drawX = (720 - drawW) * 0.5;
+                                        const drawY = (1280 - drawH) * 0.5;
+                                        ctx.save();
+                                        ctx.beginPath();
+                                        ctx.rect(0, 0, 720, 1280);
+                                        ctx.clip();
+                                        ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
+                                        ctx.restore();
+                                    }}
+                                }} else {{
+                                    ctx.fillStyle = '#121218';
+                                    ctx.fillRect(0, 0, 720, 1280);
+                                    ctx.fillStyle = '#71717a';
+                                    ctx.font = 'bold 22px sans-serif';
+                                    ctx.textAlign = 'center';
+                                    ctx.fillText('🐱 Video Standby / Reaksi', 360, 640);
+                                }}
+
+                                // 2. TikTok Character Guide Overlay (Dynamic via compositorConfig)
+                                const guideCfg = (typeof compositorConfig !== 'undefined' && compositorConfig.guide) ? compositorConfig.guide : {{x: 60, y: 150}};
+                                const guideX = guideCfg.x || 60;
+                                const guideY = guideCfg.y || 150;
+                                if (guideOverlayImg && guideOverlayImg.complete && guideOverlayImg.naturalWidth > 0) {{
+                                    ctx.drawImage(guideOverlayImg, guideX, guideY);
+                                }}
+
+                                // 3. Single Webcam Box at Top-Right (200x200 at x=476, y=160)
+                                function renderWebcamBox() {{
+                                    const camCfg = (typeof compositorConfig !== 'undefined' && compositorConfig.webcam) ? compositorConfig.webcam : {{x: 440, y: 160, width: 200, height: 200}};
+                                    const camW = camCfg.width || 200;
+                                    const camH = camCfg.height || 200;
+                                    const camX = camCfg.x || 440;
+                                    const camY = camCfg.y || 160;
+
+                                    if (camVid && camVid.readyState >= 2) {{
+                                        const cW = camVid.videoWidth || 320;
+                                        const cH = camVid.videoHeight || 320;
+                                        const minDim = Math.min(cW, cH);
+                                        const sX = (cW - minDim) * 0.5;
+                                        const sY = (cH - minDim) * 0.5;
+
+                                        ctx.save();
+                                        ctx.beginPath();
+                                        ctx.rect(camX, camY, camW, camH);
+                                        ctx.clip();
+
+                                        if (dualIsMirror) {{
+                                            ctx.translate(camX + camW, camY);
+                                            ctx.scale(-1, 1);
+                                            ctx.drawImage(camVid, sX, sY, minDim, minDim, 0, 0, camW, camH);
+                                        }} else {{
+                                            ctx.drawImage(camVid, sX, sY, minDim, minDim, camX, camY, camW, camH);
+                                        }}
+                                        ctx.restore();
+
+                                        // Cyan Neon border 2px
+                                        ctx.strokeStyle = '#25f4ee';
+                                        ctx.lineWidth = 2;
+                                        ctx.strokeRect(camX, camY, camW, camH);
+
+                                        // Host indicator badge
+                                        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                                        ctx.fillRect(camX, camY + camH - 22, camW, 22);
+                                        ctx.fillStyle = '#25f4ee';
+                                        ctx.font = 'bold 11px sans-serif';
+                                        ctx.textAlign = 'center';
+                                        ctx.fillText('🔴 LIVE HOST', camX + camW * 0.5, camY + camH - 6);
+                                    }} else {{
+                                        ctx.fillStyle = 'rgba(18, 18, 24, 0.85)';
+                                        ctx.fillRect(camX, camY, camW, camH);
+                                        ctx.strokeStyle = '#25f4ee';
+                                        ctx.lineWidth = 2;
+                                        ctx.strokeRect(camX, camY, camW, camH);
+
+                                        ctx.fillStyle = '#71717a';
+                                        ctx.font = 'bold 12px sans-serif';
+                                        ctx.textAlign = 'center';
+                                        ctx.fillText('📷 Cam Standby', camX + camW * 0.5, camY + camH * 0.5 + 4);
+                                    }}
+                                }}
+
+                                // Function to draw Dynamic Overlay Layer (.webm Transparan VP8/VP9) across full screen
+                                function renderDynamicOverlay() {{
+                                    if (dualActiveOverlayVid && dualIsOverlayPlaying && dualActiveOverlayVid.readyState >= 2) {{
+                                        ctx.drawImage(dualActiveOverlayVid, 0, 0, 720, 1280);
+                                    }}
+                                }}
+
+                                // Dynamic Z-Index Compositing between Webcam and Dynamic Overlay:
+                                if (dualOverlayLayerPos === 'below_webcam') {{
+                                    renderDynamicOverlay();
+                                    renderWebcamBox();
+                                }} else {{
+                                    // Default: 'above_webcam' (menyatu secara organik di seluruh layar)
+                                    renderWebcamBox();
+                                    renderDynamicOverlay();
+                                }}
+
+                                // 4. Dynamic Watermark Badge at Top-Left (x=24, y=24)
+                                ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+                                ctx.beginPath();
+                                ctx.roundRect(24, 24, 210, 34, 6);
+                                ctx.fill();
+                                ctx.fillStyle = (dualCurrentSlot === 1 ? '#34c759' : '#fe2c55');
+                                ctx.font = 'bold 13px sans-serif';
+                                ctx.textAlign = 'left';
+                                ctx.fillText(dualCurrentSlot === 1 ? '🐱 STANDBY (SLOT 1)' : '🎁 REAKSI (SLOT ' + dualCurrentSlot + ')', 34, 46);
+
+                                // 5. Toast Notification / Gift Banner at Center-Top (x=30, y=400)
+                                if (dualActiveToast) {{
+                                    ctx.save();
+                                    ctx.fillStyle = 'rgba(15, 15, 24, 0.94)';
+                                    ctx.beginPath();
+                                    if (ctx.roundRect) {{
+                                        ctx.roundRect(30, 400, 660, 54, 10);
+                                    }} else {{
+                                        ctx.rect(30, 400, 660, 54);
+                                    }}
+                                    ctx.fill();
+                                    ctx.strokeStyle = '#fe2c55';
+                                    ctx.lineWidth = 2;
+                                    ctx.stroke();
+
+                                    // Inner neon highlight line
+                                    if (ctx.roundRect) {{
+                                        ctx.beginPath();
+                                        ctx.roundRect(33, 403, 654, 48, 8);
+                                        ctx.strokeStyle = 'rgba(37, 244, 238, 0.45)';
+                                        ctx.lineWidth = 1;
+                                        ctx.stroke();
+                                    }}
+
+                                    ctx.fillStyle = '#25f4ee';
+                                    ctx.font = 'bold 16px sans-serif';
+                                    ctx.textAlign = 'center';
+                                    ctx.fillText(dualActiveToast, 360, 434);
+                                    ctx.restore();
+                                }}
+                            }}
+
+                            // Zero-Lag 24 FPS Engine: Dedicated Web Worker Clock (Anti-Throttling)
+                            // Browser background/hidden tabs do NOT throttle Web Worker timers
+                            try {{
+                                if (!dualTickWorker) {{
+                                    const workerBlob = new Blob([
+                                        'let timer = null;' +
+                                        'self.onmessage = function(e) {{' +
+                                        '  if (e.data === "start") {{' +
+                                        '    if (!timer) timer = setInterval(function() {{ self.postMessage("tick"); }}, 1000 / 24);' +
+                                        '  }} else if (e.data === "stop") {{' +
+                                        '    if (timer) {{ clearInterval(timer); timer = null; }}' +
+                                        '  }}' +
+                                        '}};'
+                                    ], {{ type: 'application/javascript' }});
+                                    dualTickWorker = new Worker(URL.createObjectURL(workerBlob));
+                                    dualTickWorker.onmessage = function(e) {{
+                                        if (e.data === 'tick' && isRenderLoopRunning) {{
+                                            draw();
+                                        }}
+                                    }};
+                                }}
+                                if (dualTickWorker && isRenderLoopRunning) {{
+                                    dualTickWorker.postMessage('start');
+                                }}
+                            }} catch(wErr) {{
+                                console.warn('[DualScreen] Web Worker timer fallback to setInterval:', wErr);
+                                if (!window._dualFallbackTimer) {{
+                                    window._dualFallbackTimer = setInterval(function() {{
+                                        if (isRenderLoopRunning) draw();
+                                    }}, 1000 / 24);
+                                }}
+                            }}
+
+                            // Initial frame render
+                            draw();
+                        }}
+
+                        async function toggleCamera() {{
+                            const btn = document.getElementById('btnToggleCam');
+                            const badge = document.getElementById('dualStatusBadge');
+                            const camVid = document.getElementById('dualCamVideo');
+                            const catVid = document.getElementById('dualCatVideo');
+
+                            if (dualMediaStream) {{
+                                dualMediaStream.getTracks().forEach(t => t.stop());
+                                dualMediaStream = null;
+                                if (camVid) camVid.srcObject = null;
+                                if (btn) {{
+                                    btn.innerHTML = '📷 Aktifkan Kamera & Mic';
+                                    btn.style.setProperty('--shimmer-color', '#34c759');
+                                    btn.style.setProperty('--bg', 'rgba(52, 199, 89, 0.15)');
+                                }}
+                                if (badge) {{
+                                    badge.innerText = '⚪ Standby (Kamera Nonaktif)';
+                                    badge.style.color = '#a1a1aa';
+                                    badge.style.borderColor = '#71717a';
+                                    badge.style.background = 'rgba(113, 113, 122, 0.2)';
+                                }}
+                                const bTopOff = document.getElementById('camStatusBadge');
+                                if (bTopOff) {{ bTopOff.innerText = '📷 Cam: OFF'; bTopOff.style.color = '#a1a1aa'; }}
+                                isDualScreenActive = false;
+                                return;
+                            }}
+
+                            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
+                                alert('Browser Anda memblokir akses media. Pastikan membuka dashboard via HTTPS (https://staging.apologets.com:8088).');
+                                return;
+                            }}
+
+                            try {{
+                                const camId = document.getElementById('cameraSourceSelect') ? document.getElementById('cameraSourceSelect').value : null;
+                                const micId = document.getElementById('micSourceSelect') ? document.getElementById('micSourceSelect').value : null;
+
+                                const constraints = {{
+                                    video: {{
+                                        ...(camId ? {{ deviceId: {{ exact: camId }} }} : {{ facingMode: 'user' }}),
+                                        width: {{ ideal: 240, max: 320 }},
+                                        height: {{ ideal: 240, max: 320 }},
+                                        frameRate: {{ ideal: 24, max: 24 }}
+                                    }},
+                                    audio: micId ? {{ deviceId: {{ exact: micId }} }} : true
+                                }};
+
+                                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                                dualMediaStream = stream;
+
+                                stream.getTracks().forEach(track => {{
+                                    track.onended = () => {{
+                                        console.warn('[MediaEngine] Track ended:', track.kind);
+                                        const bTop = document.getElementById('camStatusBadge');
+                                        if (bTop) {{ bTop.innerText = '🔴 Cam: Ended'; bTop.style.color = '#ff3b30'; }}
+                                        const bDeck = document.getElementById('dualStatusBadge');
+                                        if (bDeck) {{ bDeck.innerText = '🔴 Camera Ended'; bDeck.style.color = '#ff3b30'; }}
+                                    }};
+                                    track.onmute = () => {{
+                                        console.warn('[MediaEngine] Track muted (background):', track.kind);
+                                        const bTop = document.getElementById('camStatusBadge');
+                                        if (bTop) {{ bTop.innerText = '🟡 Cam: Muted'; bTop.style.color = '#ffb800'; }}
+                                        const bDeck = document.getElementById('dualStatusBadge');
+                                        if (bDeck) {{ bDeck.innerText = '🟡 Camera Muted'; bDeck.style.color = '#ffb800'; }}
+                                    }};
+                                    track.onunmute = () => {{
+                                        console.log('[MediaEngine] Track unmuted:', track.kind);
+                                        const bTop = document.getElementById('camStatusBadge');
+                                        if (bTop) {{ bTop.innerText = '🟢 Cam: ON'; bTop.style.color = '#34c759'; }}
+                                        const bDeck = document.getElementById('dualStatusBadge');
+                                        if (bDeck) {{ bDeck.innerText = '🟢 Kamera Siap'; bDeck.style.color = '#34c759'; }}
+                                    }};
+                                }});
+                                const bTopInit = document.getElementById('camStatusBadge');
+                                if (bTopInit) {{ bTopInit.innerText = '🟢 Cam: ON'; bTopInit.style.color = '#34c759'; }}
+                                if (camVid) {{
+                                    camVid.srcObject = stream;
+                                    camVid.play().catch(e => console.warn(e));
+                                }}
+
+                                if (catVid) {{
+                                    catVid.crossOrigin = "anonymous";
+                                    if (!catVid.src || catVid.src === '' || catVid.src.endsWith('/')) {{
+                                        catVid.src = '/video-stream?name=video_1.mp4';
+                                        catVid.loop = true;
+                                    }}
+                                    catVid.muted = false;
+                                }}
+
+                                setupDualAudioMixing(stream, catVid);
+
+                                if (catVid && (isRenderLoopRunning || dualIsStreaming || isMonitorOutputVisible)) {{
+                                    catVid.play().catch(e => console.warn(e));
+                                }}
+
+                                if (btn) {{
+                                    btn.innerHTML = '🛑 Matikan Kamera & Mic';
+                                    btn.style.setProperty('--shimmer-color', '#ff3b30');
+                                    btn.style.setProperty('--bg', 'rgba(255, 59, 48, 0.2)');
+                                }}
+                                if (badge) {{
+                                    badge.innerText = '🟢 Kamera & Mic Siap';
+                                    badge.style.color = '#34c759';
+                                    badge.style.borderColor = '#34c759';
+                                    badge.style.background = 'rgba(52, 199, 89, 0.2)';
+                                }}
+                                isDualScreenActive = true;
+                            }} catch (err) {{
+                                alert('Gagal mengakses kamera/mic: ' + err.message);
+                                console.error(err);
+                            }}
+                        }}
+
+                        function setupDualAudioMixing(micStream, catVid) {{
+                            try {{
+                                if (!dualAudioCtx) {{
+                                    dualAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                                }}
+                                if (dualAudioCtx.state === 'suspended') {{
+                                    dualAudioCtx.resume();
+                                }}
+                                if (!dualAudioDest) {{
+                                    dualAudioDest = dualAudioCtx.createMediaStreamDestination();
+                                }}
+
+                                // Monitor Gain Node (Jalur Speaker Lokal Browser)
+                                if (!dualMonitorGain) {{
+                                    dualMonitorGain = dualAudioCtx.createGain();
+                                    dualMonitorGain.gain.value = isMonitorOutputVisible ? 1.0 : 0.0;
+                                    dualMonitorGain.connect(dualAudioCtx.destination);
+                                }} else {{
+                                    dualMonitorGain.gain.value = isMonitorOutputVisible ? 1.0 : 0.0;
+                                }}
+
+                                if (micStream && micStream.getAudioTracks().length > 0) {{
+                                    const micSrc = dualAudioCtx.createMediaStreamSource(micStream);
+                                    dualMicGain = dualAudioCtx.createGain();
+                                    dualMicGain.gain.value = dualIsMicMuted ? 0 : 1.0;
+                                    micSrc.connect(dualMicGain);
+                                    dualMicGain.connect(dualAudioDest);
+
+                                    const analyser = dualAudioCtx.createAnalyser();
+                                    analyser.fftSize = 64;
+                                    micSrc.connect(analyser);
+                                    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+                                    function updateVu() {{
+                                        if (!dualMediaStream) return;
+                                        analyser.getByteFrequencyData(dataArray);
+                                        let sum = 0;
+                                        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                                        const avg = sum / dataArray.length;
+                                        const pct = Math.min(100, Math.round((avg / 128) * 100));
+                                        const bar = document.getElementById('dualVuLevel');
+                                        if (bar) bar.style.width = pct + '%';
+                                        requestAnimationFrame(updateVu);
+                                    }}
+                                    updateVu();
+                                }}
+
+                                if (catVid && !dualCatAudioSource) {{
+                                    try {{
+                                        dualCatAudioSource = dualAudioCtx.createMediaElementSource(catVid);
+
+                                        // Jalur 1 (Ke Stream Server / TikTok): Volume penuh 1.0 selalu aktif
+                                        const catStreamGain = dualAudioCtx.createGain();
+                                        catStreamGain.gain.value = 1.0;
+                                        dualCatAudioSource.connect(catStreamGain);
+                                        catStreamGain.connect(dualAudioDest);
+
+                                        // Jalur 2 (Ke Speaker Lokal Browser): Melewati dualMonitorGain (0.0 saat hidden, 1.0 saat aktif)
+                                        dualCatAudioSource.connect(dualMonitorGain);
+                                    }} catch (e) {{
+                                        console.warn('AudioElementSource warning:', e);
+                                    }}
+                                }}
+                            }} catch (e) {{
+                                console.warn('Audio mixing setup warning:', e);
+                            }}
+                        }}
+
+                        function switchCameraDevice() {{
+                            if (dualMediaStream) {{
+                                toggleCamera().then(() => toggleCamera());
+                            }}
+                        }}
+
+                        function switchMicDevice() {{
+                            if (dualMediaStream) {{
+                                toggleCamera().then(() => toggleCamera());
+                            }}
+                        }}
+
+                        function toggleMirrorCam() {{
+                            dualIsMirror = !dualIsMirror;
+                            const btn = document.getElementById('btnToggleMirror');
+                            if (btn) btn.innerHTML = '🪞 Mirror Kamera: ' + (dualIsMirror ? 'ON' : 'OFF');
+                        }}
+
+                        function toggleMuteMic() {{
+                            dualIsMicMuted = !dualIsMicMuted;
+                            if (dualMicGain) {{
+                                dualMicGain.gain.value = dualIsMicMuted ? 0 : 1.0;
+                            }}
+                            const btn = document.getElementById('btnToggleMic');
+                            if (btn) {{
+                                btn.innerHTML = dualIsMicMuted ? '🔇 Mic: MUTE' : '🎙️ Mic: ON';
+                                btn.style.setProperty('--shimmer-color', dualIsMicMuted ? '#ff9500' : '#25f4ee');
+                            }}
+                        }}
+
+                        function startDualStream() {{
+                            destroyAllSlotPreviews();
+
+                            if (!isDualScreenActive || !dualMediaStream) {{
+                                alert('Harap aktifkan Kamera & Mic terlebih dahulu sebelum mulai push stream!');
+                                return;
+                            }}
+
+                            startRenderLoop();
+
+                            const canvas = document.getElementById('dualCompositeCanvas');
+                            if (!canvas) return;
+
+                            const stream = canvas.captureStream(24);
+                            if (dualAudioDest) {{
+                                if (dualAudioDest.stream.getAudioTracks().length === 0 && dualAudioCtx) {{
+                                    try {{
+                                        const osc = dualAudioCtx.createOscillator();
+                                        const silent = dualAudioCtx.createGain();
+                                        silent.gain.value = 0.0001;
+                                        osc.connect(silent);
+                                        silent.connect(dualAudioDest);
+                                        osc.start();
+                                    }} catch(e) {{}}
+                                }}
+                                if (dualAudioDest.stream.getAudioTracks().length > 0) {{
+                                    stream.addTrack(dualAudioDest.stream.getAudioTracks()[0]);
+                                }}
+                            }}
+
+                            const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                            const wsUrl = proto + '//' + window.location.host + '/ws/stream';
+
+                            console.log('[DualStream] Menghubungkan ke WebSocket pipe:', wsUrl);
+                            dualStreamWs = new WebSocket(wsUrl);
+                            dualStreamWs.binaryType = 'arraybuffer';
+
+                            dualStreamWs.onmessage = function(ev) {{
+                                try {{
+                                    const msg = JSON.parse(ev.data);
+                                    if (msg.status === 'error') {{
+                                        alert('⚠️ Dual-Screen Pipe Error: ' + msg.message);
+                                        stopDualStream();
+                                    }} else if (msg.status === 'ready') {{
+                                        console.log('[DualStream] Server pipe siap menerima data.');
+                                    }}
+                                }} catch(e) {{}}
+                            }};
+
+                            dualStreamWs.onopen = function() {{
+                                console.log('[DualStream] WebSocket terhubung! Memulai MediaRecorder H.264 (24 FPS)...');
+                                const candidateMimes = [
+                                    'video/webm;codecs=h264,opus',
+                                    'video/webm;codecs=avc1.64001f,opus',
+                                    'video/mp4;codecs=avc1.64001f,mp4a.40.2',
+                                    'video/webm;codecs=h264',
+                                    'video/mp4;codecs=avc1',
+                                    'video/webm;codecs=vp8,opus',
+                                    'video/webm;codecs=vp8',
+                                    'video/webm'
+                                ];
+                                let mime = '';
+                                for (let c of candidateMimes) {{
+                                    if (MediaRecorder.isTypeSupported(c)) {{
+                                        mime = c;
+                                        break;
+                                    }}
+                                }}
+                                console.log('[DualStream] Menggunakan encoder mimeType:', mime || 'browser-default');
+                                try {{
+                                    dualMediaRecorder = new MediaRecorder(stream, {{
+                                        mimeType: mime,
+                                        videoBitsPerSecond: 1200000,
+                                        audioBitsPerSecond: 96000
+                                    }});
+                                }} catch (err) {{
+                                    dualMediaRecorder = new MediaRecorder(stream);
+                                }}
+
+                                dualMediaRecorder.ondataavailable = async function(e) {{
+                                    if (e.data && e.data.size > 0 && dualStreamWs && dualStreamWs.readyState === WebSocket.OPEN) {{
+                                        const buffer = await e.data.arrayBuffer();
+                                        dualStreamWs.send(buffer);
+                                    }}
+                                }};
+
+                                dualMediaRecorder.start(200);
+                                dualIsStreaming = true;
+
+                                const btnStart = document.getElementById('btnStartDualStream');
+                                const btnStop = document.getElementById('btnStopDualStream');
+                                if (btnStart) btnStart.style.display = 'none';
+                                if (btnStop) btnStop.style.display = 'inline-block';
+                                const badge = document.getElementById('dualStatusBadge');
+                                if (badge) {{
+                                    badge.innerText = '🔴 STREAMING TIKTOK (Full-Screen + PiP)';
+                                    badge.style.color = '#ff3b30';
+                                    badge.style.borderColor = '#ff3b30';
+                                    badge.style.background = 'rgba(255, 59, 48, 0.25)';
+                                    badge.style.boxShadow = '0 0 15px rgba(255, 59, 48, 0.5)';
+                                }}
+                            }};
+
+                            dualStreamWs.onclose = function() {{
+                                console.log('[DualStream] WebSocket pipe terputus.');
+                                stopDualStream();
+                            }};
+
+                            dualStreamWs.onerror = function(err) {{
+                                console.error('[DualStream] WebSocket error:', err);
+                                alert('Gagal menghubungkan WebSocket stream. Pastikan membuka dashboard via HTTPS.');
+                                stopDualStream();
+                            }};
+                        }}
+
+                        function stopDualStream() {{
+                            dualIsStreaming = false;
+                            if (dualMediaRecorder && dualMediaRecorder.state !== 'inactive') {{
+                                try {{ dualMediaRecorder.stop(); }} catch (e) {{}}
+                            }}
+                            if (dualStreamWs) {{
+                                try {{ dualStreamWs.close(); }} catch (e) {{}}
+                                dualStreamWs = null;
+                            }}
+
+                            // If monitor output is hidden, stop render loop completely
+                            if (!isMonitorOutputVisible) {{
+                                stopRenderLoop();
+                            }}
+
+                            const btnStart = document.getElementById('btnStartDualStream');
+                            const btnStop = document.getElementById('btnStopDualStream');
+                            if (btnStart) btnStart.style.display = 'inline-block';
+                            if (btnStop) btnStop.style.display = 'none';
+
+                            const badge = document.getElementById('dualStatusBadge');
+                            if (badge) {{
+                                badge.innerText = isDualScreenActive ? '🟢 Kamera & Mic Siap' : '⚪ Standby (Kamera Nonaktif)';
+                                badge.style.color = isDualScreenActive ? '#34c759' : '#a1a1aa';
+                                badge.style.borderColor = isDualScreenActive ? '#34c759' : '#71717a';
+                                badge.style.background = isDualScreenActive ? 'rgba(52, 199, 89, 0.2)' : 'rgba(113, 113, 122, 0.2)';
+                                badge.style.boxShadow = 'none';
+                            }}
+                            const btnMain = document.getElementById('btnMainStartLive');
+                            if (btnMain) {{
+                                btnMain.disabled = false;
+                                btnMain.innerHTML = '🚀 Start Live (Dual-Screen TikTok)';
+                                btnMain.style.removeProperty('--shimmer-color');
+                                btnMain.style.removeProperty('--bg');
+                            }}
+                        }}
+
+                        async function handleStartLiveClick(ev) {{
+                            if (ev) ev.preventDefault();
+                            if (!validateStartLive()) return;
+
+                            // Destroy all slot previews immediately to free hardware decoders
+                            destroyAllSlotPreviews();
+
+                            const btn = document.getElementById('btnMainStartLive');
+                            const origText = btn ? btn.innerHTML : '🚀 Start Live (Dual-Screen TikTok)';
+                            if (btn) {{
+                                btn.disabled = true;
+                                btn.innerHTML = '⏳ Menyiapkan Kamera Host...';
+                            }}
+
+                            try {{
+                                // 1. Pastikan Kamera & Mic aktif dari awal
+                                if (!isDualScreenActive || !dualMediaStream) {{
+                                    console.log('[StartLive] Mengaktifkan Kamera & Mic otomatis...');
+                                    await toggleCamera();
+                                }}
+
+                                // Pastikan status monitor output dan audio speaker lokal tetap terkontrol sesuai preferensi user
+                                if (dualMonitorGain) {{
+                                    dualMonitorGain.gain.value = isMonitorOutputVisible ? 1.0 : 0.0;
+                                }}
+                                const stage = document.getElementById('dualPreviewStage');
+                                const placeholder = document.getElementById('dualPreviewPlaceholder');
+                                if (!isMonitorOutputVisible) {{
+                                    if (stage) stage.style.display = 'none';
+                                    if (placeholder) placeholder.style.display = 'flex';
+                                }}
+
+                                if (btn) btn.innerHTML = '🚀 Mengambil RTMP TikTok...';
+
+                                // 2. Request kredensial RTMP room TikTok via AJAX
+                                const resp = await fetch('/start-stream', {{
+                                    method: 'POST',
+                                    headers: {{
+                                        'Accept': 'application/json',
+                                        'X-Requested-With': 'XMLHttpRequest'
+                                    }}
+                                }});
+                                const data = await resp.json();
+                                if (!data || data.status !== 'ok') {{
+                                    throw new Error((data && data.message) ? data.message : 'Gagal membuat room TikTok Live.');
+                                }}
+
+                                console.log('[StartLive] Room RTMP TikTok siap:', data.rtmp_url);
+
+                                if (btn) {{
+                                    btn.innerHTML = '🔴 LIVE FULLSCREEN + PIP AKTIF';
+                                    btn.style.setProperty('--shimmer-color', '#34c759');
+                                    btn.style.setProperty('--bg', 'rgba(52, 199, 89, 0.2)');
+                                    btn.disabled = false;
+                                }}
+
+                                // 3. Langsung mulai push stream ke WebSocket /ws/stream -> FFmpeg Dual Screen
+                                startDualStream();
+
+                            }} catch (err) {{
+                                alert('Gagal memulai Live: ' + err.message);
+                                if (btn) {{
+                                    btn.disabled = false;
+                                    btn.innerHTML = origText;
+                                }}
+                            }}
+                        }}
+
+                        window.addEventListener('DOMContentLoaded', initDualScreenStudio);
+                    
+                        // --- Mobile Chrome Resilience & Reconnect Camera ---
+                        async function reconnectCamera() {{
+                            console.log('[MediaEngine] Reconnecting camera...');
+                            const bTop = document.getElementById('camStatusBadge');
+                            const bDeck = document.getElementById('dualStatusBadge');
+                            if (bTop) {{ bTop.innerText = '🟡 Cam: Recon...'; bTop.style.color = '#ffb800'; }}
+                            if (bDeck) {{ bDeck.innerText = '🟡 Reconnecting Camera...'; bDeck.style.color = '#ffb800'; }}
+
+                            if (dualMediaStream) {{
+                                dualMediaStream.getTracks().forEach(t => {{
+                                    try {{ t.stop(); }} catch(e) {{}}
+                                }});
+                                dualMediaStream = null;
+                            }}
+                            const camVid = document.getElementById('dualCamVideo');
+                            if (camVid) camVid.srcObject = null;
+                            isDualScreenActive = false;
+
+                            await toggleCamera();
+                            showToast('📷 Kamera terhubung kembali');
+                        }}
+
+                        document.addEventListener('visibilitychange', () => {{
+                            if (document.visibilityState === 'visible') {{
+                                console.log('[MediaEngine] Tab became visible. Checking camera status...');
+                                if (isDualScreenActive && dualMediaStream) {{
+                                    const tracks = dualMediaStream.getVideoTracks();
+                                    const isDead = tracks.length === 0 || tracks.some(t => t.readyState === 'ended' || t.muted);
+                                    if (isDead) {{
+                                        console.warn('[MediaEngine] Camera track dead after tab hidden. Auto-reconnecting...');
+                                        reconnectCamera();
+                                    }}
+                                }}
+                            }}
+                        }});
+
+                        // --- Compositor Settings Handlers ---
+                        function updateMiniCompositorPreview() {{
+                            const scale = 0.3;
+                            const wx = parseInt(document.getElementById('compWebcamX').value) || 440;
+                            const wy = parseInt(document.getElementById('compWebcamY').value) || 160;
+                            const ww = parseInt(document.getElementById('compWebcamW').value) || 200;
+                            const wh = parseInt(document.getElementById('compWebcamH').value) || 200;
+                            const gx = parseInt(document.getElementById('compGuideX').value) || 60;
+                            const gy = parseInt(document.getElementById('compGuideY').value) || 150;
+
+                            const boxCam = document.getElementById('miniWebcamBox');
+                            if (boxCam) {{
+                                boxCam.style.left = (wx * scale) + 'px';
+                                boxCam.style.top = (wy * scale) + 'px';
+                                boxCam.style.width = (ww * scale) + 'px';
+                                boxCam.style.height = (wh * scale) + 'px';
+                            }}
+                            const boxGuide = document.getElementById('miniGuideBox');
+                            if (boxGuide) {{
+                                boxGuide.style.left = (gx * scale) + 'px';
+                                boxGuide.style.top = (gy * scale) + 'px';
+                            }}
+                        }}
+
+                        async function saveCompositorSettings() {{
+                            const wx = parseInt(document.getElementById('compWebcamX').value) || 440;
+                            const wy = parseInt(document.getElementById('compWebcamY').value) || 160;
+                            const ww = parseInt(document.getElementById('compWebcamW').value) || 200;
+                            const wh = parseInt(document.getElementById('compWebcamH').value) || 200;
+                            const gx = parseInt(document.getElementById('compGuideX').value) || 60;
+                            const gy = parseInt(document.getElementById('compGuideY').value) || 150;
+
+                            try {{
+                                const res = await fetch('/save-compositor-config', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{
+                                        webcam: {{ x: wx, y: wy, width: ww, height: wh }},
+                                        guide: {{ x: gx, y: gy }}
+                                    }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    compositorConfig = data.config;
+                                    showToast('✅ Konfigurasi Compositor berhasil disimpan!');
+                                }} else {{
+                                    showToast('❌ Gagal menyimpan: ' + (data.error || 'Server error'));
+                                }}
+                            }} catch(err) {{
+                                showToast('❌ Error jaringan: ' + err.message);
+                            }}
+                        }}
+
+                        // --- Router & Toast Helpers ---
+                        function switchMenu(menuId) {{
+                            document.querySelectorAll('.spa-view').forEach(el => el.classList.remove('active'));
+                            document.querySelectorAll('.nav-item, .bottom-nav-item').forEach(el => el.classList.remove('active'));
+
+                            const view = document.getElementById('view-' + menuId);
+                            if(view) view.classList.add('active');
+
+                            document.querySelectorAll('[data-menu="' + menuId + '"]').forEach(el => el.classList.add('active'));
+                            localStorage.setItem('tiktok_active_menu', menuId);
+                            if (menuId === 'compositor' && typeof updateMiniCompositorPreview === 'function') {{
+                                updateMiniCompositorPreview();
+                            }}
+                        }}
+
+                        function showToast(msg) {{
+                            const t = document.getElementById('globalToast');
+                            if (!t) return;
+                            t.textContent = msg;
+                            t.classList.add('show');
+                            setTimeout(() => t.classList.remove('show'), 3000);
+                        }}
+
+                        function fetchFfmpegLogs() {{
+                            fetch('/get-logs')
+                                .then(r => r.text())
+                                .then(t => {{
+                                    const c = document.getElementById('logContainer');
+                                    if (c) {{
+                                        c.textContent = t;
+                                        c.scrollTop = c.scrollHeight;
+                                    }}
+                                }}).catch(e => console.warn(e));
+                        }}
+
+                        window.addEventListener('DOMContentLoaded', () => {{
+                            const saved = localStorage.getItem('tiktok_active_menu') || 'studio';
+                            switchMenu(saved);
+                            if (typeof fetchFfmpegLogs === 'function') fetchFfmpegLogs();
+                        }});
+
+                        document.querySelectorAll('.nav-item, .bottom-nav-item').forEach(item => {{
+                            item.addEventListener('click', (e) => {{
+                                e.preventDefault();
+                                switchMenu(item.dataset.menu);
+                            }});
+                        }});
+
+</script>
 </head>
 <body>
 
+<!-- Persistent Media Engine (Offscreen DOM Elements) -->
 <div id="persistent-media-engine">
-<video id="dualCatVideo" playsinline muted></video>
-<video id="dualCamVideo" playsinline muted></video>
-<canvas id="dualCanvas"></canvas>
+    <video id="dualCatVideo" playsinline loop muted crossorigin="anonymous"></video>
+    <video id="dualCamVideo" playsinline autoplay muted></video>
 </div>
 
+<!-- Sticky Top Bar -->
 <div class="top-bar">
-<div style="display:flex; gap:15px; align-items:center;">
-<span style="color:var(--crimson); font-weight:bold;">● LIVE STATUS: {stream_status_text}</span>
-<span style="font-family:var(--font-mono); font-size:12px;">Q:{queueCountVal} | BR:1.2Mbps</span>
-</div>
-<button class="btn btn-primary" onclick="document.getElementById('formStart').submit()">START / STOP</button>
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <span style="color:var(--crimson); font-weight:bold; font-size:14px;">● LIVE STATUS: {stream_status_text}</span>
+        <span id="camStatusBadge" style="background:rgba(113,113,122,0.2); border:1px solid #71717a; color:#a1a1aa; padding:3px 8px; border-radius:6px; font-size:12px; font-weight:bold;">📷 Cam: OFF</span>
+        <span style="font-family:var(--font-mono); font-size:12px; background:rgba(255,255,255,0.06); padding:3px 8px; border-radius:6px;">Q:<span id="queueCountVal">{queueCountVal}</span> | BR:1.2Mbps</span>
+    </div>
+    <div style="display:flex; gap:8px; align-items:center;">
+        <button type="button" class="btn btn-secondary" onclick="reconnectCamera()" style="font-size:12px; padding:6px 12px; display:inline-flex; align-items:center; gap:6px;">📷 Reconnect</button>
+        <button id="btnMainStartLive" type="button" class="btn btn-primary" onclick="handleStartLiveClick(event)">🚀 START LIVE</button>
+    </div>
 </div>
 
 <div class="app-shell">
-<nav class="sidebar">
-<h3 style="margin-top:0; color:var(--cyan);">POLYA STUDIO</h3>
-<a href="#" class="nav-item active" data-menu="studio">📡 Studio Deck</a>
-<a href="#" class="nav-item" data-menu="slots">🎬 Video Slots</a>
-<a href="#" class="nav-item" data-menu="overlays">🎭 Overlays</a>
-<a href="#" class="nav-item" data-menu="compositor">🎛️ Compositor</a>
-<a href="#" class="nav-item" data-menu="telemetry">⚡ Telemetry</a>
-</nav>
+    <!-- Desktop Sidebar -->
+    <nav class="sidebar">
+        <h3 style="margin-top:0; color:var(--cyan); font-size:18px; letter-spacing:1px; display:flex; align-items:center; gap:8px;">
+            <span>✨</span> POLYA STUDIO
+        </h3>
+        <p style="color:#71717a; font-size:11px; margin:0 0 16px 0;">Bento Grid 2.0 Engine</p>
+        <a href="#" class="nav-item active" data-menu="studio">📡 Studio Deck</a>
+        <a href="#" class="nav-item" data-menu="slots">🎬 Video Slots</a>
+        <a href="#" class="nav-item" data-menu="overlays">🎭 Overlays</a>
+        <a href="#" class="nav-item" data-menu="compositor">🎛️ Compositor</a>
+        <a href="#" class="nav-item" data-menu="telemetry">⚡ Telemetry</a>
+    </nav>
 
-<main class="main-content">
-<section id="view-studio" class="spa-view active">
-<div class="card">
-<h2>Studio Monitor Output</h2>
-<p>Status Monitor: <strong>HIDDEN (Zero-Load)</strong></p>
-<button class="btn btn-secondary" onclick="toggleMonitor()">👁️ Tampilkan Monitor Output</button>
-<br><br>
-<form id="formStart" method="POST" action="/start-stream" style="display:inline;"></form>
+    <!-- Main Content Area with 5 SPA Views -->
+    <main class="main-content">
+        <!-- 1. VIEW STUDIO DECK -->
+        <section id="view-studio" class="spa-view active">
+            <div style="margin-bottom: 15px;">
+                {account_status_banner}
+            </div>
+
+            {live_status_html}
+
+            <!-- Studio Deck Dual-Screen Box -->
+            <div class="card" style="margin-top: 15px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:10px;">
+                    <div>
+                        <h3 style="margin:0; color:var(--cyan); font-size:18px;">📡 Studio Live Deck (Dual-Screen Host & Video Reaction)</h3>
+                        <p style="margin:4px 0 0 0; color:#888; font-size:12px;">Kontrol kanvas mixing 720x1280 (24 FPS) langsung ke TikTok Live RTMP.</p>
+                    </div>
+                    <span id="dualStatusBadge" style="background:rgba(113,113,122,0.2); border:1px solid #71717a; color:#a1a1aa; padding:4px 10px; border-radius:6px; font-size:12px; font-weight:bold;">⚪ Standby (Kamera Nonaktif)</span>
+                </div>
+
+                <div style="display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap;">
+                    <!-- Studio Preview Column with Zero-Load Monitor Output -->
+                    <div style="flex: 0 0 auto; width: 300px; display: flex; flex-direction: column; align-items: center; gap: 10px;">
+                        <button type="button" id="btnToggleMonitorOutput" onclick="toggleMonitorOutput()" class="modern-btn" style="width: 100%; padding: 10px 14px; font-size: 13px; font-weight: bold; background: rgba(37, 244, 238, 0.12); color: #25f4ee; border: 1px solid #25f4ee; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                            <span>👁️</span> <span>Tampilkan Monitor Output</span>
+                        </button>
+
+                        <!-- Placeholder when Monitor Output is Hidden (0% GPU/CPU overhead) -->
+                        <div id="dualPreviewPlaceholder" style="width: 300px; height: 533px; background: #121218; border-radius: 16px; border: 2px dashed #3f3f46; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 24px; box-sizing: border-box;">
+                            <span style="font-size: 38px; margin-bottom: 12px;">🖥️</span>
+                            <div style="font-size: 14px; font-weight: bold; color: #fff; margin-bottom: 6px;">Monitor Output Nonaktif</div>
+                            <div style="font-size: 12px; color: #71717a; line-height: 1.5; margin-bottom: 16px;">
+                                Rendering visual DOM dinonaktifkan (Zero-Load / 0% CPU & GPU overhead). Klik tombol di atas untuk membuka pratinjau kanvas.
+                            </div>
+                            <button type="button" class="modern-btn" onclick="toggleMonitorOutput()" style="padding: 6px 14px; font-size: 12px; background: #27272a; color: #25f4ee; border: 1px solid #3f3f46; cursor: pointer;">
+                                Buka Monitor
+                            </button>
+                        </div>
+
+                        <!-- Live Preview Stage (9:16 Ratio) - Hidden by default -->
+                        <div id="dualPreviewStage" style="display: none; width: 300px; height: 533px; background: #000; border-radius: 16px; border: 2px solid #27272a; position: relative; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.8), 0 0 20px rgba(37,244,238,0.15);">
+                            <canvas id="dualCompositeCanvas" width="720" height="1280" style="width: 100%; height: 100%; object-fit: cover; display: block;"></canvas>
+                            
+                            <div style="position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; align-items: center; pointer-events: none;">
+                                <span id="dualCurrentSlotBadge" style="background: rgba(0,0,0,0.7); color: #34c759; border: 1px solid #34c759; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: bold;">
+                                    🐱 Slot 1 (Standby)
+                                </span>
+                            </div>
+                            <div style="position: absolute; bottom: 12px; right: 12px; display: flex; align-items: center; gap: 6px; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 6px; border: 1px solid #333; pointer-events: none;">
+                                <span style="font-size: 11px; color: #25f4ee;">🎙️</span>
+                                <div id="dualVuBar" style="width: 40px; height: 6px; background: #222; border-radius: 3px; overflow: hidden;">
+                                    <div id="dualVuLevel" style="width: 0%; height: 100%; background: #34c759; transition: width 0.08s ease;"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Controls Column -->
+                    <div style="flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 14px;">
+                        <!-- Device Selectors -->
+                        <div style="background: #181820; padding: 14px; border-radius: 10px; border: 1px solid #27272a;">
+                            <h4 style="margin: 0 0 10px 0; font-size: 14px; color: #fff;">⚙️ Pengaturan Perangkat Host & Layout</h4>
+                            
+                            <label style="display: block; font-size: 12px; color: #a1a1aa; margin-bottom: 4px;">Pilihan Kamera:</label>
+                            <select id="cameraSourceSelect" onchange="switchCameraDevice()" style="width: 100%; padding: 8px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 13px; margin-bottom: 10px;">
+                                <option value="">Pilih Kamera...</option>
+                            </select>
+
+                            <label style="display: block; font-size: 12px; color: #a1a1aa; margin-bottom: 4px;">Pilihan Mikrofon:</label>
+                            <select id="micSourceSelect" onchange="switchMicDevice()" style="width: 100%; padding: 8px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 13px; margin-bottom: 12px;">
+                                <option value="">Pilih Mikrofon...</option>
+                            </select>
+
+                            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                <div style="flex: 1; min-width: 130px;">
+                                    <label style="display: block; font-size: 11px; color: #25f4ee; margin-bottom: 4px; font-weight: 600;">Framing Video Utama:</label>
+                                    <select id="dualCatFitSelect" onchange="dualCatFitMode = this.value;" style="width: 100%; padding: 7px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 12px;">
+                                        <option value="fill" selected>📐 Fill (Penuh Layar 9:16)</option>
+                                        <option value="fit">🔍 Fit (Utuh Tanpa Potong)</option>
+                                    </select>
+                                </div>
+                                <div style="flex: 1; min-width: 130px;">
+                                    <label style="display: block; font-size: 11px; color: #fe2c55; margin-bottom: 4px; font-weight: 600;">Layout Kamera Host:</label>
+                                    <select id="dualCamFitSelect" style="width: 100%; padding: 7px; background: #121216; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; font-size: 12px;">
+                                        <option value="pip" selected>🖼️ Floating PiP (200x200 Kanan Atas)</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Action Buttons -->
+                        <div style="display: flex; flex-direction: column; gap: 10px;">
+                            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                <button type="button" id="btnToggleCam" onclick="toggleCamera()" class="shimmer-btn" style="--shimmer-color: #34c759; --bg: rgba(52, 199, 89, 0.15); flex: 1; min-width: 140px; padding: 10px 14px; font-weight: bold;">
+                                    📷 Aktifkan Kamera & Mic
+                                </button>
+                                <button type="button" id="btnToggleMirror" onclick="toggleMirrorCam()" class="shimmer-btn" style="--shimmer-color: #a07cfe; --bg: rgba(160, 124, 254, 0.15); padding: 10px 14px;">
+                                    🪞 Mirror: ON
+                                </button>
+                                <button type="button" id="btnToggleMic" onclick="toggleMuteMic()" class="shimmer-btn" style="--shimmer-color: #25f4ee; --bg: rgba(37, 244, 238, 0.15); padding: 10px 14px;">
+                                    🎙️ Mic: ON
+                                </button>
+                                <button type="button" id="btnReconnectCamDeck" onclick="reconnectCamera()" class="modern-btn" style="background:#27272a; padding:10px 14px; gap:6px;">
+                                    🔄 Reconnect
+                                </button>
+                            </div>
+
+                            <!-- Push Dual Stream live actions -->
+                            <div style="background: rgba(37, 244, 238, 0.05); padding: 14px; border-radius: 10px; border: 1px solid rgba(37, 244, 238, 0.2); margin-top: 6px;">
+                                <div style="font-size: 13px; font-weight: bold; color: #25f4ee; margin-bottom: 6px;">🚀 Push Full-Screen + PiP Langsung ke TikTok Live</div>
+                                <p style="font-size: 12px; color: #aaa; margin: 0 0 10px 0;">
+                                    Kamera host (PiP 200x200) + Audio & Video utama dikirim via WebSocket ke server FFmpeg dan di-push ke RTMPS TikTok (24 FPS / 1.2 Mbps).
+                                </p>
+                                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                    <button type="button" id="btnStartDualStream" onclick="startDualStream()" class="shimmer-btn" style="--shimmer-color: #ffb800; --bg: rgba(255, 184, 0, 0.18); flex: 1; font-weight: bold; padding: 12px 18px;">
+                                        🚀 Mulai Stream Live (Full-Screen + PiP)
+                                    </button>
+                                    <button type="button" id="btnStopDualStream" onclick="stopDualStream()" class="shimmer-btn" style="--shimmer-color: #ff3b30; --bg: rgba(255, 59, 48, 0.18); padding: 12px 18px; display: none;">
+                                        ⏹️ Stop Stream Live
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Panel Simulasi Gift Event Interaktif -->
+            <div class="card" style="margin-top: 15px; border: 1px solid rgba(52, 199, 89, 0.35); background: #16161d;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 12px;">
+                    <div>
+                        <h3 style="margin: 0; color: #34c759; font-size: 17px; display: flex; align-items: center; gap: 8px;">
+                            <span>🎁</span> Simulasi Pemicu Gift Event (Slot 2 s.d. 6)
+                        </h3>
+                        <p style="color: #a1a1aa; font-size: 13px; margin: 4px 0 0 0;">
+                            Uji coba pemicu video reaksi secara instan tanpa reload halaman. Klik beruntun untuk mengisi antrean pemutaran video.
+                        </p>
+                    </div>
+                    <div>
+                        <button type="button" id="btn-reset-standby" class="shimmer-btn" style="--shimmer-color: #007aff; --bg: rgba(0, 122, 255, 0.15); padding: 8px 18px; font-size: 13px; font-weight: 600;" onclick="resetStandby(event)">
+                            🔄 Reset ke Standby (Slot 1)
+                        </button>
+                    </div>
+                </div>
+
+                <div id="sim-status-banner" style="display: none; padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; border: 1px solid #34c759; background: rgba(52, 199, 89, 0.1); color: #34c759; transition: all 0.3s ease;">
+                </div>
+
+                <div style="display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-start; align-items: center;">
+                    {simulation_buttons_html}
+                </div>
+            </div>
+        </section>
+
+        <!-- 2. VIEW VIDEO SLOTS -->
+        <section id="view-slots" class="spa-view">
+            <div class="card">
+                <h2 style="margin-top:0; color:var(--cyan);">🎬 Video Slots (Slot 1 - 6)</h2>
+                <p style="color:#aaa; font-size:13px; margin-bottom:15px;">Kelola video standby (Slot 1) dan video reaksi gift (Slot 2-6). Klik 'Pilih Gift' untuk memetakan jenis hadiah penonton ke slot reaksi.</p>
+                {video_slots_html}
+            </div>
+
+            <!-- Quick Gift Simulation on Slots page -->
+            <div class="card" style="margin-top: 15px; border: 1px solid rgba(52, 199, 89, 0.3); background: #16161d;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+                    <div>
+                        <h3 style="margin:0; color:#34c759; font-size:15px; display:flex; align-items:center; gap:6px;">
+                            <span>⚡</span> Tes Cepat Pemicu Reaksi (Simulasi Gift)
+                        </h3>
+                        <p style="margin:3px 0 0 0; color:#888; font-size:12px;">Uji reaksi gift langsung tanpa berpindah ke tab Studio Deck.</p>
+                    </div>
+                    <button type="button" class="modern-btn" style="background:#222; border:1px solid #444; padding:6px 12px; font-size:12px;" onclick="resetStandby(event)">🔄 Standby (Slot 1)</button>
+                </div>
+                <div style="display:flex; flex-wrap:wrap; gap:8px;">
+                    {simulation_buttons_html}
+                </div>
+            </div>
+        </section>
+
+        <!-- 3. VIEW OVERLAYS -->
+        <section id="view-overlays" class="spa-view">
+            {dynamic_overlay_card_html}
+            {overlay_card_html}
+        </section>
+
+        <!-- 4. VIEW COMPOSITOR -->
+        <section id="view-compositor" class="spa-view">
+            <div class="card">
+                <h2 style="margin-top:0; color:var(--cyan);">🎛️ Tata Letak Layar & Audio Compositor (720x1280)</h2>
+                <p style="color:#aaa; font-size:13px; margin-bottom:20px;">
+                    Konfigurasi koordinat Floating PiP Webcam dan Panduan Karakter. Nilai tersimpan di <code>compositor_config.json</code> dan tersinkronisasi otomatis dengan filter FFmpeg backend serta rendering canvas frontend.
+                </p>
+
+                <div style="display:flex; gap:25px; flex-wrap:wrap; align-items:flex-start;">
+                    <!-- Left Form Column -->
+                    <div style="flex:1; min-width:300px; display:flex; flex-direction:column; gap:18px;">
+                        <!-- Webcam PiP Card -->
+                        <div style="background:#181820; padding:16px; border-radius:12px; border:1px solid rgba(37,244,238,0.3);">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                                <h4 style="margin:0; color:var(--cyan); font-size:14px; display:flex; align-items:center; gap:6px;">
+                                    <span>📷</span> Floating PiP Webcam Box
+                                </h4>
+                                <span style="font-size:11px; background:rgba(37,244,238,0.15); color:#25f4ee; padding:2px 8px; border-radius:4px;">Kanan Atas (Margin 80px)</span>
+                            </div>
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                                <div>
+                                    <label style="display:block; font-size:12px; color:#aaa; margin-bottom:4px;">Koordinat X (px):</label>
+                                    <input type="number" id="compWebcamX" value="{cam_x}" min="0" max="720" style="width:100%; padding:8px; background:#121216; color:#fff; border:1px solid #3f3f46; border-radius:6px; font-size:13px; box-sizing:border-box;" oninput="updateMiniCompositorPreview()">
+                                </div>
+                                <div>
+                                    <label style="display:block; font-size:12px; color:#aaa; margin-bottom:4px;">Koordinat Y (px):</label>
+                                    <input type="number" id="compWebcamY" value="{cam_y}" min="0" max="1280" style="width:100%; padding:8px; background:#121216; color:#fff; border:1px solid #3f3f46; border-radius:6px; font-size:13px; box-sizing:border-box;" oninput="updateMiniCompositorPreview()">
+                                </div>
+                                <div>
+                                    <label style="display:block; font-size:12px; color:#aaa; margin-bottom:4px;">Lebar Width (px):</label>
+                                    <input type="number" id="compWebcamW" value="{cam_w}" min="50" max="720" style="width:100%; padding:8px; background:#121216; color:#fff; border:1px solid #3f3f46; border-radius:6px; font-size:13px; box-sizing:border-box;" oninput="updateMiniCompositorPreview()">
+                                </div>
+                                <div>
+                                    <label style="display:block; font-size:12px; color:#aaa; margin-bottom:4px;">Tinggi Height (px):</label>
+                                    <input type="number" id="compWebcamH" value="{cam_h}" min="50" max="1280" style="width:100%; padding:8px; background:#121216; color:#fff; border:1px solid #3f3f46; border-radius:6px; font-size:13px; box-sizing:border-box;" oninput="updateMiniCompositorPreview()">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Guide Overlay Card -->
+                        <div style="background:#181820; padding:16px; border-radius:12px; border:1px solid rgba(245,158,11,0.3);">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                                <h4 style="margin:0; color:var(--amber); font-size:14px; display:flex; align-items:center; gap:6px;">
+                                    <span>🎭</span> Panduan Visual Karakter (Guide Overlay)
+                                </h4>
+                                <span style="font-size:11px; background:rgba(245,158,11,0.15); color:#f59e0b; padding:2px 8px; border-radius:4px;">Header Layar</span>
+                            </div>
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                                <div>
+                                    <label style="display:block; font-size:12px; color:#aaa; margin-bottom:4px;">Koordinat X (px):</label>
+                                    <input type="number" id="compGuideX" value="{guide_x}" min="0" max="720" style="width:100%; padding:8px; background:#121216; color:#fff; border:1px solid #3f3f46; border-radius:6px; font-size:13px; box-sizing:border-box;" oninput="updateMiniCompositorPreview()">
+                                </div>
+                                <div>
+                                    <label style="display:block; font-size:12px; color:#aaa; margin-bottom:4px;">Koordinat Y (px):</label>
+                                    <input type="number" id="compGuideY" value="{guide_y}" min="0" max="1280" style="width:100%; padding:8px; background:#121216; color:#fff; border:1px solid #3f3f46; border-radius:6px; font-size:13px; box-sizing:border-box;" oninput="updateMiniCompositorPreview()">
+                                </div>
+                            </div>
+                        </div>
+
+                        <button type="button" class="shimmer-btn" style="--shimmer-color:#25f4ee; --bg:rgba(37,244,238,0.2); font-weight:bold; padding:12px 24px; width:100%;" onclick="saveCompositorSettings()">
+                            💾 Simpan Konfigurasi Compositor
+                        </button>
+                    </div>
+
+                    <!-- Right Mini Preview Column -->
+                    <div style="width:240px; display:flex; flex-direction:column; align-items:center; gap:10px;">
+                        <span style="font-size:12px; color:#aaa; font-weight:600;">Pratinjau Layout Mini (9:16)</span>
+                        <div id="miniLayoutStage" style="width:216px; height:384px; background:#07080c; border:2px solid #3f3f46; border-radius:12px; position:relative; overflow:hidden; box-shadow:0 8px 24px rgba(0,0,0,0.6);">
+                            <!-- TikTok Right Button Safe Zone (80px * 0.3 = 24px width) -->
+                            <div style="position:absolute; right:0; top:0; bottom:0; width:24px; background:rgba(255,43,84,0.12); border-left:1px dashed rgba(255,43,84,0.4); pointer-events:none; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; font-size:8px; color:#ff2b54;">
+                                <span>❤️</span><span>💬</span><span>↗️</span>
+                            </div>
+                            
+                            <!-- Guide Box Indicator in Mini Preview -->
+                            <div id="miniGuideBox" style="position:absolute; left:{guide_x * 0.3}px; top:{guide_y * 0.3}px; width:100px; height:24px; border:1px dashed #f59e0b; background:rgba(245,158,11,0.15); border-radius:3px; display:flex; align-items:center; justify-content:center; font-size:9px; color:#f59e0b; pointer-events:none; transition:all 0.1s ease;">
+                                Guide Karakter
+                            </div>
+
+                            <!-- Webcam Box Indicator in Mini Preview -->
+                            <div id="miniWebcamBox" style="position:absolute; left:{cam_x * 0.3}px; top:{cam_y * 0.3}px; width:{cam_w * 0.3}px; height:{cam_h * 0.3}px; border:1.5px solid #25f4ee; background:rgba(37,244,238,0.2); border-radius:4px; display:flex; flex-direction:column; align-items:center; justify-content:center; font-size:9px; color:#25f4ee; pointer-events:none; transition:all 0.1s ease;">
+                                <span>📷 Host</span>
+                                <span style="font-size:7px; color:#aaa;">PiP</span>
+                            </div>
+
+                            <div style="position:absolute; bottom:6px; left:8px; font-size:8px; color:#555;">720x1280</div>
+                        </div>
+                        <div style="font-size:11px; color:#71717a; text-align:center; line-height:1.4;">
+                            Area merah garis putus-putus menunjukkan tombol interaktif TikTok Live penonton. Webcam bergeser aman ke kiri margin 80px.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 5. VIEW TELEMETRY -->
+        <section id="view-telemetry" class="spa-view">
+            {vpn_card_html}
+            {live_listener_card_html}
+            <div class="card" style="margin-top:15px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                    <h3 style="margin:0; color:var(--cyan); font-size:15px;">⚡ FFmpeg Streaming Logs</h3>
+                    <button type="button" class="modern-btn" onclick="fetchFfmpegLogs()" style="background:#27272a; padding:4px 10px; font-size:11px;">🔄 Refresh Log</button>
+                </div>
+                <pre id="logContainer" style="height:250px; overflow:auto; background:#000; padding:10px; font-family:var(--font-mono); font-size:12px; border:1px solid #27272a; border-radius:6px;"></pre>
+            </div>
+        </section>
+    </main>
 </div>
-</section>
 
-<section id="view-slots" class="spa-view">
-<div class="card"><h2>Video Slots (1-6)</h2>{video_slots_html}</div>
-</section>
-
-<section id="view-overlays" class="spa-view">
-<div class="card">
-<h2>Dynamic Overlays</h2>
-<button class="btn btn-secondary" onclick="triggerTestOverlay()">▶ Test Layer</button>
-</div>
-</section>
-
-<section id="view-compositor" class="spa-view">
-<div class="card"><h2>Compositor & Audio</h2><p>Koordinat Guide/Webcam settings...</p></div>
-</section>
-
-<section id="view-telemetry" class="spa-view">
-<div class="card"><h2>Telemetry & Logs</h2><pre id="logContainer" style="height:300px; overflow:auto; background:#000; padding:10px; font-family:var(--font-mono); font-size:12px;"></pre></div>
-</section>
-</main>
-</div>
-
+<!-- Mobile Bottom Navigation -->
 <nav class="bottom-nav">
-<div class="bottom-nav-item active" data-menu="studio">📡<br>Studio</div>
-<div class="bottom-nav-item" data-menu="slots">🎬<br>Slots</div>
-<div class="bottom-nav-item" data-menu="overlays">🎭<br>Ovl</div>
-<div class="bottom-nav-item" data-menu="compositor">🎛️<br>Cmp</div>
-<div class="bottom-nav-item" data-menu="telemetry">⚡<br>Log</div>
+    <div class="bottom-nav-item active" data-menu="studio">📡<br>Studio</div>
+    <div class="bottom-nav-item" data-menu="slots">🎬<br>Slots</div>
+    <div class="bottom-nav-item" data-menu="overlays">🎭<br>Ovl</div>
+    <div class="bottom-nav-item" data-menu="compositor">🎛️<br>Cmp</div>
+    <div class="bottom-nav-item" data-menu="telemetry">⚡<br>Log</div>
 </nav>
+
+<!-- Gift Trigger Selector Modal -->
+<div id="giftModal" class="modal-overlay">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 style="margin: 0; font-size: 16px; color: #fff;">Pilih Pemicu Hadiah (Gift Trigger)</h3>
+            <span class="close-btn" onclick="closeGiftModal()">&times;</span>
+        </div>
+        <div class="modal-body">
+            <iframe id="giftIframe" src="" style="width: 100%; height: 450px; border: none;"></iframe>
+        </div>
+    </div>
+</div>
 
 <div id="globalToast" class="toast"></div>
 
-<script>
-// Router Logic
-function switchMenu(menuId) {{
-document.querySelectorAll('.spa-view').forEach(el => el.classList.remove('active'));
-document.querySelectorAll('.nav-item, .bottom-nav-item').forEach(el => el.classList.remove('active'));
-
-const view = document.getElementById('view-' + menuId);
-if(view) view.classList.add('active');
-
-document.querySelector('[data-menu="' + menuId + '"]').classList.add('active');
-localStorage.setItem('tiktok_active_menu', menuId);
-}}
-
-// Init
-window.addEventListener('DOMContentLoaded', () => {{
-const saved = localStorage.getItem('tiktok_active_menu') || 'studio';
-switchMenu(saved);
-}});
-
-// Event Listeners for Nav
-document.querySelectorAll('.nav-item, .bottom-nav-item').forEach(item => {{
-item.addEventListener('click', (e) => {{
-e.preventDefault();
-switchMenu(item.dataset.menu);
-}});
-}});
-
-// Toast Helper
-function showToast(msg) {{
-const t = document.getElementById('globalToast');
-t.textContent = msg;
-t.classList.add('show');
-setTimeout(() => t.classList.remove('show'), 3000);
-}}
-
-// Actions
-function toggleMonitor() {{
-showToast("Monitor toggled. Check Console.");
-// Actual logic would call existing backend/frontend handler here
-}}
-
-function triggerTestOverlay() {{
-showToast("🎭 Playing Overlay Slot #X on Stream...");
-// Hook into existing overlay engine
-if(typeof window.testOverlayEngine !== 'undefined') window.testOverlayEngine.playRandom();
-}}
-</script>
 </body>
 </html>
 """
             self.wfile.write(html.encode('utf-8'))
             
+        elif parsed_url.path == '/get-compositor-config':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(load_compositor_config()).encode('utf-8'))
+            return
+
         elif parsed_url.path == '/gift-selector':
             query = urllib.parse.parse_qs(parsed_url.query)
             slot = query.get('slot', ['2'])[0]
@@ -4090,7 +6123,71 @@ if(typeof window.testOverlayEngine !== 'undefined') window.testOverlayEngine.pla
             self.send_header('Location', '/')
             self.end_headers()
             return
-            
+
+        elif parsed_url.path == '/save-compositor-config':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else ""
+                
+                data = {}
+                if body.strip().startswith('{'):
+                    try:
+                        data = json.loads(body)
+                    except Exception:
+                        pass
+                if not data:
+                    parsed = urllib.parse.parse_qs(body)
+                    cam_x = parsed.get('webcam_x', [None])[0]
+                    cam_y = parsed.get('webcam_y', [None])[0]
+                    cam_w = parsed.get('webcam_w', [None])[0]
+                    cam_h = parsed.get('webcam_h', [None])[0]
+                    guide_x = parsed.get('guide_x', [None])[0]
+                    guide_y = parsed.get('guide_y', [None])[0]
+                    data = {"webcam": {}, "guide": {}}
+                    if cam_x is not None: data["webcam"]["x"] = int(cam_x)
+                    if cam_y is not None: data["webcam"]["y"] = int(cam_y)
+                    if cam_w is not None: data["webcam"]["width"] = int(cam_w)
+                    if cam_h is not None: data["webcam"]["height"] = int(cam_h)
+                    if guide_x is not None: data["guide"]["x"] = int(guide_x)
+                    if guide_y is not None: data["guide"]["y"] = int(guide_y)
+
+                cfg = load_compositor_config()
+                if "webcam" in data and isinstance(data["webcam"], dict):
+                    cfg["webcam"].update({
+                        "x": int(data["webcam"].get("x", cfg["webcam"]["x"])),
+                        "y": int(data["webcam"].get("y", cfg["webcam"]["y"])),
+                        "width": int(data["webcam"].get("width", cfg["webcam"]["width"])),
+                        "height": int(data["webcam"].get("height", cfg["webcam"]["height"]))
+                    })
+                if "guide" in data and isinstance(data["guide"], dict):
+                    cfg["guide"].update({
+                        "x": int(data["guide"].get("x", cfg["guide"]["x"])),
+                        "y": int(data["guide"].get("y", cfg["guide"]["y"]))
+                    })
+                    char_cfg = load_character_config()
+                    char_cfg["position"] = {"x": cfg["guide"]["x"], "y": cfg["guide"]["y"]}
+                    save_character_config(char_cfg)
+                    try:
+                        generate_guide_overlay(char_cfg)
+                        refresh_active_stream_overlay()
+                    except Exception as ge:
+                        print(f"[Compositor] Overlay refresh error: {ge}")
+                
+                save_compositor_config(cfg)
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "config": cfg}).encode('utf-8'))
+                return
+            except Exception as e:
+                print(f"[Save Compositor Error] {e}")
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                return
+
         elif parsed_url.path == '/toggle-vpn':
             try:
                 content_length = int(self.headers.get('Content-Length', 0))
