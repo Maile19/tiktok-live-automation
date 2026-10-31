@@ -20,6 +20,7 @@ import http.cookies
 import shutil
 import asyncio
 import websockets
+import queue
 import copy
 from PIL import Image, ImageDraw, ImageFont
 
@@ -1274,6 +1275,7 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-tune", "zerolatency",
+        "-profile:v", "high",
         "-threads", "2",
         "-b:v", "1500k",
         "-maxrate", "1800k",
@@ -1374,6 +1376,7 @@ def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-tune", "zerolatency",
+        "-profile:v", "high",
         "-threads", "2",
         "-b:v", "1500k",
         "-maxrate", "1800k",
@@ -1448,6 +1451,39 @@ def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
         save_stream_metadata()
         return streaming_process
 
+def _ffmpeg_stdin_writer_worker(proc, chunk_queue, stop_event):
+    """
+    Dedicated daemon worker thread to stream binary chunks from chunk_queue into proc.stdin
+    without blocking the asyncio WebSocket handler (zero backpressure pipeline).
+    """
+    while not stop_event.is_set():
+        try:
+            chunk = chunk_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+
+        if chunk is None:
+            break
+
+        if proc.poll() is not None or not proc.stdin:
+            print(f"[FFmpeg Writer] FFmpeg process exited (code: {proc.poll()}), stopping stdin writer.")
+            break
+
+        try:
+            proc.stdin.write(chunk)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as pe:
+            print(f"[FFmpeg Writer] Pipe write error: {pe}")
+            break
+        except Exception as ex:
+            print(f"[FFmpeg Writer] Unexpected write error: {ex}")
+            break
+        finally:
+            try:
+                chunk_queue.task_done()
+            except ValueError:
+                pass
+
 async def ws_stream_handler(websocket):
     global dual_screen_active, dual_screen_ws_client, streaming_process
     print("[DualScreen WS] Klien terhubung ke WebSocket stream pipe.")
@@ -1498,6 +1534,16 @@ async def ws_stream_handler(websocket):
     except Exception:
         pass
 
+    chunk_queue = queue.Queue(maxsize=150)
+    stop_event = threading.Event()
+    writer_thread = threading.Thread(
+        target=_ffmpeg_stdin_writer_worker,
+        args=(proc, chunk_queue, stop_event),
+        name="ffmpeg-stdin-writer",
+        daemon=True
+    )
+    writer_thread.start()
+
     bytes_received = 0
     chunks_count = 0
     try:
@@ -1506,17 +1552,27 @@ async def ws_stream_handler(websocket):
                 chunks_count += 1
                 bytes_received += len(message)
                 if chunks_count % 30 == 0:
-                    print(f"[DualScreen WS] Chunks masuk: {chunks_count} ({bytes_received / (1024*1024):.2f} MB), pipe status: {'running' if proc.poll() is None else f'exited ({proc.poll()})'}")
-                if proc.poll() is None and proc.stdin:
-                    try:
-                        proc.stdin.write(message)
-                        proc.stdin.flush()
-                    except (BrokenPipeError, OSError) as pe:
-                        print(f"[DualScreen WS] Pipe write error: {pe}")
-                        break
-                else:
-                    print(f"[DualScreen WS] FFmpeg proses berhenti mendadak (code: {proc.poll()})")
+                    print(f"[DualScreen WS] Chunks masuk: {chunks_count} ({bytes_received / (1024*1024):.2f} MB), queue: {chunk_queue.qsize()}/{chunk_queue.maxsize}, pipe status: {'running' if proc.poll() is None else f'exited ({proc.poll()})'}")
+
+                if proc.poll() is not None or not writer_thread.is_alive():
+                    print(f"[DualScreen WS] FFmpeg atau stdin writer berhenti mendadak (code: {proc.poll()})")
                     break
+
+                try:
+                    chunk_queue.put_nowait(message)
+                except queue.Full:
+                    # Drop oldest chunk to prevent blocking main WebSocket loop (zero backpressure)
+                    try:
+                        _ = chunk_queue.get_nowait()
+                        chunk_queue.task_done()
+                    except Exception:
+                        pass
+                    try:
+                        chunk_queue.put_nowait(message)
+                    except Exception:
+                        pass
+                    if chunks_count % 30 == 0:
+                        print("[DualScreen WS] Peringatan: chunk_queue penuh (150), menjatuhkan frame lama untuk menjaga kelancaran stream.")
             elif isinstance(message, str):
                 try:
                     payload = json.loads(message)
@@ -1529,6 +1585,13 @@ async def ws_stream_handler(websocket):
     except Exception as e:
         print(f"[DualScreen WS] WebSocket exception: {e}")
     finally:
+        stop_event.set()
+        try:
+            chunk_queue.put_nowait(None)
+        except Exception:
+            pass
+        writer_thread.join(timeout=1.0)
+
         dual_screen_active = False
         dual_screen_ws_client = None
         print(f"[DualScreen WS] Sesi WebSocket streaming dual-screen selesai. Total data: {bytes_received} bytes.")
@@ -3723,6 +3786,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             if (dualTickWorker) {{
                                 dualTickWorker.postMessage('stop');
                             }}
+                            if (window._dualFallbackTimer) {{
+                                clearInterval(window._dualFallbackTimer);
+                                window._dualFallbackTimer = null;
+                            }}
                             const catVid = document.getElementById('dualCatVideo');
                             if (catVid) {{
                                 catVid.pause();
@@ -4046,28 +4113,15 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 }}
                             }}
 
-                            // Decoupled 24 FPS Engine: RAF when tab active; Web Worker ONLY when document.hidden === true
-                            let lastRafTime = 0;
-                            const targetIntervalMs = 1000 / 24; // ~41.66ms
-
-                            function rafLoop(timestamp) {{
-                                if (!isRenderLoopRunning) return;
-                                if (!document.hidden) {{
-                                    if (timestamp - lastRafTime >= targetIntervalMs - 2) {{
-                                        lastRafTime = timestamp;
-                                        draw();
-                                    }}
-                                }}
-                                dualAnimFrame = requestAnimationFrame(rafLoop);
-                            }}
-
+                            // Zero-Lag 24 FPS Engine: Dedicated Web Worker Clock (Anti-Throttling)
+                            // Browser background/hidden tabs do NOT throttle Web Worker timers
                             try {{
                                 if (!dualTickWorker) {{
                                     const workerBlob = new Blob([
                                         'let timer = null;' +
                                         'self.onmessage = function(e) {{' +
                                         '  if (e.data === "start") {{' +
-                                        '    if (!timer) timer = setInterval(function() {{ self.postMessage("tick"); }}, 41);' +
+                                        '    if (!timer) timer = setInterval(function() {{ self.postMessage("tick"); }}, 1000 / 24);' +
                                         '  }} else if (e.data === "stop") {{' +
                                         '    if (timer) {{ clearInterval(timer); timer = null; }}' +
                                         '  }}' +
@@ -4075,30 +4129,25 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ], {{ type: 'application/javascript' }});
                                     dualTickWorker = new Worker(URL.createObjectURL(workerBlob));
                                     dualTickWorker.onmessage = function(e) {{
-                                        if (e.data === 'tick' && document.hidden && isRenderLoopRunning) {{
+                                        if (e.data === 'tick' && isRenderLoopRunning) {{
                                             draw();
                                         }}
                                     }};
                                 }}
-                            }} catch(wErr) {{
-                                console.warn('[DualScreen] Worker timer fallback:', wErr);
-                            }}
-
-                            document.addEventListener('visibilitychange', function() {{
-                                if (document.hidden) {{
-                                    if (dualTickWorker && isRenderLoopRunning) dualTickWorker.postMessage('start');
-                                }} else {{
-                                    if (dualTickWorker) dualTickWorker.postMessage('stop');
-                                    lastRafTime = performance.now();
+                                if (dualTickWorker && isRenderLoopRunning) {{
+                                    dualTickWorker.postMessage('start');
                                 }}
-                            }});
-
-                            if (dualAnimFrame) {{
-                                cancelAnimationFrame(dualAnimFrame);
-                                dualAnimFrame = null;
+                            }} catch(wErr) {{
+                                console.warn('[DualScreen] Web Worker timer fallback to setInterval:', wErr);
+                                if (!window._dualFallbackTimer) {{
+                                    window._dualFallbackTimer = setInterval(function() {{
+                                        if (isRenderLoopRunning) draw();
+                                    }}, 1000 / 24);
+                                }}
                             }}
-                            lastRafTime = performance.now();
-                            rafLoop(performance.now());
+
+                            // Initial frame render
+                            draw();
                         }}
 
                         async function toggleCamera() {{
@@ -4138,8 +4187,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 const constraints = {{
                                     video: {{
                                         ...(camId ? {{ deviceId: {{ exact: camId }} }} : {{ facingMode: 'user' }}),
-                                        width: {{ ideal: 320, max: 480 }},
-                                        height: {{ ideal: 320, max: 480 }},
+                                        width: {{ ideal: 240, max: 320 }},
+                                        height: {{ ideal: 240, max: 320 }},
                                         frameRate: {{ ideal: 24, max: 24 }}
                                     }},
                                     audio: micId ? {{ deviceId: {{ exact: micId }} }} : true
@@ -4316,9 +4365,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             }};
 
                             dualStreamWs.onopen = function() {{
-                                console.log('[DualStream] WebSocket terhubung! Memulai MediaRecorder H.264/30 FPS...');
+                                console.log('[DualStream] WebSocket terhubung! Memulai MediaRecorder H.264 (24 FPS)...');
                                 const candidateMimes = [
                                     'video/webm;codecs=h264,opus',
+                                    'video/webm;codecs=avc1.64001f,opus',
+                                    'video/mp4;codecs=avc1.64001f,mp4a.40.2',
                                     'video/webm;codecs=h264',
                                     'video/mp4;codecs=avc1',
                                     'video/webm;codecs=vp8,opus',
