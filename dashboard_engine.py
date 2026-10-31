@@ -871,7 +871,7 @@ def save_video_meta(meta):
 
 DEFAULT_CHARACTER_CONFIG = {
     "overlay_enabled": True,
-    "position": {"x": 60, "y": 120},
+    "position": {"x": 60, "y": 150},
     "characters": {
         "1": {"name": "Karakter 1 (Kucing Kribo)", "avatar": ""},
         "2": {"name": "Karakter 2", "avatar": ""},
@@ -1225,9 +1225,9 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     
     char_cfg = load_character_config()
     overlay_enabled = char_cfg.get("overlay_enabled", True)
-    pos = char_cfg.get("position", {"x": 60, "y": 120})
+    pos = char_cfg.get("position", {"x": 60, "y": 150})
     pos_x = pos.get("x", 60)
-    pos_y = pos.get("y", 120)
+    pos_y = pos.get("y", 150)
 
     if overlay_enabled and not os.path.exists(GUIDE_OVERLAY_FILE):
         try:
@@ -1239,8 +1239,8 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     has_audio = check_has_audio(video_path)
 
     loop_args = ["-stream_loop", "-1"] if loop else []
-    # Full-screen 720x1280 layout + Floating bottom-center PiP webcam box (400x400 at x=160, y=840)
-    scale_filter = "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=160:y=840:w=400:h=400:color=0x181820@0.85:t=fill,drawbox=x=160:y=840:w=400:h=400:color=0x25f4ee:t=2"
+    # Full-screen 720x1280 layout + Side-by-Side 200x200 (Left: Dynamic Overlay at x=120, Right: Webcam at x=400 at y=1040)
+    scale_filter = "scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x=120:y=1040:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=120:y=1040:w=200:h=200:color=0xff2b54:t=2,drawbox=x=400:y=1040:w=200:h=200:color=0x181820@0.85:t=fill,drawbox=x=400:y=1040:w=200:h=200:color=0x25f4ee:t=2"
 
     cmd = [
         "ffmpeg",
@@ -2527,7 +2527,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
             char_cfg = load_character_config()
             pos_x = char_cfg.get("position", {}).get("x", 60)
-            pos_y = char_cfg.get("position", {}).get("y", 120)
+            pos_y = char_cfg.get("position", {}).get("y", 150)
             overlay_is_on = char_cfg.get("overlay_enabled", True)
             chars_dict = char_cfg.get("characters", {})
 
@@ -3858,22 +3858,26 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             const ctx = canvas.getContext('2d');
                             const catVid = document.getElementById('dualCatVideo');
                             const camVid = document.getElementById('dualCamVideo');
+                            let guideOverlayImg = new Image();
+                            guideOverlayImg.src = '/overlay-preview?v=' + Date.now();
 
-                            // Lightweight image smoothing: 'low' saves ~60% CPU/GPU overhead
+                            // High-quality bicubic image smoothing for maximum crispness
                             ctx.imageSmoothingEnabled = true;
-                            ctx.imageSmoothingQuality = 'low';
+                            ctx.imageSmoothingQuality = 'high';
 
                             function draw() {{
                                 // Base dark background
                                 ctx.fillStyle = '#0a0a0f';
                                 ctx.fillRect(0, 0, 720, 1280);
 
-                                // 1. Full-Screen Video (720x1280)
+                                // 1. Full-Screen Video (720x1280) with 1:1 sharp drawing optimization
                                 if (catVid && catVid.readyState >= 2) {{
                                     const vW = catVid.videoWidth || 720;
                                     const vH = catVid.videoHeight || 1280;
 
-                                    if (dualCatFitMode === 'fit') {{
+                                    if (vW === 720 && vH === 1280) {{
+                                        ctx.drawImage(catVid, 0, 0, 720, 1280);
+                                    }} else if (dualCatFitMode === 'fit') {{
                                         const fitScale = Math.min(720 / vW, 1280 / vH);
                                         const drawW = vW * fitScale;
                                         const drawH = vH * fitScale;
@@ -3902,78 +3906,121 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ctx.fillText('🐱 Video Standby / Reaksi', 360, 640);
                                 }}
 
-                                // Function to draw Webcam Box (400x400 at Bottom-Center: x=160, y=840)
+                                // 2. TikTok Character Guide Overlay (Lowered by 30px to y=150)
+                                if (guideOverlayImg && guideOverlayImg.complete && guideOverlayImg.naturalWidth > 0) {{
+                                    ctx.drawImage(guideOverlayImg, 60, 150);
+                                }}
+
+                                // 3. Side-by-Side 200x200 Layout at Bottom Screen (y=1040)
+                                // Left Box: Dynamic Overlay (.webm Transparan) 200x200 (x=120, y=1040)
+                                function renderDynamicOverlayBox() {{
+                                    const ovW = 200;
+                                    const ovH = 200;
+                                    const ovX = 120;
+                                    const ovY = 1040;
+
+                                    if (dualActiveOverlayVid && dualIsOverlayPlaying && dualActiveOverlayVid.readyState >= 2) {{
+                                        const vW = dualActiveOverlayVid.videoWidth || 200;
+                                        const vH = dualActiveOverlayVid.videoHeight || 200;
+                                        const minDim = Math.min(vW, vH);
+                                        const sX = (vW - minDim) * 0.5;
+                                        const sY = (vH - minDim) * 0.5;
+
+                                        ctx.fillStyle = 'rgba(18, 18, 24, 0.85)';
+                                        ctx.fillRect(ovX, ovY, ovW, ovH);
+
+                                        ctx.save();
+                                        ctx.beginPath();
+                                        ctx.rect(ovX, ovY, ovW, ovH);
+                                        ctx.clip();
+                                        ctx.drawImage(dualActiveOverlayVid, sX, sY, minDim, minDim, ovX, ovY, ovW, ovH);
+                                        ctx.restore();
+
+                                        // TikTok Pink Neon border 2px
+                                        ctx.strokeStyle = '#ff2b54';
+                                        ctx.lineWidth = 2;
+                                        ctx.strokeRect(ovX, ovY, ovW, ovH);
+
+                                        // Overlay active badge
+                                        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                                        ctx.fillRect(ovX, ovY + ovH - 22, ovW, 22);
+                                        ctx.fillStyle = '#ff2b54';
+                                        ctx.font = 'bold 11px sans-serif';
+                                        ctx.textAlign = 'center';
+                                        ctx.fillText('✨ DYNAMIC OVERLAY', ovX + ovW * 0.5, ovY + ovH - 6);
+                                    }} else {{
+                                        ctx.fillStyle = 'rgba(18, 18, 24, 0.85)';
+                                        ctx.fillRect(ovX, ovY, ovW, ovH);
+                                        ctx.strokeStyle = '#ff2b54';
+                                        ctx.lineWidth = 2;
+                                        ctx.strokeRect(ovX, ovY, ovW, ovH);
+
+                                        ctx.fillStyle = '#a1a1aa';
+                                        ctx.font = 'bold 12px sans-serif';
+                                        ctx.textAlign = 'center';
+                                        ctx.fillText('🎭 Overlay Standby', ovX + ovW * 0.5, ovY + ovH * 0.5 + 4);
+                                    }}
+                                }}
+
+                                // Right Box: Monitor Webcam 200x200 (x=400, y=1040)
                                 function renderWebcamBox() {{
-                                    const pipW = 400;
-                                    const pipH = 400;
-                                    const pipX = 160;
-                                    const pipY = 840;
+                                    const camW = 200;
+                                    const camH = 200;
+                                    const camX = 400;
+                                    const camY = 1040;
 
                                     if (camVid && camVid.readyState >= 2) {{
-                                        const cW = camVid.videoWidth || 480;
-                                        const cH = camVid.videoHeight || 480;
+                                        const cW = camVid.videoWidth || 320;
+                                        const cH = camVid.videoHeight || 320;
                                         const minDim = Math.min(cW, cH);
                                         const sX = (cW - minDim) * 0.5;
                                         const sY = (cH - minDim) * 0.5;
 
                                         ctx.save();
                                         ctx.beginPath();
-                                        ctx.rect(pipX, pipY, pipW, pipH);
+                                        ctx.rect(camX, camY, camW, camH);
                                         ctx.clip();
 
                                         if (dualIsMirror) {{
-                                            ctx.translate(pipX + pipW, pipY);
+                                            ctx.translate(camX + camW, camY);
                                             ctx.scale(-1, 1);
-                                            ctx.drawImage(camVid, sX, sY, minDim, minDim, 0, 0, pipW, pipH);
+                                            ctx.drawImage(camVid, sX, sY, minDim, minDim, 0, 0, camW, camH);
                                         }} else {{
-                                            ctx.drawImage(camVid, sX, sY, minDim, minDim, pipX, pipY, pipW, pipH);
+                                            ctx.drawImage(camVid, sX, sY, minDim, minDim, camX, camY, camW, camH);
                                         }}
                                         ctx.restore();
 
-                                        // Neon border 2px
+                                        // Cyan Neon border 2px
                                         ctx.strokeStyle = '#25f4ee';
                                         ctx.lineWidth = 2;
-                                        ctx.strokeRect(pipX, pipY, pipW, pipH);
+                                        ctx.strokeRect(camX, camY, camW, camH);
 
                                         // Host indicator badge
                                         ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-                                        ctx.fillRect(pipX, pipY + pipH - 26, pipW, 26);
+                                        ctx.fillRect(camX, camY + camH - 22, camW, 22);
                                         ctx.fillStyle = '#25f4ee';
-                                        ctx.font = 'bold 13px sans-serif';
+                                        ctx.font = 'bold 11px sans-serif';
                                         ctx.textAlign = 'center';
-                                        ctx.fillText('🔴 LIVE HOST', pipX + pipW * 0.5, pipY + pipH - 8);
+                                        ctx.fillText('🔴 LIVE HOST', camX + camW * 0.5, camY + camH - 6);
                                     }} else {{
                                         ctx.fillStyle = 'rgba(18, 18, 24, 0.85)';
-                                        ctx.fillRect(pipX, pipY, pipW, pipH);
+                                        ctx.fillRect(camX, camY, camW, camH);
                                         ctx.strokeStyle = '#25f4ee';
                                         ctx.lineWidth = 2;
-                                        ctx.strokeRect(pipX, pipY, pipW, pipH);
+                                        ctx.strokeRect(camX, camY, camW, camH);
 
                                         ctx.fillStyle = '#71717a';
-                                        ctx.font = 'bold 14px sans-serif';
+                                        ctx.font = 'bold 12px sans-serif';
                                         ctx.textAlign = 'center';
-                                        ctx.fillText('📷 Cam Standby', pipX + pipW * 0.5, pipY + pipH * 0.5 + 4);
+                                        ctx.fillText('📷 Cam Standby', camX + camW * 0.5, camY + camH * 0.5 + 4);
                                     }}
                                 }}
 
-                                // Function to draw Dynamic Overlay Layer (.webm Transparan VP8/VP9)
-                                function renderDynamicOverlay() {{
-                                    if (dualActiveOverlayVid && dualIsOverlayPlaying && dualActiveOverlayVid.readyState >= 2) {{
-                                        ctx.drawImage(dualActiveOverlayVid, 0, 0, 720, 1280);
-                                    }}
-                                }}
+                                // Draw Side-by-Side Elements (Left: Overlay, Right: Webcam)
+                                renderDynamicOverlayBox();
+                                renderWebcamBox();
 
-                                // Dynamic Z-Index Compositing between Webcam and Dynamic Overlay:
-                                if (dualOverlayLayerPos === 'below_webcam') {{
-                                    renderDynamicOverlay();
-                                    renderWebcamBox();
-                                }} else {{
-                                    // Default: 'above_webcam' (menyatu secara organik di seluruh layar)
-                                    renderWebcamBox();
-                                    renderDynamicOverlay();
-                                }}
-
-                                // 3. Dynamic Watermark Badge at Top-Left (x=24, y=24)
+                                // 4. Dynamic Watermark Badge at Top-Left (x=24, y=24)
                                 ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
                                 ctx.beginPath();
                                 ctx.roundRect(24, 24, 210, 34, 6);
@@ -3983,11 +4030,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 ctx.textAlign = 'left';
                                 ctx.fillText(dualCurrentSlot === 1 ? '🐱 STANDBY (SLOT 1)' : '🎁 REAKSI (SLOT ' + dualCurrentSlot + ')', 34, 46);
 
-                                // 4. Toast Notification right above Webcam (x=30, y=760)
+                                // 5. Toast Notification right above Side-by-Side Boxes (x=30, y=960)
                                 if (dualActiveToast) {{
                                     ctx.fillStyle = 'rgba(15, 15, 24, 0.92)';
                                     ctx.beginPath();
-                                    ctx.roundRect(30, 760, 660, 52, 8);
+                                    ctx.roundRect(30, 960, 660, 52, 8);
                                     ctx.fill();
                                     ctx.strokeStyle = '#fe2c55';
                                     ctx.lineWidth = 2;
@@ -3995,7 +4042,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                     ctx.fillStyle = '#25f4ee';
                                     ctx.font = 'bold 16px sans-serif';
                                     ctx.textAlign = 'center';
-                                    ctx.fillText(dualActiveToast, 360, 792);
+                                    ctx.fillText(dualActiveToast, 360, 992);
                                 }}
                             }}
 
@@ -4091,8 +4138,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 const constraints = {{
                                     video: {{
                                         ...(camId ? {{ deviceId: {{ exact: camId }} }} : {{ facingMode: 'user' }}),
-                                        width: {{ ideal: 480, max: 480 }},
-                                        height: {{ ideal: 480, max: 480 }},
+                                        width: {{ ideal: 320, max: 480 }},
+                                        height: {{ ideal: 320, max: 480 }},
                                         frameRate: {{ ideal: 24, max: 24 }}
                                     }},
                                     audio: micId ? {{ deviceId: {{ exact: micId }} }} : true
@@ -4497,10 +4544,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px;">
                                 <div>
                                     <h3 style="margin: 0; color: #25f4ee; font-size: 18px; display: flex; align-items: center; gap: 8px;">
-                                        <span>🎥</span> Dual-Screen Live Studio (Full-Screen + PiP Host)
+                                        <span>🎥</span> Dual-Screen Live Studio (Full-Screen + Side-by-Side 200x200)
                                     </h3>
                                     <p style="color: #a1a1aa; font-size: 13px; margin: 4px 0 0 0;">
-                                        Video utama Full-Screen 9:16 (720x1280) dengan floating webcam Picture-in-Picture (400x400 di bawah tengah). Pipeline 24 FPS ringan & hemat sumber daya perangkat.
+                                        Video utama Full-Screen 9:16 (720x1280) dengan komposisi Side-by-Side 200x200 di area bawah (Kiri: Dynamic Overlay, Kanan: Webcam Host). Pipeline 24 FPS ringan & hemat sumber daya perangkat.
                                     </p>
                                 </div>
                                 <div style="display: flex; gap: 8px; align-items: center;">
@@ -5600,9 +5647,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 except Exception:
                     pos_x = 60
                 try:
-                    pos_y = int(parsed.get('pos_y', [120])[0])
+                    pos_y = int(parsed.get('pos_y', [150])[0])
                 except Exception:
-                    pos_y = 120
+                    pos_y = 150
                     
                 cfg = load_character_config()
                 cfg['overlay_enabled'] = overlay_enabled
