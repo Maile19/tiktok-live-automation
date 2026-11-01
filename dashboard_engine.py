@@ -3354,7 +3354,7 @@ body {{ margin:0; background:var(--bg-main); color:#fff; font-family:-apple-syst
 .toast.show {{ opacity:1; }}
 
 /* Persistent Media Engine offscreen */
-#persistent-media-engine {{ position:fixed; top:-9999px; left:-9999px; width:1px; height:1px; opacity:0.01; pointer-events:none; z-index:-1; }}
+#persistent-media-engine {{ position:fixed; top:0; left:-9999px; width:720px; height:1280px; opacity:0.001; pointer-events:none; z-index:-999; }}
 
 @media (max-width: 768px) {{
     .sidebar {{ display:none; }}
@@ -4309,7 +4309,12 @@ let compositorConfig = {compositor_cfg_json};
                             const btn = document.getElementById('btnToggleMonitorOutput');
 
                             if (isMonitorOutputVisible) {{
-                                if (stage) stage.style.display = 'block';
+                                if (stage) {{
+                                    stage.style.position = 'relative';
+                                    stage.style.left = '0';
+                                    stage.style.top = '0';
+                                    stage.style.display = 'block';
+                                }}
                                 if (placeholder) placeholder.style.display = 'none';
                                 if (btn) {{
                                     btn.innerHTML = '<span>🙈</span> <span>Sembunyikan Monitor Output</span>';
@@ -4325,7 +4330,12 @@ let compositorConfig = {compositor_cfg_json};
                                 }}
                                 startRenderLoop();
                             }} else {{
-                                if (stage) stage.style.display = 'none';
+                                if (stage) {{
+                                    stage.style.position = 'absolute';
+                                    stage.style.left = '-9999px';
+                                    stage.style.top = '-9999px';
+                                    stage.style.display = 'block';
+                                }}
                                 if (placeholder) placeholder.style.display = 'flex';
                                 if (btn) {{
                                     btn.innerHTML = '<span>👁️</span> <span>Tampilkan Monitor Output</span>';
@@ -4350,11 +4360,10 @@ let compositorConfig = {compositor_cfg_json};
                                     vid = document.createElement('video');
                                     vid.id = 'dualSlotVideo_' + s;
                                     vid.playsInline = true;
-                                    vid.muted = true;
+                                    vid.muted = false;
                                     vid.preload = 'auto';
                                     vid.crossOrigin = 'anonymous';
                                     vid.src = '/video-stream?name=video_' + s + '.mp4';
-                                    vid.style.display = 'none';
                                     const container = document.getElementById('persistent-media-engine') || document.body;
                                     container.appendChild(vid);
                                 }}
@@ -4362,6 +4371,7 @@ let compositorConfig = {compositor_cfg_json};
                                 vid.preload = 'auto';
                                 vid.playsInline = true;
                                 vid.crossOrigin = 'anonymous';
+                                vid.muted = false;
 
                                 // Pre-warm first frame into decoder memory
                                 vid.addEventListener('loadeddata', () => {{
@@ -4526,11 +4536,19 @@ let compositorConfig = {compositor_cfg_json};
                             const prevSlot = dualCurrentSlot;
                             dualCurrentSlot = slot;
 
-                            // Batalkan timer rewind untuk slot ini jika ada yang masih pending
+                            // 1. Batalkan semua timer rewind yang masih pending di awal fungsi
                             window.slotRewindTimers = window.slotRewindTimers || {{}};
                             if (window.slotRewindTimers[slot]) {{
                                 clearTimeout(window.slotRewindTimers[slot]);
                                 window.slotRewindTimers[slot] = null;
+                            }}
+                            if (slot === 1) {{
+                                for (let s in window.slotRewindTimers) {{
+                                    if (window.slotRewindTimers[s]) {{
+                                        clearTimeout(window.slotRewindTimers[s]);
+                                        window.slotRewindTimers[s] = null;
+                                    }}
+                                }}
                             }}
 
                             const badge = document.getElementById('dualCurrentSlotBadge');
@@ -4548,8 +4566,14 @@ let compositorConfig = {compositor_cfg_json};
                             const targetVid = slotVideoPool[slot];
                             if (!targetVid) return;
 
-                            // 1. Instant Audio Gain Switching via Web Audio API (0ms gap, zero click/pop)
+                            // 2. Pastikan targetVid unmuted agar Web Audio MediaElementSource menerima sinyal audio
+                            targetVid.muted = false;
+
+                            // 3. Instant Audio Gain Switching via Web Audio API (0ms gap, zero click/pop)
                             if (dualAudioCtx) {{
+                                if (dualAudioCtx.state === 'suspended') {{
+                                    dualAudioCtx.resume();
+                                }}
                                 const curTime = dualAudioCtx.currentTime;
                                 for (let s = 1; s <= 6; s++) {{
                                     if (slotAudioGains[s]) {{
@@ -4560,18 +4584,21 @@ let compositorConfig = {compositor_cfg_json};
                                 }}
                             }}
 
-                            // 2. Instant Video Pointer Switching (Cut-to-Cut in 1 frame)
+                            // 4. Instant Video Pointer Switching (Cut-to-Cut in 1 frame)
                             window.activeSlotVideo = targetVid;
 
-                            // 3. Pause previous video if different (Slot 1 hanya di-pause tanpa reset currentTime)
+                            // 5. Pause previous video if different (Slot 1 hanya di-pause tanpa reset currentTime)
                             if (prevSlot !== slot && slotVideoPool[prevSlot]) {{
                                 try {{
                                     slotVideoPool[prevSlot].pause();
                                 }} catch(e) {{}}
                             }}
 
-                            // 4. Seek target video
+                            // 6. Seek & Load target video
                             if (slot !== 1) {{
+                                if (targetVid.readyState === 0) {{
+                                    try {{ targetVid.load(); }} catch(e) {{}}
+                                }}
                                 if (prevSlot === slot) {{
                                     // Pemutaran slot yang sama secara beruntun: langsung rewind ke awal dan putar ulang
                                     try {{
@@ -5039,15 +5066,28 @@ let compositorConfig = {compositor_cfg_json};
 
                                 const constraints = {{
                                     video: {{
-                                        ...(camId ? {{ deviceId: {{ exact: camId }} }} : {{ facingMode: 'user' }}),
-                                        width: {{ ideal: 240, max: 320 }},
-                                        height: {{ ideal: 240, max: 320 }},
+                                        ...(camId && camId !== '' ? {{ deviceId: {{ ideal: camId }} }} : {{ facingMode: 'user' }}),
+                                        width: {{ ideal: 320, max: 480 }},
+                                        height: {{ ideal: 240, max: 360 }},
                                         frameRate: {{ ideal: 24, max: 24 }}
                                     }},
-                                    audio: micId ? {{ deviceId: {{ exact: micId }} }} : true
+                                    audio: micId && micId !== '' ? {{ deviceId: {{ ideal: micId }} }} : true
                                 }};
 
-                                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                                let stream;
+                                try {{
+                                    stream = await navigator.mediaDevices.getUserMedia(constraints);
+                                }} catch (camErr) {{
+                                    console.warn('[MediaEngine] Preferred constraints failed, falling back to permissive mode:', camErr);
+                                    try {{
+                                        stream = await navigator.mediaDevices.getUserMedia({{
+                                            video: {{ facingMode: 'user' }},
+                                            audio: true
+                                        }});
+                                    }} catch (fallbackErr) {{
+                                        stream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: true }});
+                                    }}
+                                }}
                                 dualMediaStream = stream;
 
                                 stream.getTracks().forEach(track => {{
@@ -5200,15 +5240,19 @@ let compositorConfig = {compositor_cfg_json};
                             }}
                         }}
 
-                        function switchCameraDevice() {{
+                        async function switchCameraDevice() {{
                             if (dualMediaStream) {{
-                                toggleCamera().then(() => toggleCamera());
+                                await toggleCamera();
+                                await new Promise(r => setTimeout(r, 400));
+                                await toggleCamera();
                             }}
                         }}
 
-                        function switchMicDevice() {{
+                        async function switchMicDevice() {{
                             if (dualMediaStream) {{
-                                toggleCamera().then(() => toggleCamera());
+                                await toggleCamera();
+                                await new Promise(r => setTimeout(r, 400));
+                                await toggleCamera();
                             }}
                         }}
 
@@ -5389,6 +5433,17 @@ let compositorConfig = {compositor_cfg_json};
                             // Destroy all slot previews immediately to free hardware decoders
                             destroyAllSlotPreviews();
 
+                            // 0. User-Gesture Audio/Video Pipeline Unlock (Instant Resume/Play)
+                            initSlotVideoPool();
+                            if (dualAudioCtx && dualAudioCtx.state === 'suspended') {{
+                                dualAudioCtx.resume();
+                            }}
+                            const s1 = slotVideoPool[1];
+                            if (s1 && s1.paused) {{
+                                s1.play().catch(e => console.warn('[StartLive] User-gesture unlock Slot 1:', e));
+                            }}
+                            startRenderLoop();
+
                             const btn = document.getElementById('btnMainStartLive');
                             const origText = btn ? btn.innerHTML : '🚀 Start Live (Dual-Screen TikTok)';
                             if (btn) {{
@@ -5410,7 +5465,12 @@ let compositorConfig = {compositor_cfg_json};
                                 const stage = document.getElementById('dualPreviewStage');
                                 const placeholder = document.getElementById('dualPreviewPlaceholder');
                                 if (!isMonitorOutputVisible) {{
-                                    if (stage) stage.style.display = 'none';
+                                    if (stage) {{
+                                        stage.style.position = 'absolute';
+                                        stage.style.left = '-9999px';
+                                        stage.style.top = '-9999px';
+                                        stage.style.display = 'block';
+                                    }}
                                     if (placeholder) placeholder.style.display = 'flex';
                                 }}
 
@@ -5531,6 +5591,7 @@ let compositorConfig = {compositor_cfg_json};
                             if (camVid) camVid.srcObject = null;
                             isDualScreenActive = false;
 
+                            await new Promise(r => setTimeout(r, 400));
                             await toggleCamera();
                             showToast('📷 Kamera terhubung kembali');
                         }}
@@ -5659,15 +5720,15 @@ let compositorConfig = {compositor_cfg_json};
 <body>
 
 <!-- Persistent Media Engine (Pre-loaded Video Pool for 0ms Cut-to-Cut Switching) -->
-<div id="persistent-media-engine">
-    <video id="dualCatVideo" playsinline loop muted crossorigin="anonymous" style="display:none;"></video>
-    <video id="dualSlotVideo_1" playsinline loop muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_1.mp4" style="display:none;"></video>
-    <video id="dualSlotVideo_2" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_2.mp4" style="display:none;"></video>
-    <video id="dualSlotVideo_3" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_3.mp4" style="display:none;"></video>
-    <video id="dualSlotVideo_4" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_4.mp4" style="display:none;"></video>
-    <video id="dualSlotVideo_5" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_5.mp4" style="display:none;"></video>
-    <video id="dualSlotVideo_6" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_6.mp4" style="display:none;"></video>
-    <video id="dualCamVideo" playsinline autoplay muted></video>
+<div id="persistent-media-engine" style="position:fixed; top:0; left:-9999px; width:720px; height:1280px; opacity:0.001; pointer-events:none; z-index:-999;">
+    <video id="dualCatVideo" playsinline loop crossorigin="anonymous" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_1" playsinline loop preload="auto" crossorigin="anonymous" src="/video-stream?name=video_1.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_2" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_2.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_3" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_3.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_4" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_4.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_5" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_5.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_6" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_6.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualCamVideo" playsinline autoplay style="width:320px; height:240px;"></video>
 </div>
 
 <!-- Sticky Top Bar -->
@@ -5743,8 +5804,8 @@ let compositorConfig = {compositor_cfg_json};
                             </button>
                         </div>
 
-                        <!-- Live Preview Stage (9:16 Ratio) - Hidden by default -->
-                        <div id="dualPreviewStage" style="display: none; width: 300px; height: 533px; background: #000; border-radius: 16px; border: 2px solid #27272a; position: relative; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.8), 0 0 20px rgba(37,244,238,0.15);">
+                        <!-- Live Preview Stage (9:16 Ratio) - Hidden by default (Offscreen layout to prevent stream throttle) -->
+                        <div id="dualPreviewStage" style="position: absolute; left: -9999px; top: -9999px; width: 300px; height: 533px; background: #000; border-radius: 16px; border: 2px solid #27272a; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.8), 0 0 20px rgba(37,244,238,0.15); display: block;">
                             <canvas id="dualCompositeCanvas" width="720" height="1280" style="width: 100%; height: 100%; object-fit: cover; display: block;"></canvas>
                             
                             <div style="position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; align-items: center; pointer-events: none;">
