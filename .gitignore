@@ -8,6 +8,10 @@ dist/
 *.bak*
 *.audit_backup
 *.orig
+*.orig.mp4
+backup_videos_orig/
+/tmp/*
+tmp/
 *.swp
 *~
 __pycache__/

@@ -4001,7 +4001,7 @@ let compositorConfig = {compositor_cfg_json};
                                         btn.style.borderColor = '';
                                     }}, 2500);
                                 }}
-                                if (typeof queueDualScreenSlot === 'function') queueDualScreenSlot(1, 'Standby Loop', '');
+                                if (typeof queueDualScreenSlot === 'function') queueDualScreenSlot(1, '', '');
                                 showSimStatus('Antrean dikosongkan. Kembali ke Standby Loop (Slot 1).', true, false);
                                 if (typeof syncListenerStatus === 'function') syncListenerStatus();
                             }})
@@ -4381,9 +4381,9 @@ let compositorConfig = {compositor_cfg_json};
 
                                 // Pre-warm first frame into decoder memory
                                 vid.addEventListener('loadeddata', () => {{
-                                    console.log('[VideoPool] Slot ' + s + ' pre-warmed & ready in decoder memory (dur: ' + (vid.duration ? vid.duration.toFixed(2) : 0) + 's)');
+                                    console.log('[VideoPool] Slot ' + s + ' pre-warmed & ready in decoder memory (dur: ' + (vid.duration ? vid.duration.toFixed(2) : 0) + 's, readyState: ' + vid.readyState + ')');
                                     try {{
-                                        vid.currentTime = 0;
+                                        if (s !== 1) vid.currentTime = 0;
                                     }} catch(e) {{}}
                                 }}, {{ once: true }});
 
@@ -4464,7 +4464,7 @@ let compositorConfig = {compositor_cfg_json};
                                 dualGiftQueue = [];
                                 dualIsReactionPlaying = false;
                                 if (dualReactionTimer) clearTimeout(dualReactionTimer);
-                                playSlotImmediate(1, 'Standby Loop');
+                                playSlotImmediate(1, '');
                                 return;
                             }}
                             dualGiftQueue.push({{
@@ -4472,7 +4472,11 @@ let compositorConfig = {compositor_cfg_json};
                                 giftName: giftName || ('Gift Slot ' + slot),
                                 sender: sender || 'Penonton'
                             }});
-                            showCanvasToast('🎁 Gift: ' + (giftName || 'Slot ' + slot) + (sender ? ' (@' + sender + ')' : ''));
+                            showCanvasToast({{
+                                icon: '🎁',
+                                giftName: giftName || ('Slot ' + slot),
+                                sender: sender ? ('@' + sender.replace(/^@/, '')) : ''
+                            }});
                             processDualScreenQueue();
                         }}
 
@@ -4486,7 +4490,7 @@ let compositorConfig = {compositor_cfg_json};
                             }} else {{
                                 dualIsReactionPlaying = false;
                                 if (dualCurrentSlot !== 1) {{
-                                    playSlotImmediate(1, 'Standby Loop');
+                                    playSlotImmediate(1, '');
                                 }}
                             }}
                         }}
@@ -4499,7 +4503,7 @@ let compositorConfig = {compositor_cfg_json};
 
                             const badge = document.getElementById('dualCurrentSlotBadge');
                             if (badge) {{
-                                badge.innerText = (slot === 1 ? '🐱 Slot 1 (Standby)' : '🎁 Slot ' + slot + ' (' + (giftName || 'Reaksi') + ')');
+                                badge.innerText = (slot === 1 ? '🐱 Slot 1' : '🎁 Slot ' + slot + ' (' + (giftName || 'Reaksi') + ')');
                                 badge.style.color = (slot === 1 ? '#34c759' : '#ffb800');
                                 badge.style.borderColor = (slot === 1 ? '#34c759' : '#ffb800');
                             }}
@@ -4534,12 +4538,15 @@ let compositorConfig = {compositor_cfg_json};
                                 }} catch(e) {{}}
                             }}
 
-                            // 4. Reset currentTime HANYA untuk video reaksi (slot !== 1).
-                            // Untuk Slot 1 (video utama), langsung lanjutkan pemutaran (resume) tanpa reset/seek.
+                            // 4. Seek target video hanya jika diperlukan.
+                            // Jika slot !== 1 dan targetVid.currentTime >= 0.1, reset ke 0.
+                            // Jika targetVid.currentTime < 0.1 (sudah di awal / pre-warmed), JANGAN panggil currentTime = 0 lagi untuk menghindari seek re-sync yang menurunkan readyState.
                             if (slot !== 1) {{
-                                try {{
-                                    targetVid.currentTime = 0;
-                                }} catch(e) {{}}
+                                if (targetVid.currentTime >= 0.1) {{
+                                    try {{
+                                        targetVid.currentTime = 0;
+                                    }} catch(e) {{}}
+                                }}
                             }}
 
                             targetVid.play().catch(e => {{
@@ -4553,13 +4560,22 @@ let compositorConfig = {compositor_cfg_json};
                                         clearTimeout(dualReactionTimer);
                                         dualReactionTimer = null;
                                     }}
-                                    // Reset reaction video in background for instant re-trigger
-                                    try {{
-                                        targetVid.pause();
-                                        targetVid.currentTime = 0;
-                                    }} catch(e) {{}}
+                                    // 1. Langsung alihkan pointer ke Slot 1 dan play() seketika di baris teratas (Zero Transition Delay)
+                                    if (slotVideoPool[1]) {{
+                                        window.activeSlotVideo = slotVideoPool[1];
+                                        try {{ slotVideoPool[1].play().catch(() => {{}}); }} catch(e) {{}}
+                                    }}
                                     dualIsReactionPlaying = false;
                                     processDualScreenQueue();
+
+                                    // 2. Tunda proses rewind video reaksi yang baru selesai di latar belakang (80ms)
+                                    // agar proses seek ke 00:00 terjadi setelah layar 100% berpindah kembali ke Slot 1
+                                    setTimeout(() => {{
+                                        try {{
+                                            targetVid.pause();
+                                            targetVid.currentTime = 0;
+                                        }} catch(e) {{}}
+                                    }}, 80);
                                 }}
                             }};
 
@@ -4570,8 +4586,18 @@ let compositorConfig = {compositor_cfg_json};
                                         clearTimeout(dualReactionTimer);
                                         dualReactionTimer = null;
                                     }}
+                                    if (slotVideoPool[1]) {{
+                                        window.activeSlotVideo = slotVideoPool[1];
+                                        try {{ slotVideoPool[1].play().catch(() => {{}}); }} catch(e) {{}}
+                                    }}
                                     dualIsReactionPlaying = false;
                                     processDualScreenQueue();
+                                    setTimeout(() => {{
+                                        try {{
+                                            targetVid.pause();
+                                            targetVid.currentTime = 0;
+                                        }} catch(e) {{}}
+                                    }}, 80);
                                 }}
                             }};
 
@@ -4581,8 +4607,18 @@ let compositorConfig = {compositor_cfg_json};
                                 dualReactionTimer = setTimeout(() => {{
                                     if (dualIsReactionPlaying && dualCurrentSlot === slot) {{
                                         console.log('[DualScreen] Safety timer auto-advance for slot ' + slot);
+                                        if (slotVideoPool[1]) {{
+                                            window.activeSlotVideo = slotVideoPool[1];
+                                            try {{ slotVideoPool[1].play().catch(() => {{}}); }} catch(e) {{}}
+                                        }}
                                         dualIsReactionPlaying = false;
                                         processDualScreenQueue();
+                                        setTimeout(() => {{
+                                            try {{
+                                                targetVid.pause();
+                                                targetVid.currentTime = 0;
+                                            }} catch(e) {{}}
+                                        }}, 80);
                                     }}
                                 }}, (dur + 0.5) * 1000);
                             }}
@@ -4639,27 +4675,22 @@ let compositorConfig = {compositor_cfg_json};
                             // High-quality bicubic image smoothing for maximum crispness
                             ctx.imageSmoothingEnabled = true;
                             ctx.imageSmoothingQuality = 'high';
+                            let _canvasInitialized = false;
 
                             function draw() {{
-                                // Base dark background
-                                ctx.fillStyle = '#0a0a0f';
-                                ctx.fillRect(0, 0, 720, 1280);
-
-                                // 1. Full-Screen Video (720x1280) Cut-to-Cut via activeSlotVideo pointer
-                                const catVid = window.activeSlotVideo || (typeof slotVideoPool !== 'undefined' && slotVideoPool[dualCurrentSlot]) || (typeof slotVideoPool !== 'undefined' && slotVideoPool[1]) || document.getElementById('dualCatVideo');
-                                if (catVid && catVid.readyState >= 2) {{
-                                    const vW = catVid.videoWidth || 720;
-                                    const vH = catVid.videoHeight || 1280;
-
+                                function renderMainVideoFrame(vElem) {{
+                                    if (!vElem || vElem.readyState < 2) return false;
+                                    const vW = vElem.videoWidth || 720;
+                                    const vH = vElem.videoHeight || 1280;
                                     if (vW === 720 && vH === 1280) {{
-                                        ctx.drawImage(catVid, 0, 0, 720, 1280);
+                                        ctx.drawImage(vElem, 0, 0, 720, 1280);
                                     }} else if (dualCatFitMode === 'fit') {{
                                         const fitScale = Math.min(720 / vW, 1280 / vH);
                                         const drawW = vW * fitScale;
                                         const drawH = vH * fitScale;
                                         const drawX = (720 - drawW) * 0.5;
                                         const drawY = (1280 - drawH) * 0.5;
-                                        ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
+                                        ctx.drawImage(vElem, drawX, drawY, drawW, drawH);
                                     }} else {{
                                         const fillScale = Math.max(720 / vW, 1280 / vH);
                                         const drawW = vW * fillScale;
@@ -4670,16 +4701,24 @@ let compositorConfig = {compositor_cfg_json};
                                         ctx.beginPath();
                                         ctx.rect(0, 0, 720, 1280);
                                         ctx.clip();
-                                        ctx.drawImage(catVid, drawX, drawY, drawW, drawH);
+                                        ctx.drawImage(vElem, drawX, drawY, drawW, drawH);
                                         ctx.restore();
                                     }}
-                                }} else {{
-                                    ctx.fillStyle = '#121218';
+                                    return true;
+                                }}
+
+                                // 1. Full-Screen Video (720x1280) Cut-to-Cut via activeSlotVideo pointer
+                                // Frame Persistence & Zero Black Blink: Jika targetVid sedang transisi (readyState < 2),
+                                // otomatis fallback ke Slot 1 atau pertahankan frame kanvas sebelumnya tanpa ditimpa kotak hitam
+                                const catVid = window.activeSlotVideo || (typeof slotVideoPool !== 'undefined' && slotVideoPool[dualCurrentSlot]) || (typeof slotVideoPool !== 'undefined' && slotVideoPool[1]) || document.getElementById('dualCatVideo');
+                                let frameDrawn = renderMainVideoFrame(catVid);
+                                if (!frameDrawn && slotVideoPool[1] && slotVideoPool[1] !== catVid) {{
+                                    frameDrawn = renderMainVideoFrame(slotVideoPool[1]);
+                                }}
+                                if (!frameDrawn && !_canvasInitialized) {{
+                                    ctx.fillStyle = '#0a0a0f';
                                     ctx.fillRect(0, 0, 720, 1280);
-                                    ctx.fillStyle = '#71717a';
-                                    ctx.font = 'bold 22px sans-serif';
-                                    ctx.textAlign = 'center';
-                                    ctx.fillText('🐱 Video Standby / Reaksi', 360, 640);
+                                    _canvasInitialized = true;
                                 }}
 
                                 // 2. TikTok Character Guide Overlay (Dynamic via compositorConfig)
@@ -4762,44 +4801,95 @@ let compositorConfig = {compositor_cfg_json};
                                     renderDynamicOverlay();
                                 }}
 
-                                // 4. Dynamic Watermark Badge at Top-Left (x=24, y=24)
-                                ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
-                                ctx.beginPath();
-                                ctx.roundRect(24, 24, 210, 34, 6);
-                                ctx.fill();
-                                ctx.fillStyle = (dualCurrentSlot === 1 ? '#34c759' : '#fe2c55');
-                                ctx.font = 'bold 13px sans-serif';
-                                ctx.textAlign = 'left';
-                                ctx.fillText(dualCurrentSlot === 1 ? '🐱 STANDBY (SLOT 1)' : '🎁 REAKSI (SLOT ' + dualCurrentSlot + ')', 34, 46);
-
-                                // 5. Toast Notification / Gift Banner at Center-Top (x=30, y=400)
+                                // 4. Compact 100px Rounded Chat Bubble at Left Side Above TikTok Comments (Safe-Zone: bx=80, y=710)
+                                // Background Transparan 10% (rgba(0,0,0,0.10)) + Border Tipis (rgba(255,255,255,0.20))
                                 if (dualActiveToast) {{
                                     ctx.save();
-                                    ctx.fillStyle = 'rgba(15, 15, 24, 0.94)';
+                                    // Geser ke safe zone kiri (sejajar dengan margin TikTok guide overlay x=76-80)
+                                    const bx = 80;
+                                    const by = 710;
+                                    const bw = 100;
+                                    const bh = 84;
+                                    const r = 16;
+
+                                    // Path Balon Chat dengan ekor kecil di kiri bawah (tetap di dalam batas >= bx)
                                     ctx.beginPath();
-                                    if (ctx.roundRect) {{
-                                        ctx.roundRect(30, 400, 660, 54, 10);
-                                    }} else {{
-                                        ctx.rect(30, 400, 660, 54);
-                                    }}
+                                    ctx.moveTo(bx + r, by);
+                                    ctx.lineTo(bx + bw - r, by);
+                                    ctx.quadraticCurveTo(bx + bw, by, bx + bw, by + r);
+                                    ctx.lineTo(bx + bw, by + bh - r);
+                                    ctx.quadraticCurveTo(bx + bw, by + bh, bx + bw - r, by + bh);
+                                    // Ekor balon mengarah ke kiri bawah tanpa melewati batas kiri bx (bx + 16 > bx)
+                                    ctx.lineTo(bx + 40, by + bh);
+                                    ctx.lineTo(bx + 16, by + bh + 12);
+                                    ctx.lineTo(bx + 26, by + bh);
+                                    ctx.lineTo(bx + r, by + bh);
+                                    ctx.quadraticCurveTo(bx, by + bh, bx, by + bh - r);
+                                    ctx.lineTo(bx, by + r);
+                                    ctx.quadraticCurveTo(bx, by, bx + r, by);
+                                    ctx.closePath();
+
+                                    // Background Transparan 10%
+                                    ctx.fillStyle = 'rgba(0, 0, 0, 0.10)';
                                     ctx.fill();
-                                    ctx.strokeStyle = '#fe2c55';
-                                    ctx.lineWidth = 2;
+
+                                    // Border tipis 20%
+                                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.20)';
+                                    ctx.lineWidth = 1;
                                     ctx.stroke();
 
-                                    // Inner neon highlight line
-                                    if (ctx.roundRect) {{
-                                        ctx.beginPath();
-                                        ctx.roundRect(33, 403, 654, 48, 8);
-                                        ctx.strokeStyle = 'rgba(37, 244, 238, 0.45)';
-                                        ctx.lineWidth = 1;
-                                        ctx.stroke();
+                                    // Kunci render teks di dalam balon (Anti-Overflow Clip)
+                                    ctx.save();
+                                    ctx.clip();
+
+                                    // Ekstraksi data gift / toast
+                                    let gIcon = '🎁';
+                                    let gName = 'Gift';
+                                    let gSender = '';
+
+                                    if (typeof dualActiveToast === 'object' && dualActiveToast !== null) {{
+                                        gIcon = dualActiveToast.icon || '🎁';
+                                        gName = dualActiveToast.giftName || dualActiveToast.name || dualActiveToast.text || 'Gift';
+                                        gSender = dualActiveToast.sender || '';
+                                    }} else if (typeof dualActiveToast === 'string') {{
+                                        const s = dualActiveToast.trim();
+                                        if (s.includes('(@')) {{
+                                            const parts = s.split('(@');
+                                            gName = parts[0].replace(/^[^\\w\\s]*\\s*(Gift:\\s*)?/i, '').trim();
+                                            gSender = '@' + parts[1].replace(/\\)$/, '').trim();
+                                        }} else {{
+                                            gName = s.replace(/^[^\\w\\s]*\\s*(Gift:\\s*)?/i, '').trim();
+                                        }}
                                     }}
 
-                                    ctx.fillStyle = '#25f4ee';
-                                    ctx.font = 'bold 16px sans-serif';
+                                    if (gName.length > 10) gName = gName.slice(0, 9) + '..';
+                                    if (gSender.length > 11) gSender = gSender.slice(0, 10) + '..';
+
+                                    const centerX = bx + (bw / 2);
+                                    const maxTxtW = bw - 12;
+
+                                    // Text styling dengan shadow halus agar kontras dan terbaca di atas video
+                                    ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+                                    ctx.shadowBlur = 4;
                                     ctx.textAlign = 'center';
-                                    ctx.fillText(dualActiveToast, 360, 434);
+
+                                    // Baris 1: Ikon Gift
+                                    ctx.fillStyle = '#ffffff';
+                                    ctx.font = '22px sans-serif';
+                                    ctx.fillText(gIcon, centerX, by + 28, maxTxtW);
+
+                                    // Baris 2: Nama Gift
+                                    ctx.fillStyle = '#ffffff';
+                                    ctx.font = 'bold 11px sans-serif';
+                                    ctx.fillText(gName, centerX, by + 48, maxTxtW);
+
+                                    // Baris 3: Username Pengirim
+                                    if (gSender) {{
+                                        ctx.fillStyle = '#25f4ee';
+                                        ctx.font = '10px sans-serif';
+                                        ctx.fillText(gSender, centerX, by + 66, maxTxtW);
+                                    }}
+                                    ctx.restore();
                                     ctx.restore();
                                 }}
                             }}
