@@ -3888,84 +3888,67 @@ let compositorConfig = {compositor_cfg_json};
                             el.innerHTML = (isQueue ? '📥 ' : (isSuccess ? '🟢 ' : '⚠️ ')) + msg;
                         }}
 
-                        let isSimulatingGift = false;
                         function simulateGift(e, slot) {{
                             if (e) {{
                                 if (e.preventDefault) e.preventDefault();
                                 if (e.stopPropagation) e.stopPropagation();
                             }}
-                            if (isSimulatingGift) {{
-                                console.log('[SimulateGift] Request sedang berjalan, cegah double trigger.');
+                            if (!slot || slot < 2 || slot > 6) return;
+
+                            if (dualGiftQueue && dualGiftQueue.length >= 50) {{
+                                showSimStatus('Antrean penuh (maksimal 50 gift)', false, true);
                                 return;
                             }}
-                            isSimulatingGift = true;
-                            console.log('[SimulateGift] Tombol Slot ' + slot + ' diklik.');
 
-                            const btn = (e && (e.currentTarget || e.target)) ? (e.currentTarget || e.target) : document.getElementById('btn-sim-slot-' + slot);
-                            const origHtml = btn ? btn.innerHTML : ('Slot ' + slot);
-                            
-                            if (btn) {{
-                                btn.disabled = true;
-                                btn.innerHTML = '<span>⏳</span> Mengirim...';
+                            if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
+                                startRenderLoop();
                             }}
 
-                            fetch('/simulate-gift?slot=' + slot, {{
+                            const btn = (e && (e.currentTarget || e.target)) ? (e.currentTarget || e.target) : document.getElementById('btn-sim-slot-' + slot);
+                            let giftLabel = 'Slot ' + slot;
+                            if (btn) {{
+                                const text = btn.innerText || btn.textContent || '';
+                                if (text.indexOf('(') !== -1 && text.lastIndexOf(')') !== -1) {{
+                                    const sub = text.substring(text.indexOf('(') + 1, text.lastIndexOf(')'));
+                                    if (sub) giftLabel = sub;
+                                }}
+                                const origBorder = btn.style.borderColor;
+                                btn.style.borderColor = '#ffb800';
+                                btn.style.transform = 'scale(0.96)';
+                                setTimeout(() => {{
+                                    btn.style.transform = '';
+                                    btn.style.borderColor = origBorder;
+                                }}, 180);
+                            }}
+
+                            const localEventId = 'sim_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+                            recentlyLocalQueuedEventIds.add(localEventId);
+                            if (recentlyLocalQueuedEventIds.size > 200) {{
+                                const arr = Array.from(recentlyLocalQueuedEventIds);
+                                arr.slice(0, 100).forEach(id => recentlyLocalQueuedEventIds.delete(id));
+                            }}
+
+                            // 1. Eksekusi instan non-blocking ke antrean studio lokal
+                            if (typeof queueDualScreenSlot === 'function') {{
+                                queueDualScreenSlot(slot, giftLabel, 'Simulasi');
+                            }}
+
+                            const totalPos = (dualGiftQueue ? dualGiftQueue.length : 0) + (dualIsReactionPlaying ? 1 : 0);
+                            showSimStatus('Gift Slot ' + slot + ' (' + giftLabel + ') masuk antrean! ' + (totalPos > 1 ? '(Antrean #' + totalPos + ')' : '(Sedang Diputar)'), true, totalPos > 1);
+
+                            // 2. Notifikasi asinkron ke backend di latar belakang (fire-and-forget sync)
+                            fetch('/simulate-gift?slot=' + slot + '&local_id=' + encodeURIComponent(localEventId), {{
                                 method: 'POST',
                                 headers: {{ 'Accept': 'application/json' }}
                             }})
-                            .then(r => {{
-                                if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
-                                return r.json();
-                            }})
+                            .then(r => r.json())
                             .then(data => {{
-                                console.log('[SimulateGift] Response dari server:', data);
-                                if (btn) {{
-                                    btn.disabled = false;
-                                    if (data.queued) {{
-                                        btn.innerHTML = '📥 Antrean #' + (data.queue_length || 1);
-                                        btn.style.borderColor = '#ffb800';
-                                    }} else {{
-                                        btn.innerHTML = '🟢 Sedang Diputar';
-                                        btn.style.borderColor = '#34c759';
-                                    }}
-                                    setTimeout(() => {{
-                                        btn.innerHTML = origHtml;
-                                        btn.style.borderColor = '';
-                                    }}, 2500);
+                                if (data && data.id) {{
+                                    recentlyLocalQueuedEventIds.add(data.id);
                                 }}
-
-                                if (data.success) {{
-                                    if (data.id) {{
-                                        recentlyLocalQueuedEventIds.add(data.id);
-                                    }}
-                                    if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
-                                        startRenderLoop();
-                                    }}
-                                    if (typeof queueDualScreenSlot === 'function') {{
-                                        queueDualScreenSlot(slot, data.giftName, 'Simulasi');
-                                    }}
-                                    showSimStatus(data.message || ('Simulasi Slot ' + slot + ' diterima!'), true, data.queued);
-                                }} else {{
-                                    showSimStatus(data.message || 'Gagal memicu simulasi', false, false);
-                                }}
-                                if (typeof syncListenerStatus === 'function') syncListenerStatus();
                             }})
                             .catch(err => {{
-                                console.error('[SimulateGift] Error:', err);
-                                if (btn) {{
-                                    btn.disabled = false;
-                                    btn.innerHTML = '⚠️ Error';
-                                    setTimeout(() => {{
-                                        btn.innerHTML = origHtml;
-                                        btn.style.borderColor = '';
-                                    }}, 2500);
-                                }}
-                                showSimStatus('Gagal request simulasi: ' + err.message, false, false);
-                            }})
-                            .finally(() => {{
-                                setTimeout(() => {{
-                                    isSimulatingGift = false;
-                                }}, 400);
+                                console.warn('[SimulateGift] Background server sync warning:', err);
                             }});
                         }}
 
@@ -4115,6 +4098,7 @@ let compositorConfig = {compositor_cfg_json};
                         let dualActiveToast = null;
                         let dualToastTimeout = null;
                         let dualReactionTimer = null;
+                        window.slotRewindTimers = {{}};
                         let dualCatFitMode = 'fill';
                         let dualCamFitMode = 'fill';
                         let dualTickWorker = null;
@@ -4458,20 +4442,59 @@ let compositorConfig = {compositor_cfg_json};
                             }}, 4500);
                         }}
 
+                        function updateDualQueueUI() {{
+                            const totalInQueue = (dualGiftQueue ? dualGiftQueue.length : 0);
+                            const countEl = document.getElementById('dualQueueCount');
+                            if (countEl) countEl.innerText = totalInQueue;
+                            
+                            const badgeEl = document.getElementById('dualQueueBadge');
+                            if (badgeEl) {{
+                                if (totalInQueue > 0) {{
+                                    badgeEl.style.background = 'rgba(255, 184, 0, 0.18)';
+                                    badgeEl.style.borderColor = '#ffb800';
+                                    badgeEl.style.color = '#ffb800';
+                                }} else {{
+                                    badgeEl.style.background = 'rgba(255, 255, 255, 0.05)';
+                                    badgeEl.style.borderColor = 'rgba(255, 255, 255, 0.15)';
+                                    badgeEl.style.color = '#888';
+                                }}
+                            }}
+                        }}
+
                         function queueDualScreenSlot(slot, giftName, sender) {{
                             if (!slot) return;
                             if (slot === 1) {{
                                 dualGiftQueue = [];
                                 dualIsReactionPlaying = false;
-                                if (dualReactionTimer) clearTimeout(dualReactionTimer);
+                                if (dualReactionTimer) {{
+                                    clearTimeout(dualReactionTimer);
+                                    dualReactionTimer = null;
+                                }}
+                                if (window.slotRewindTimers) {{
+                                    for (let s in window.slotRewindTimers) {{
+                                        if (window.slotRewindTimers[s]) {{
+                                            clearTimeout(window.slotRewindTimers[s]);
+                                            window.slotRewindTimers[s] = null;
+                                        }}
+                                    }}
+                                }}
+                                updateDualQueueUI();
                                 playSlotImmediate(1, '');
                                 return;
                             }}
+
+                            if (dualGiftQueue.length >= 50) {{
+                                console.warn('[DualScreen] Antrean penuh (maks 50), mengabaikan gift.');
+                                return;
+                            }}
+
                             dualGiftQueue.push({{
                                 slot: slot,
                                 giftName: giftName || ('Gift Slot ' + slot),
                                 sender: sender || 'Penonton'
                             }});
+                            updateDualQueueUI();
+
                             showCanvasToast({{
                                 icon: '🎁',
                                 giftName: giftName || ('Slot ' + slot),
@@ -4486,9 +4509,11 @@ let compositorConfig = {compositor_cfg_json};
                             if (dualGiftQueue.length > 0) {{
                                 const nextItem = dualGiftQueue.shift();
                                 dualIsReactionPlaying = true;
+                                updateDualQueueUI();
                                 playSlotImmediate(nextItem.slot, nextItem.giftName);
                             }} else {{
                                 dualIsReactionPlaying = false;
+                                updateDualQueueUI();
                                 if (dualCurrentSlot !== 1) {{
                                     playSlotImmediate(1, '');
                                 }}
@@ -4500,6 +4525,13 @@ let compositorConfig = {compositor_cfg_json};
                             initSlotVideoPool();
                             const prevSlot = dualCurrentSlot;
                             dualCurrentSlot = slot;
+
+                            // Batalkan timer rewind untuk slot ini jika ada yang masih pending
+                            window.slotRewindTimers = window.slotRewindTimers || {{}};
+                            if (window.slotRewindTimers[slot]) {{
+                                clearTimeout(window.slotRewindTimers[slot]);
+                                window.slotRewindTimers[slot] = null;
+                            }}
 
                             const badge = document.getElementById('dualCurrentSlotBadge');
                             if (badge) {{
@@ -4538,11 +4570,14 @@ let compositorConfig = {compositor_cfg_json};
                                 }} catch(e) {{}}
                             }}
 
-                            // 4. Seek target video hanya jika diperlukan.
-                            // Jika slot !== 1 dan targetVid.currentTime >= 0.1, reset ke 0.
-                            // Jika targetVid.currentTime < 0.1 (sudah di awal / pre-warmed), JANGAN panggil currentTime = 0 lagi untuk menghindari seek re-sync yang menurunkan readyState.
+                            // 4. Seek target video
                             if (slot !== 1) {{
-                                if (targetVid.currentTime >= 0.1) {{
+                                if (prevSlot === slot) {{
+                                    // Pemutaran slot yang sama secara beruntun: langsung rewind ke awal dan putar ulang
+                                    try {{
+                                        targetVid.currentTime = 0;
+                                    }} catch(e) {{}}
+                                }} else if (targetVid.currentTime >= 0.1) {{
                                     try {{
                                         targetVid.currentTime = 0;
                                     }} catch(e) {{}}
@@ -4553,28 +4588,39 @@ let compositorConfig = {compositor_cfg_json};
                                 console.warn('[VideoPool] Play warning for slot ' + slot, e);
                             }});
 
-                            // 5. Onended callback: Instantly return pointer to Slot 1 on next frame (0ms gap)
+                            // 5. Onended callback
                             targetVid.onended = function() {{
                                 if (slot !== 1) {{
                                     if (dualReactionTimer) {{
                                         clearTimeout(dualReactionTimer);
                                         dualReactionTimer = null;
                                     }}
-                                    // 1. Langsung alihkan pointer ke Slot 1 dan play() seketika di baris teratas (Zero Transition Delay)
-                                    if (slotVideoPool[1]) {{
-                                        window.activeSlotVideo = slotVideoPool[1];
-                                        try {{ slotVideoPool[1].play().catch(() => {{}}); }} catch(e) {{}}
+                                    if (window.slotRewindTimers && window.slotRewindTimers[slot]) {{
+                                        clearTimeout(window.slotRewindTimers[slot]);
+                                        window.slotRewindTimers[slot] = null;
                                     }}
-                                    dualIsReactionPlaying = false;
-                                    processDualScreenQueue();
 
-                                    // 2. Tunda proses rewind video reaksi yang baru selesai di latar belakang (80ms)
-                                    // agar proses seek ke 00:00 terjadi setelah layar 100% berpindah kembali ke Slot 1
-                                    setTimeout(() => {{
+                                    const hasNext = (dualGiftQueue && dualGiftQueue.length > 0);
+                                    dualIsReactionPlaying = false;
+
+                                    if (hasNext) {{
+                                        // Langsung cut-to-cut ke gift reaksi berikutnya tanpa menyentuh Slot 1
+                                        processDualScreenQueue();
+                                    }} else {{
+                                        // Antrean habis, kembalikan ke Standby Slot 1
+                                        playSlotImmediate(1, '');
+                                    }}
+
+                                    // Tunda rewind video reaksi (80ms).
+                                    // Hanya pause & reset ke 0 jika slot ini TIDAK sedang diputar lagi oleh antrean
+                                    window.slotRewindTimers[slot] = setTimeout(() => {{
                                         try {{
-                                            targetVid.pause();
-                                            targetVid.currentTime = 0;
+                                            if (dualCurrentSlot !== slot) {{
+                                                targetVid.pause();
+                                                targetVid.currentTime = 0;
+                                            }}
                                         }} catch(e) {{}}
+                                        if (window.slotRewindTimers) window.slotRewindTimers[slot] = null;
                                     }}, 80);
                                 }}
                             }};
@@ -4586,17 +4632,28 @@ let compositorConfig = {compositor_cfg_json};
                                         clearTimeout(dualReactionTimer);
                                         dualReactionTimer = null;
                                     }}
-                                    if (slotVideoPool[1]) {{
-                                        window.activeSlotVideo = slotVideoPool[1];
-                                        try {{ slotVideoPool[1].play().catch(() => {{}}); }} catch(e) {{}}
+                                    if (window.slotRewindTimers && window.slotRewindTimers[slot]) {{
+                                        clearTimeout(window.slotRewindTimers[slot]);
+                                        window.slotRewindTimers[slot] = null;
                                     }}
+
+                                    const hasNext = (dualGiftQueue && dualGiftQueue.length > 0);
                                     dualIsReactionPlaying = false;
-                                    processDualScreenQueue();
-                                    setTimeout(() => {{
+
+                                    if (hasNext) {{
+                                        processDualScreenQueue();
+                                    }} else {{
+                                        playSlotImmediate(1, '');
+                                    }}
+
+                                    window.slotRewindTimers[slot] = setTimeout(() => {{
                                         try {{
-                                            targetVid.pause();
-                                            targetVid.currentTime = 0;
+                                            if (dualCurrentSlot !== slot) {{
+                                                targetVid.pause();
+                                                targetVid.currentTime = 0;
+                                            }}
                                         }} catch(e) {{}}
+                                        if (window.slotRewindTimers) window.slotRewindTimers[slot] = null;
                                     }}, 80);
                                 }}
                             }};
@@ -4607,17 +4664,29 @@ let compositorConfig = {compositor_cfg_json};
                                 dualReactionTimer = setTimeout(() => {{
                                     if (dualIsReactionPlaying && dualCurrentSlot === slot) {{
                                         console.log('[DualScreen] Safety timer auto-advance for slot ' + slot);
-                                        if (slotVideoPool[1]) {{
-                                            window.activeSlotVideo = slotVideoPool[1];
-                                            try {{ slotVideoPool[1].play().catch(() => {{}}); }} catch(e) {{}}
+                                        dualReactionTimer = null;
+                                        if (window.slotRewindTimers && window.slotRewindTimers[slot]) {{
+                                            clearTimeout(window.slotRewindTimers[slot]);
+                                            window.slotRewindTimers[slot] = null;
                                         }}
+
+                                        const hasNext = (dualGiftQueue && dualGiftQueue.length > 0);
                                         dualIsReactionPlaying = false;
-                                        processDualScreenQueue();
-                                        setTimeout(() => {{
+
+                                        if (hasNext) {{
+                                            processDualScreenQueue();
+                                        }} else {{
+                                            playSlotImmediate(1, '');
+                                        }}
+
+                                        window.slotRewindTimers[slot] = setTimeout(() => {{
                                             try {{
-                                                targetVid.pause();
-                                                targetVid.currentTime = 0;
+                                                if (dualCurrentSlot !== slot) {{
+                                                    targetVid.pause();
+                                                    targetVid.currentTime = 0;
+                                                }}
                                             }} catch(e) {{}}
+                                            if (window.slotRewindTimers) window.slotRewindTimers[slot] = null;
                                         }}, 80);
                                     }}
                                 }}, (dur + 0.5) * 1000);
@@ -4630,6 +4699,7 @@ let compositorConfig = {compositor_cfg_json};
 
                         function initDualScreenStudio() {{
                             initSlotVideoPool();
+                            updateDualQueueUI();
                             const canvas = document.getElementById('dualCompositeCanvas');
                             if (!canvas) return;
 
@@ -5772,7 +5842,10 @@ let compositorConfig = {compositor_cfg_json};
                             Uji coba pemicu video reaksi secara instan tanpa reload halaman. Klik beruntun untuk mengisi antrean pemutaran video.
                         </p>
                     </div>
-                    <div>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span id="dualQueueBadge" style="display: inline-flex; align-items: center; gap: 6px; background: rgba(255, 255, 255, 0.05); color: #888; border: 1px solid rgba(255, 255, 255, 0.15); padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; transition: all 0.2s ease;">
+                            <span>📥</span> Antrean Gift: <b id="dualQueueCount">0</b>
+                        </span>
                         <button type="button" id="btn-reset-standby" class="shimmer-btn" style="--shimmer-color: #007aff; --bg: rgba(0, 122, 255, 0.15); padding: 8px 18px; font-size: 13px; font-weight: 600;" onclick="resetStandby(event)">
                             🔄 Reset ke Standby (Slot 1)
                         </button>
@@ -7332,6 +7405,7 @@ let compositorConfig = {compositor_cfg_json};
             global global_gift_seq, latest_gift_event, recent_gift_logs
             query_params = urllib.parse.parse_qs(parsed_url.query)
             slot_str = query_params.get("slot", [None])[0]
+            local_id = query_params.get("local_id", [None])[0]
             if not slot_str:
                 content_len = int(self.headers.get('Content-Length', 0))
                 if content_len > 0:
@@ -7395,10 +7469,12 @@ let compositorConfig = {compositor_cfg_json};
                         detail_msg = f"Live stream langsung beralih ke Video Reaksi Slot {target_slot} ({gift_name})."
                 else:
                     detail_msg = f"Simulasi diterima, namun tidak ada slot reaksi yang cocok ({res.get('reason')})."
-                event_id = latest_gift_event.get("id") if latest_gift_event else ""
+                if latest_gift_event and local_id:
+                    latest_gift_event["id"] = local_id
+                event_id = local_id if local_id else (latest_gift_event.get("id") if latest_gift_event else "")
             else:
                 global_gift_seq += 1
-                event_id = f"{int(time.time()*1000)}_{target_slot}_{global_gift_seq}"
+                event_id = local_id if local_id else f"{int(time.time()*1000)}_{target_slot}_{global_gift_seq}"
                 gift_info = {
                     "id": event_id,
                     "seq": global_gift_seq,
