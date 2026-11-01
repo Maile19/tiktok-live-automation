@@ -4360,7 +4360,7 @@ let compositorConfig = {compositor_cfg_json};
                                     vid = document.createElement('video');
                                     vid.id = 'dualSlotVideo_' + s;
                                     vid.playsInline = true;
-                                    vid.muted = false;
+                                    vid.muted = (s !== 1);
                                     vid.preload = 'auto';
                                     vid.crossOrigin = 'anonymous';
                                     vid.src = '/video-stream?name=video_' + s + '.mp4';
@@ -4371,7 +4371,7 @@ let compositorConfig = {compositor_cfg_json};
                                 vid.preload = 'auto';
                                 vid.playsInline = true;
                                 vid.crossOrigin = 'anonymous';
-                                vid.muted = false;
+                                vid.muted = (s !== 1);
 
                                 // Pre-warm first frame into decoder memory
                                 vid.addEventListener('loadeddata', () => {{
@@ -4566,8 +4566,12 @@ let compositorConfig = {compositor_cfg_json};
                             const targetVid = slotVideoPool[slot];
                             if (!targetVid) return;
 
-                            // 2. Pastikan targetVid unmuted agar Web Audio MediaElementSource menerima sinyal audio
-                            targetVid.muted = false;
+                            // 2. Unmute dinamis: HANYA targetVid aktif yang unmuted, slot lainnya di-mute
+                            for (let s = 1; s <= 6; s++) {{
+                                if (slotVideoPool[s]) {{
+                                    slotVideoPool[s].muted = (s !== slot);
+                                }}
+                            }}
 
                             // 3. Instant Audio Gain Switching via Web Audio API (0ms gap, zero click/pop)
                             if (dualAudioCtx) {{
@@ -5123,7 +5127,7 @@ let compositorConfig = {compositor_cfg_json};
                                 initSlotVideoPool();
                                 for (let s = 1; s <= 6; s++) {{
                                     if (slotVideoPool[s]) {{
-                                        slotVideoPool[s].muted = false;
+                                        slotVideoPool[s].muted = (s !== dualCurrentSlot);
                                     }}
                                 }}
 
@@ -5204,7 +5208,7 @@ let compositorConfig = {compositor_cfg_json};
                                     const sVid = slotVideoPool[s];
                                     if (sVid && !slotAudioSources[s]) {{
                                         try {{
-                                            sVid.muted = false;
+                                            sVid.muted = (s !== dualCurrentSlot);
                                             const sSrc = dualAudioCtx.createMediaElementSource(sVid);
                                             const sGain = dualAudioCtx.createGain();
                                             sGain.gain.value = (s === dualCurrentSlot) ? 1.0 : 0.0;
@@ -5723,11 +5727,11 @@ let compositorConfig = {compositor_cfg_json};
 <div id="persistent-media-engine" style="position:fixed; top:0; left:-9999px; width:720px; height:1280px; opacity:0.001; pointer-events:none; z-index:-999;">
     <video id="dualCatVideo" playsinline loop crossorigin="anonymous" style="width:720px; height:1280px;"></video>
     <video id="dualSlotVideo_1" playsinline loop preload="auto" crossorigin="anonymous" src="/video-stream?name=video_1.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_2" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_2.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_3" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_3.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_4" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_4.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_5" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_5.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_6" playsinline preload="auto" crossorigin="anonymous" src="/video-stream?name=video_6.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_2" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_2.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_3" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_3.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_4" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_4.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_5" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_5.mp4" style="width:720px; height:1280px;"></video>
+    <video id="dualSlotVideo_6" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_6.mp4" style="width:720px; height:1280px;"></video>
     <video id="dualCamVideo" playsinline autoplay style="width:320px; height:240px;"></video>
 </div>
 
