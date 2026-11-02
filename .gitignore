@@ -16,6 +16,7 @@ tmp/
 *~
 __pycache__/
 *.pyc
+*.fifo
 
 # Runtime metadata & credentials
 cookies.json
@@ -26,5 +27,6 @@ video_metadata.json
 
 # Uploads & media
 uploads/
+profiles/
 *.mp4
 *.webm

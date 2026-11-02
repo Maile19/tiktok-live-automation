@@ -16,6 +16,7 @@ import email.parser
 import subprocess
 import threading
 import time
+import uuid
 import http.cookies
 import shutil
 import asyncio
@@ -47,6 +48,13 @@ STREAM_META_FILE = os.path.join(BASE_DIR, "stream_metadata.json")
 LIVE_LISTENER_LOG_FILE = os.path.join(BASE_DIR, "live_listener.log")
 MAX_FFMPEG_LOG_SIZE = 5 * 1024 * 1024  # 5 MB
 
+RAMDISK_DIR = "/dev/shm/tiktok_live"
+RAMDISK_VIDEO_FIFO = os.path.join(RAMDISK_DIR, "v_stream.fifo")
+RAMDISK_AUDIO_FIFO = os.path.join(RAMDISK_DIR, "a_stream.fifo")
+RAMDISK_PROGRESS_FILE = os.path.join(RAMDISK_DIR, "master_progress.txt")
+GUIDE_OVERLAY_SHM = os.path.join(RAMDISK_DIR, "guide_overlay.png")
+os.makedirs(RAMDISK_DIR, exist_ok=True)
+
 VPN_DIR = os.path.join(BASE_DIR, "vpn")
 VPN_CONFIG_FILE = os.path.join(BASE_DIR, "vpn_config.json")
 PROXYCHAINS_CONF = os.path.join(VPN_DIR, "proxychains.conf")
@@ -57,6 +65,346 @@ os.makedirs(AVATARS_DIR, exist_ok=True)
 os.makedirs(OVERLAYS_DIR, exist_ok=True)
 os.makedirs(DYNAMIC_OVERLAYS_DIR, exist_ok=True)
 os.makedirs(VPN_DIR, exist_ok=True)
+
+PROFILES_DIR = os.path.join(BASE_DIR, "profiles")
+PROFILES_META_FILE = os.path.join(PROFILES_DIR, "profiles_meta.json")
+os.makedirs(PROFILES_DIR, exist_ok=True)
+
+SNAPSHOT_CONFIG_FILES = {
+    "account_config": ACCOUNT_CONFIG_FILE,
+    "cookies": COOKIES_FILE,
+    "character_config": CHARACTER_CONFIG_FILE,
+    "compositor_config": COMPOSITOR_CONFIG_FILE,
+    "dynamic_overlay_config": DYNAMIC_OVERLAY_CONFIG_FILE,
+    "gift_config": CONFIG_FILE,
+    "stream_metadata": STREAM_META_FILE,
+    "video_metadata": VIDEO_META_FILE,
+    "vpn_config": VPN_CONFIG_FILE,
+}
+
+SNAPSHOT_MEDIA_DIRS = {
+    "videos": VIDEOS_DIR,
+    "dynamic_overlays": DYNAMIC_OVERLAYS_DIR,
+    "avatars": AVATARS_DIR,
+    "overlays": OVERLAYS_DIR,
+}
+
+def safe_link_or_copy(src_path, dst_path):
+    """
+    Hardlinks src_path to dst_path with safe unlink of existing destination
+    and fallback to shutil.copy2 if hardlink fails. Fulfills Technical Requirement 1.
+    """
+    if not os.path.exists(src_path):
+        return False
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    if os.path.exists(dst_path):
+        try:
+            os.unlink(dst_path)
+        except Exception:
+            try:
+                os.remove(dst_path)
+            except Exception:
+                pass
+    try:
+        os.link(src_path, dst_path)
+        return True
+    except Exception:
+        try:
+            shutil.copy2(src_path, dst_path)
+            return True
+        except Exception as copy_err:
+            print(f"[Profiles] safe_link_or_copy error {src_path} -> {dst_path}: {copy_err}")
+            return False
+
+def safe_write_json(filepath, data):
+    """
+    Safely writes JSON data by first writing to a temp file, unlinking target if existing,
+    and replacing atomically with fallback copy.
+    """
+    tmp_path = filepath + f".tmp.{os.getpid()}.{time.time()}"
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        if os.path.exists(filepath):
+            try:
+                os.unlink(filepath)
+            except Exception:
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+        try:
+            os.replace(tmp_path, filepath)
+        except Exception:
+            shutil.copy2(tmp_path, filepath)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        print(f"[Profiles] safe_write_json error {filepath}: {e}")
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        return False
+
+def load_profiles_meta():
+    ensure_profiles_storage()
+    if os.path.exists(PROFILES_META_FILE):
+        try:
+            with open(PROFILES_META_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[Profiles] Error loading meta: {e}")
+    now = int(time.time())
+    return {
+        "active_profile_id": "profile_default",
+        "profiles": {
+            "profile_default": {
+                "id": "profile_default",
+                "name": "Default Profile",
+                "created_at": now,
+                "updated_at": now,
+                "active_preset_id": "preset_default",
+                "presets": {
+                    "preset_default": {
+                        "id": "preset_default",
+                        "name": "Preset Awal",
+                        "created_at": now,
+                        "updated_at": now,
+                        "description": "Snapshot kondisi aktif saat ini"
+                    }
+                }
+            }
+        }
+    }
+
+def save_profiles_meta(meta):
+    safe_write_json(PROFILES_META_FILE, meta)
+
+def create_preset_snapshot(profile_id, preset_id, name, description="", update_meta=True):
+    preset_dir = os.path.join(PROFILES_DIR, profile_id, preset_id)
+    preset_media_dir = os.path.join(preset_dir, "media")
+    os.makedirs(preset_media_dir, exist_ok=True)
+
+    # 1. Capture 9 JSON configs
+    captured_state = {}
+    for key, fpath in SNAPSHOT_CONFIG_FILES.items():
+        if os.path.exists(fpath):
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    captured_state[key] = json.load(f)
+            except Exception as e:
+                print(f"[Profiles] Snapshot load {fpath} error: {e}")
+                captured_state[key] = None
+        else:
+            captured_state[key] = None
+
+    now = int(time.time())
+    snapshot_doc = {
+        "version": "1.0",
+        "created_at": now,
+        "profile_id": profile_id,
+        "preset_id": preset_id,
+        "name": name,
+        "description": description,
+        "state": captured_state
+    }
+
+    state_file = os.path.join(preset_dir, "snapshot_state.json")
+    safe_write_json(state_file, snapshot_doc)
+
+    # 2. Capture media files
+    for cat, src_dir in SNAPSHOT_MEDIA_DIRS.items():
+        dst_cat_dir = os.path.join(preset_media_dir, cat)
+        os.makedirs(dst_cat_dir, exist_ok=True)
+        active_files = set()
+        if os.path.exists(src_dir):
+            for fname in os.listdir(src_dir):
+                src_file = os.path.join(src_dir, fname)
+                if os.path.isfile(src_file):
+                    active_files.add(fname)
+                    dst_file = os.path.join(dst_cat_dir, fname)
+                    safe_link_or_copy(src_file, dst_file)
+        if os.path.exists(dst_cat_dir):
+            for fname in os.listdir(dst_cat_dir):
+                if fname not in active_files:
+                    try:
+                        os.unlink(os.path.join(dst_cat_dir, fname))
+                    except Exception:
+                        pass
+
+    # 3. Update profiles_meta.json
+    if update_meta:
+        meta = load_profiles_meta()
+        if "profiles" not in meta:
+            meta["profiles"] = {}
+        if profile_id not in meta["profiles"]:
+            meta["profiles"][profile_id] = {
+                "id": profile_id,
+                "name": profile_id,
+                "created_at": now,
+                "updated_at": now,
+                "active_preset_id": preset_id,
+                "presets": {}
+            }
+        prof = meta["profiles"][profile_id]
+        if "presets" not in prof:
+            prof["presets"] = {}
+
+        is_existing = preset_id in prof["presets"]
+        created_time = prof["presets"][preset_id].get("created_at", now) if is_existing else now
+        prof["presets"][preset_id] = {
+            "id": preset_id,
+            "name": name,
+            "created_at": created_time,
+            "updated_at": now,
+            "description": description
+        }
+        prof["updated_at"] = now
+        prof["active_preset_id"] = preset_id
+        meta["active_profile_id"] = profile_id
+        save_profiles_meta(meta)
+
+    return snapshot_doc
+
+def restore_preset_snapshot(profile_id, preset_id):
+    preset_dir = os.path.join(PROFILES_DIR, profile_id, preset_id)
+    state_file = os.path.join(preset_dir, "snapshot_state.json")
+    if not os.path.exists(state_file):
+        raise FileNotFoundError(f"Snapshot tidak ditemukan di: {state_file}")
+
+    with open(state_file, 'r', encoding='utf-8') as f:
+        snapshot_doc = json.load(f)
+
+    captured_state = snapshot_doc.get("state", {})
+
+    # 1. Restore JSON configs safely (unlink target first in safe_write_json)
+    for key, fpath in SNAPSHOT_CONFIG_FILES.items():
+        if key in captured_state and captured_state[key] is not None:
+            safe_write_json(fpath, captured_state[key])
+
+    # 2. Restore media files safely
+    preset_media_dir = os.path.join(preset_dir, "media")
+    for cat, dst_dir in SNAPSHOT_MEDIA_DIRS.items():
+        os.makedirs(dst_dir, exist_ok=True)
+        src_cat_dir = os.path.join(preset_media_dir, cat)
+        preset_files = set()
+        if os.path.exists(src_cat_dir):
+            for fname in os.listdir(src_cat_dir):
+                src_file = os.path.join(src_cat_dir, fname)
+                if os.path.isfile(src_file):
+                    preset_files.add(fname)
+                    dst_file = os.path.join(dst_dir, fname)
+                    safe_link_or_copy(src_file, dst_file)
+
+        # Clean orphan files in uploads/<cat> that are not part of this preset
+        if os.path.exists(dst_dir) and preset_files:
+            for fname in os.listdir(dst_dir):
+                if fname not in preset_files:
+                    dst_file = os.path.join(dst_dir, fname)
+                    if os.path.isfile(dst_file):
+                        try:
+                            os.unlink(dst_file)
+                        except Exception:
+                            pass
+
+    # 3. Update active_preset_id & active_profile_id in profiles_meta.json
+    meta = load_profiles_meta()
+    if profile_id in meta.get("profiles", {}):
+        meta["active_profile_id"] = profile_id
+        meta["profiles"][profile_id]["active_preset_id"] = preset_id
+        meta["profiles"][profile_id]["updated_at"] = int(time.time())
+        save_profiles_meta(meta)
+
+    # 4. In-memory update
+    try:
+        global stream_metadata
+        if os.path.exists(STREAM_META_FILE):
+            with open(STREAM_META_FILE, 'r', encoding='utf-8') as f:
+                stream_metadata.update(json.load(f))
+    except Exception:
+        pass
+
+    # 5. Restart live_listener daemon if running
+    try:
+        if "ensure_live_listener" in globals():
+            ensure_live_listener(force_restart=True)
+    except Exception as e:
+        print(f"[Profiles] live_listener restart warning: {e}")
+
+    return {
+        "success": True,
+        "profile_id": profile_id,
+        "preset_id": preset_id,
+        "name": snapshot_doc.get("name", preset_id),
+        "message": f"Preset '{snapshot_doc.get('name', preset_id)}' berhasil diaktifkan."
+    }
+
+def overwrite_preset_snapshot(profile_id, preset_id):
+    meta = load_profiles_meta()
+    if profile_id not in meta.get("profiles", {}):
+        raise ValueError(f"Profil '{profile_id}' tidak ditemukan.")
+    prof = meta["profiles"][profile_id]
+    if preset_id not in prof.get("presets", {}):
+        raise ValueError(f"Preset '{preset_id}' tidak ditemukan pada profil '{profile_id}'.")
+
+    preset_meta = prof["presets"][preset_id]
+    name = preset_meta.get("name", preset_id)
+    description = preset_meta.get("description", "")
+
+    create_preset_snapshot(profile_id, preset_id, name, description=description, update_meta=True)
+    return {
+        "success": True,
+        "profile_id": profile_id,
+        "preset_id": preset_id,
+        "name": name,
+        "message": f"Preset '{name}' berhasil diperbarui dengan konfigurasi aktif saat ini."
+    }
+
+def ensure_profiles_storage():
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+    if not os.path.exists(PROFILES_META_FILE):
+        now = int(time.time())
+        meta = {
+            "active_profile_id": "profile_default",
+            "profiles": {
+                "profile_default": {
+                    "id": "profile_default",
+                    "name": "Default Profile",
+                    "created_at": now,
+                    "updated_at": now,
+                    "active_preset_id": "preset_default",
+                    "presets": {
+                        "preset_default": {
+                            "id": "preset_default",
+                            "name": "Preset Awal",
+                            "created_at": now,
+                            "updated_at": now,
+                            "description": "Snapshot kondisi aktif saat ini"
+                        }
+                    }
+                }
+            }
+        }
+        safe_write_json(PROFILES_META_FILE, meta)
+        try:
+            create_preset_snapshot(
+                profile_id="profile_default",
+                preset_id="preset_default",
+                name="Preset Awal",
+                description="Snapshot kondisi aktif saat ini",
+                update_meta=False
+            )
+        except Exception as e:
+            print(f"[Profiles] Initial snapshot creation error: {e}")
+
+# Inisialisasi storage profil otomatis saat modul dimuat
+ensure_profiles_storage()
 
 DEFAULT_DYNAMIC_OVERLAY_CONFIG = {
     "layer_position": "above_webcam",
@@ -78,17 +426,39 @@ def load_dynamic_overlay_config():
         try:
             with open(DYNAMIC_OVERLAY_CONFIG_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                cfg = copy.deepcopy(DEFAULT_DYNAMIC_OVERLAY_CONFIG)
-                if "layer_position" in data:
-                    cfg["layer_position"] = data["layer_position"]
+                cfg = {
+                    "layer_position": data.get("layer_position", "above_webcam"),
+                    "scheduler": {
+                        "enabled": True,
+                        "min_interval_sec": 15,
+                        "max_interval_sec": 60
+                    },
+                    "slots": {}
+                }
                 if "scheduler" in data and isinstance(data["scheduler"], dict):
                     cfg["scheduler"].update(data["scheduler"])
                 if "slots" in data and isinstance(data["slots"], dict):
-                    for k in [str(i) for i in range(1, 11)]:
-                        if k in data["slots"]:
-                            cfg["slots"][k] = dict(DEFAULT_DYNAMIC_OVERLAY_CONFIG["slots"][k])
-                            cfg["slots"][k].update(data["slots"][k])
-                return cfg
+                    for k, v in data["slots"].items():
+                        k_str = str(k).strip()
+                        if not k_str:
+                            continue
+                        if isinstance(v, dict):
+                            slot_entry = {
+                                "name": v.get("name", f"Layer Animasi {k_str}"),
+                                "enabled": bool(v.get("enabled", True))
+                            }
+                            if "file" in v and v["file"]:
+                                slot_entry["file"] = v["file"]
+                            cfg["slots"][k_str] = slot_entry
+                        else:
+                            cfg["slots"][k_str] = {
+                                "name": f"Layer Animasi {k_str}",
+                                "enabled": True
+                            }
+                    return cfg
+                else:
+                    cfg["slots"] = copy.deepcopy(DEFAULT_DYNAMIC_OVERLAY_CONFIG["slots"])
+                    return cfg
         except Exception as e:
             print(f"[DynamicOverlay] Error loading: {e}")
     return copy.deepcopy(DEFAULT_DYNAMIC_OVERLAY_CONFIG)
@@ -831,10 +1201,15 @@ def validate_tiktok_session(username=None):
         now_str = time.strftime("%Y-%m-%d %H:%M:%S WIB", time.localtime())
 
         account_cfg = load_account_config()
-        if username:
-            account_cfg["username"] = username.strip()
-        elif resp_username and not account_cfg.get("username"):
-            account_cfg["username"] = f"@{resp_username}"
+        official_username = f"@{resp_username.lstrip('@')}" if resp_username else ""
+        if is_valid and official_username:
+            if username and username.lstrip('@').lower() != resp_username.lower():
+                print(f"[AccountValidator] ⚠️ Username mismatch! Input was '{username}', but cookies belong to '{official_username}'. Auto-syncing to '{official_username}'.")
+            account_cfg["username"] = official_username
+        elif username:
+            account_cfg["username"] = f"@{username.lstrip('@')}"
+        elif official_username:
+            account_cfg["username"] = official_username
 
         account_cfg["user_id"] = str(user_id) if user_id else ""
         account_cfg["screen_name"] = screen_name
@@ -851,14 +1226,16 @@ def validate_tiktok_session(username=None):
         save_account_config(account_cfg)
 
         if is_valid:
-            print(f"[AccountValidator] ✅ Session TikTok Valid (@{resp_username or screen_name}) | Route: {via} ({egress_ip})")
+            final_user = account_cfg.get("username") or official_username or (f"@{username.lstrip('@')}" if username else screen_name)
+            print(f"[AccountValidator] ✅ Session TikTok Valid ({final_user}) | Route: {via} ({egress_ip})")
             return {
                 "success": True,
-                "username": resp_username or screen_name,
+                "username": final_user,
+                "official_username": official_username,
                 "user_id": user_id,
                 "egress_ip": egress_ip,
                 "via": via,
-                "message": f"Session TikTok Valid! Terkunci pada {via} ({egress_ip})"
+                "message": f"Session TikTok Valid ({final_user})! Terkunci pada {via} ({egress_ip})"
             }
         else:
             msg = json_data.get("message", "Sessionid atau cookies sudah kedaluwarsa")
@@ -911,6 +1288,51 @@ def save_video_meta(meta):
             json.dump(meta, f, indent=2)
     except Exception as e:
         print(f"[VideoMeta] Error saving metadata: {e}")
+
+def get_active_video_slots():
+    """
+    Mengembalikan list nomor slot video aktif terurut.
+    Slot 1 selalu diikutsertakan sebagai Standby Loop utama.
+    Slot reaksi (>= 2) diambil secara dinamis dari video_metadata.json,
+    gift_config.json, dan file video fisik yang ada di uploads/videos.
+    """
+    slots = {1}
+    # 1. Dari video_metadata.json
+    meta = load_video_meta()
+    for k in meta.keys():
+        try:
+            s_num = int(k)
+            if s_num >= 1:
+                slots.add(s_num)
+        except ValueError:
+            pass
+    # 2. Dari gift_config.json
+    gift_cfg = load_gift_config()
+    for k in gift_cfg.keys():
+        try:
+            s_num = int(k)
+            if s_num >= 2:
+                slots.add(s_num)
+        except ValueError:
+            pass
+    # 3. Dari file fisik di uploads/videos
+    if os.path.exists(VIDEOS_DIR):
+        for fname in os.listdir(VIDEOS_DIR):
+            if fname.startswith("video_") and fname.endswith((".mp4", ".webm")):
+                raw = fname.replace(".mp4", "").replace(".webm", "")
+                parts = raw.split("_")
+                if len(parts) == 2 and parts[1].isdigit():
+                    s_num = int(parts[1])
+                    if s_num >= 1:
+                        slots.add(s_num)
+    return sorted(list(slots))
+
+def get_next_slot_number():
+    """
+    Menghitung nomor slot baru berikutnya yang siap digunakan.
+    """
+    slots = get_active_video_slots()
+    return max(slots) + 1 if slots else 2
 
 def probe_video_specs(filepath):
     """
@@ -1020,13 +1442,13 @@ def normalize_slot_video(temp_input_path, final_output_path):
     # Case A: Direct Copy Bypass (0% CPU re-encode, 100% bit-for-bit video quality)
     if video_compliant and audio_compliant:
         cmd = [
-            "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+            "ffmpeg", "-y", "-nostdin", "-nostats", "-loglevel", "error",
             "-i", temp_input_path,
             "-c", "copy",
             "-movflags", "+faststart",
             final_output_path
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if res.returncode == 0:
             elapsed = round(time.time() - t0, 3)
             print(f"[SmartBypass] ⚡ DIRECT COPY BYPASS (720x1280 h264 yuv420p & AAC {sample_rate}Hz in {elapsed}s). 0% CPU! Video kualitas 100% asli.")
@@ -1043,7 +1465,7 @@ def normalize_slot_video(temp_input_path, final_output_path):
     if video_compliant:
         if has_audio:
             cmd = [
-                "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+                "ffmpeg", "-y", "-nostdin", "-nostats", "-loglevel", "error",
                 "-i", temp_input_path,
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
@@ -1052,7 +1474,7 @@ def normalize_slot_video(temp_input_path, final_output_path):
             ]
         else:
             cmd = [
-                "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+                "ffmpeg", "-y", "-nostdin", "-nostats", "-loglevel", "error",
                 "-i", temp_input_path,
                 "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                 "-c:v", "copy",
@@ -1061,7 +1483,7 @@ def normalize_slot_video(temp_input_path, final_output_path):
                 "-movflags", "+faststart",
                 final_output_path
             ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if res.returncode == 0:
             elapsed = round(time.time() - t0, 3)
             print(f"[SmartBypass] 🎵 AUDIO TRANSCODE ONLY (Video -c:v copy preserved in {elapsed}s). 0% video re-encode!")
@@ -1079,7 +1501,7 @@ def normalize_slot_video(temp_input_path, final_output_path):
     scale_pad_filter = "scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black"
     if has_audio:
         cmd = [
-            "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+            "ffmpeg", "-y", "-nostdin", "-nostats", "-loglevel", "error",
             "-i", temp_input_path,
             "-vf", scale_pad_filter,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
@@ -1092,7 +1514,7 @@ def normalize_slot_video(temp_input_path, final_output_path):
         ]
     else:
         cmd = [
-            "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+            "ffmpeg", "-y", "-nostdin", "-nostats", "-loglevel", "error",
             "-i", temp_input_path,
             "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
             "-vf", scale_pad_filter,
@@ -1105,7 +1527,7 @@ def normalize_slot_video(temp_input_path, final_output_path):
             "-movflags", "+faststart",
             final_output_path
         ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     elapsed = round(time.time() - t0, 3)
     if res.returncode == 0:
         return {
@@ -1120,6 +1542,230 @@ def normalize_slot_video(temp_input_path, final_output_path):
         print(f"[SmartBypass] Error during fallback re-encode: {res.stderr}")
         shutil.copyfile(temp_input_path, final_output_path)
         return {"mode": "EMERGENCY_RAW_COPY", "error": res.stderr, "elapsed": elapsed}
+
+def remux_slot_video_faststart(temp_input_path, final_output_path):
+    """
+    Automatic FFmpeg Faststart Remux Engine (-c copy -movflags +faststart):
+    1. Moves MP4 'moov' atom to the head of the file for instant seeking and lightweight
+       HTTP 206 Partial Content range requests on mobile browsers without memory exhaustion.
+    2. Runs with 0% CPU video re-encoding (-c copy).
+    3. If direct copy fails (e.g. incompatible audio in MP4 container), falls back to
+       copying video while transcoding audio to AAC (-c:v copy -c:a aac), still 0% CPU video re-encode.
+    4. If format is fundamentally non-mp4 (e.g. VP9 webm), falls back to normalize_slot_video.
+    """
+    t0 = time.time()
+    # Step 1: Direct stream copy with +faststart (instant, 0% CPU)
+    cmd = [
+        "ffmpeg", "-y", "-nostdin", "-nostats", "-loglevel", "error",
+        "-i", temp_input_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        final_output_path
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if res.returncode == 0 and os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 0:
+            elapsed = round(time.time() - t0, 3)
+            print(f"[FaststartRemux] ⚡ DIRECT COPY FASTSTART (-c copy -movflags +faststart in {elapsed}s). 0% CPU!")
+            return {"mode": "DIRECT_COPY_FASTSTART", "elapsed": elapsed, "cpu_saved": "100%"}
+        print(f"[FaststartRemux] Direct stream copy notice: {res.stderr.strip() or 'exit code non-zero'}")
+    except Exception as e:
+        print(f"[FaststartRemux] Direct copy exception: {e}")
+
+    # Step 2: Audio transcode only (-c:v copy, -c:a aac)
+    try:
+        cmd_audio = [
+            "ffmpeg", "-y", "-nostdin", "-nostats", "-loglevel", "error",
+            "-i", temp_input_path,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-movflags", "+faststart",
+            final_output_path
+        ]
+        res_a = subprocess.run(cmd_audio, capture_output=True, text=True, timeout=600)
+        if res_a.returncode == 0 and os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 0:
+            elapsed = round(time.time() - t0, 3)
+            print(f"[FaststartRemux] 🎵 AUDIO TRANSCODE ONLY FASTSTART (-c:v copy -c:a aac in {elapsed}s). 0% video re-encode!")
+            return {"mode": "AUDIO_TRANSCODE_FASTSTART", "elapsed": elapsed, "cpu_saved": "95%"}
+        print(f"[FaststartRemux] Audio transcode notice: {res_a.stderr.strip()}")
+    except Exception as e:
+        print(f"[FaststartRemux] Audio transcode exception: {e}")
+
+    # Step 3: Fallback to normalize_slot_video
+    print("[FaststartRemux] ⚠️ Falling back to full normalize_slot_video...")
+    return normalize_slot_video(temp_input_path, final_output_path)
+
+class LimitedReader:
+    """Safely limits reading from socket rfile up to content_length bytes."""
+    def __init__(self, rfile, limit):
+        self.rfile = rfile
+        self.remaining = limit
+
+    def read(self, size=-1):
+        if self.remaining <= 0:
+            return b""
+        if size < 0 or size > self.remaining:
+            size = self.remaining
+        chunk = self.rfile.read(size)
+        self.remaining -= len(chunk)
+        return chunk
+
+    def readline(self, size=-1):
+        if self.remaining <= 0:
+            return b""
+        if size < 0 or size > self.remaining:
+            size = self.remaining
+        line = self.rfile.readline(size)
+        self.remaining -= len(line)
+        return line
+
+class BufferedStream:
+    """Allows unreading / peeking bytes back into the stream."""
+    def __init__(self, reader):
+        self.reader = reader
+        self.buf = b""
+
+    def unread(self, data):
+        self.buf = data + self.buf
+
+    def read(self, size=-1):
+        if self.buf:
+            if size < 0 or size >= len(self.buf):
+                res = self.buf
+                self.buf = b""
+                if size > 0 and len(res) < size:
+                    res += self.reader.read(size - len(res))
+                return res
+            else:
+                res = self.buf[:size]
+                self.buf = self.buf[size:]
+                return res
+        return self.reader.read(size)
+
+    def readline(self, size=-1):
+        if self.buf:
+            nl = self.buf.find(b"\n")
+            if nl != -1:
+                res = self.buf[:nl + 1]
+                self.buf = self.buf[nl + 1:]
+                return res
+            else:
+                res = self.buf
+                self.buf = b""
+                res += self.reader.readline(size)
+                return res
+        return self.reader.readline(size)
+
+def stream_multipart_video_upload(rfile, content_length, boundary_str, temp_filepath, default_slot="1"):
+    """
+    Streams multipart/form-data video upload directly to disk in chunks.
+    Uses ~128 KB chunk buffer instead of reading the entire file to RAM.
+    Guarantees VPS will not OOM even with 2+ GB video files.
+    """
+    boundary = boundary_str.encode('latin-1')
+    first_boundary = b"--" + boundary
+    delimiter = b"\r\n--" + boundary
+    delim_len = len(delimiter)
+
+    limiter = LimitedReader(rfile, content_length)
+    stream = BufferedStream(limiter)
+    slot = default_slot
+    orig_filename = ""
+    file_saved = False
+
+    # 1. Seek to first boundary
+    while True:
+        line = stream.readline(4096)
+        if not line:
+            break
+        if line.strip() == first_boundary:
+            break
+
+    # 2. Iterate through multipart parts
+    while True:
+        part_headers = {}
+        while True:
+            hline = stream.readline(4096)
+            if not hline or hline in (b"\r\n", b"\n"):
+                break
+            try:
+                dec = hline.decode("utf-8", errors="replace")
+                if ":" in dec:
+                    k, v = dec.split(":", 1)
+                    part_headers[k.strip().lower()] = v.strip()
+            except Exception:
+                pass
+
+        cd = part_headers.get("content-disposition", "")
+        if not cd and limiter.remaining <= 0:
+            break
+
+        is_file = False
+        field_name = ""
+        filename = ""
+        for item in cd.split(";"):
+            item = item.strip()
+            if item.lower().startswith("name="):
+                field_name = item[5:].strip("\"'")
+            elif item.lower().startswith("filename="):
+                filename = item[9:].strip("\"'")
+                is_file = True
+
+        if is_file or field_name == "videofile":
+            orig_filename = filename
+            buffer = b""
+            chunk_size = 128 * 1024  # 128 KB streaming chunks
+            with open(temp_filepath, "wb") as out_f:
+                while True:
+                    chunk = stream.read(chunk_size)
+                    if not chunk:
+                        if buffer:
+                            out_f.write(buffer)
+                        break
+                    buffer += chunk
+                    idx = buffer.find(delimiter)
+                    if idx != -1:
+                        out_f.write(buffer[:idx])
+                        file_saved = True
+                        rem = buffer[idx + len(delimiter):]
+                        stream.unread(rem)
+                        break
+                    else:
+                        if len(buffer) > delim_len:
+                            out_f.write(buffer[:-delim_len])
+                            buffer = buffer[-delim_len:]
+
+            line = stream.readline(100)
+            if line.strip().startswith(b"--"):
+                break
+        else:
+            val_lines = []
+            is_end = False
+            while True:
+                line = stream.readline(4096)
+                if not line:
+                    break
+                stripped = line.strip()
+                if stripped.startswith(first_boundary):
+                    if stripped.startswith(first_boundary + b"--"):
+                        is_end = True
+                    break
+                val_lines.append(line)
+            val = b"".join(val_lines).decode("utf-8", errors="ignore").strip()
+            if field_name == "slot" and val in ("1", "2", "3", "4", "5", "6"):
+                slot = val
+            if is_end or limiter.remaining <= 0:
+                break
+
+    # Drain any remaining bytes to keep keep-alive socket clean
+    while stream.read(65536):
+        pass
+
+    return {
+        "slot": slot,
+        "filename": orig_filename,
+        "file_saved": file_saved and os.path.exists(temp_filepath) and os.path.getsize(temp_filepath) > 0
+    }
 
 DEFAULT_CHARACTER_CONFIG = {
     "overlay_enabled": True,
@@ -1377,8 +2023,496 @@ def get_video_duration(video_path):
     except Exception:
         return 10.0
 
+def init_ramdisk_cache():
+    """
+    Menyalin semua aset video, guide overlay, dan standby loop ke /dev/shm/tiktok_live/
+    untuk menjamin 0ms read latency dan menghilangkan bottleneck Disk I/O VPS.
+    """
+    os.makedirs(RAMDISK_DIR, exist_ok=True)
+    for slot_num in range(1, 7):
+        src = find_slot_video(slot_num)
+        if src and os.path.exists(src):
+            dst = os.path.join(RAMDISK_DIR, f"video_{slot_num}.mp4")
+            try:
+                if not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst) or os.path.getsize(src) != os.path.getsize(dst):
+                    shutil.copy2(src, dst)
+            except Exception as e:
+                print(f"[RAMDisk] Warning sync video {slot_num}: {e}")
+
+    standby_src = os.path.join(BASE_DIR, "media", "standby-loop.mp4")
+    if os.path.exists(standby_src):
+        dst = os.path.join(RAMDISK_DIR, "standby-loop.mp4")
+        try:
+            if not os.path.exists(dst) or os.path.getmtime(standby_src) > os.path.getmtime(dst):
+                shutil.copy2(standby_src, dst)
+        except Exception:
+            pass
+
+    if os.path.exists(GUIDE_OVERLAY_FILE):
+        dst = GUIDE_OVERLAY_SHM
+        try:
+            shutil.copy2(GUIDE_OVERLAY_FILE, dst)
+        except Exception:
+            pass
+
+def get_ramdisk_slot_video(slot_num):
+    init_ramdisk_cache()
+    cand = os.path.join(RAMDISK_DIR, f"video_{slot_num}.mp4")
+    if os.path.exists(cand):
+        return cand
+    cand_src = find_slot_video(slot_num)
+    if cand_src and os.path.exists(cand_src):
+        return cand_src
+    return os.path.join(RAMDISK_DIR, "standby-loop.mp4")
+
+class SingleDeckPlayer:
+    """
+    Sub-worker decoder background untuk satu deck (Deck A / Deck B).
+    Mendekode video menjadi rawvideo YUV420p dan PCM audio s16le ke ring buffer memori.
+    """
+    def __init__(self, name):
+        self.name = name
+        self.proc = None
+        self.a_fifo_path = os.path.join(RAMDISK_DIR, f"{name}_audio.fifo")
+        self.a_holder = None
+        self.a_fd = None
+        self.frames = collections.deque()
+        self.reader_stop = threading.Event()
+        self.reader_thread = None
+        self.video_path = ""
+        self.slot_num = 1
+        self.total_frames = 0
+        self.frames_read = 0
+        self.lock = threading.Lock()
+
+    def _ensure_a_fifo(self):
+        if self.a_holder is not None:
+            try: os.close(self.a_holder)
+            except Exception: pass
+            self.a_holder = None
+        if os.path.exists(self.a_fifo_path):
+            try: os.remove(self.a_fifo_path)
+            except Exception: pass
+        try:
+            os.mkfifo(self.a_fifo_path)
+            self.a_holder = os.open(self.a_fifo_path, os.O_RDWR)
+        except Exception as e:
+            print(f"[Deck {self.name}] Error creating audio fifo/holder: {e}")
+
+    def start(self, video_path, slot_num=1):
+        self.stop()
+        self._ensure_a_fifo()
+        with self.lock:
+            self.video_path = video_path
+            self.slot_num = slot_num
+            self.frames.clear()
+            self.frames_read = 0
+            self.reader_stop.clear()
+
+            dur = get_video_duration(video_path)
+            self.total_frames = max(24, int(dur * 24))
+
+            cmd = [
+                "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+                "-i", video_path,
+                "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1",
+                "-f", "s16le", "-ar", "44100", "-ac", "2", self.a_fifo_path
+            ]
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+            try:
+                self.a_fd = os.open(self.a_fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+            except Exception as e:
+                print(f"[Deck {self.name}] Error opening audio reader: {e}")
+                self.a_fd = None
+
+            def _read_loop():
+                FRAME_SIZE = 720 * 1280 * 3 // 2
+                AUDIO_SIZE = 7350
+                a_buf = bytearray()
+
+                while not self.reader_stop.is_set():
+                    v_data = bytearray()
+                    while len(v_data) < FRAME_SIZE and not self.reader_stop.is_set():
+                        try:
+                            chunk = self.proc.stdout.read(min(FRAME_SIZE - len(v_data), 65536))
+                            if not chunk:
+                                break
+                            v_data.extend(chunk)
+                        except Exception:
+                            break
+
+                    if len(v_data) < FRAME_SIZE:
+                        break
+
+                    if self.a_fd:
+                        a_retries = 0
+                        while len(a_buf) < AUDIO_SIZE and not self.reader_stop.is_set():
+                            try:
+                                c_a = os.read(self.a_fd, 65536)
+                                if c_a:
+                                    a_buf.extend(c_a)
+                                else:
+                                    break
+                            except (BlockingIOError, OSError):
+                                a_retries += 1
+                                if a_retries > 10 and self.proc and self.proc.poll() is not None:
+                                    break
+                                time.sleep(0.002)
+
+                    if len(a_buf) >= AUDIO_SIZE:
+                        a_chunk = bytes(a_buf[:AUDIO_SIZE])
+                        del a_buf[:AUDIO_SIZE]
+                    else:
+                        a_chunk = b"\x00" * AUDIO_SIZE
+
+                    with self.lock:
+                        self.frames.append((bytes(v_data), a_chunk))
+                        self.frames_read += 1
+
+                    while len(self.frames) >= 72 and not self.reader_stop.is_set():
+                        time.sleep(0.02)
+
+            self.reader_thread = threading.Thread(target=_read_loop, name=f"{self.name}-reader", daemon=True)
+            self.reader_thread.start()
+
+    def get_frame(self):
+        with self.lock:
+            if self.frames:
+                return self.frames.popleft()
+        return None
+
+    def buffered_count(self):
+        with self.lock:
+            return len(self.frames)
+
+    def is_eof(self):
+        with self.lock:
+            proc_done = (self.proc is not None and self.proc.poll() is not None)
+            reader_done = (self.reader_thread is not None and not self.reader_thread.is_alive())
+            return (proc_done or reader_done) and len(self.frames) == 0
+
+    def progress_pct(self):
+        if self.total_frames <= 0:
+            return 0.0
+        return min(100.0, (self.frames_read / self.total_frames) * 100.0)
+
+    def stop(self):
+        self.reader_stop.set()
+        with self.lock:
+            if self.proc:
+                try:
+                    self.proc.terminate()
+                    self.proc.wait(timeout=0.2)
+                except Exception:
+                    try: self.proc.kill()
+                    except Exception: pass
+                self.proc = None
+            if self.a_fd:
+                try: os.close(self.a_fd)
+                except Exception: pass
+                self.a_fd = None
+            self.frames.clear()
+
+class ContinuousDeckFeeder:
+    """
+    Manajer Utama Pengumpan Frame (Continuous Pipe Feeder) Dual-Deck A/B Roll.
+    Menjamin aliran video dan audio ke Master FFmpeg tidak pernah putus (100% bebas freeze).
+    """
+    def __init__(self):
+        self.deck_a = SingleDeckPlayer("deck_a")
+        self.deck_b = SingleDeckPlayer("deck_b")
+        self.active_deck = self.deck_a
+        self.standby_deck = self.deck_b
+
+        self.v_holder = None
+        self.a_holder = None
+
+        self.v_q = queue.Queue(maxsize=48)
+        self.a_q = queue.Queue(maxsize=48)
+
+        self.clock_thread = None
+        self.v_writer_thread = None
+        self.a_writer_thread = None
+
+        self.stop_event = threading.Event()
+        self.is_running = False
+
+        self.current_slot = 1
+        self.is_prebuffering = False
+        self.prebuffered_slot = None
+
+        self.FRAME_SIZE = 720 * 1280 * 3 // 2
+        self.AUDIO_SIZE = 7350
+
+        self.last_valid_v = b"\x00" * self.FRAME_SIZE
+        self.last_valid_a = b"\x00" * self.AUDIO_SIZE
+        self.frames_sent = 0
+
+    def setup_fifos(self):
+        init_ramdisk_cache()
+        for p in (RAMDISK_VIDEO_FIFO, RAMDISK_AUDIO_FIFO):
+            if os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
+            os.mkfifo(p)
+
+        # Requirement 2: Open O_RDWR dummy holder agar Master FFmpeg TIDAK PERNAH menerima sinyal EOF
+        self.v_holder = os.open(RAMDISK_VIDEO_FIFO, os.O_RDWR)
+        self.a_holder = os.open(RAMDISK_AUDIO_FIFO, os.O_RDWR)
+        print("[DeckFeeder] FIFO Named Pipes initialized & O_RDWR holders locked.")
+
+    def start(self, initial_slot=1):
+        self.stop()
+        self.setup_fifos()
+        self.stop_event.clear()
+        self.frames_sent = 0
+        self.current_slot = initial_slot
+        self.is_prebuffering = False
+        self.prebuffered_slot = None
+
+        def _v_writer():
+            while not self.stop_event.is_set():
+                try:
+                    chunk = self.v_q.get(timeout=0.1)
+                    if self.v_holder:
+                        while chunk and not self.stop_event.is_set():
+                            n = os.write(self.v_holder, chunk)
+                            chunk = chunk[n:]
+                    self.v_q.task_done()
+                except queue.Empty: pass
+                except Exception: break
+
+        def _a_writer():
+            while not self.stop_event.is_set():
+                try:
+                    chunk = self.a_q.get(timeout=0.1)
+                    if self.a_holder:
+                        while chunk and not self.stop_event.is_set():
+                            n = os.write(self.a_holder, chunk)
+                            chunk = chunk[n:]
+                    self.a_q.task_done()
+                except queue.Empty: pass
+                except Exception: break
+
+        self.v_writer_thread = threading.Thread(target=_v_writer, name="FIFO-V-Writer", daemon=True)
+        self.a_writer_thread = threading.Thread(target=_a_writer, name="FIFO-A-Writer", daemon=True)
+        self.v_writer_thread.start()
+        self.a_writer_thread.start()
+
+        init_video = get_ramdisk_slot_video(initial_slot)
+        self.active_deck = self.deck_a
+        self.standby_deck = self.deck_b
+        self.active_deck.start(init_video, slot_num=initial_slot)
+
+        for _ in range(25):
+            if self.active_deck.buffered_count() >= 6:
+                break
+            time.sleep(0.01)
+
+        self.is_running = True
+        self.clock_thread = threading.Thread(target=self._pacer_loop, name="Deck-Clock-Pacer", daemon=True)
+        self.clock_thread.start()
+        print(f"[DeckFeeder] Feeder loop started for Slot {initial_slot}.")
+
+    def switch_to_slot(self, target_slot):
+        video_p = get_ramdisk_slot_video(target_slot)
+        print(f"[DeckFeeder] Instant switch triggered: Slot {self.current_slot} -> Slot {target_slot} ({os.path.basename(video_p)})")
+
+        self.standby_deck.start(video_p, slot_num=target_slot)
+
+        for _ in range(10):
+            if self.standby_deck.buffered_count() >= 3:
+                break
+            time.sleep(0.01)
+
+        old_deck = self.active_deck
+        self.active_deck = self.standby_deck
+        self.standby_deck = old_deck
+
+        self.current_slot = target_slot
+        self.is_prebuffering = False
+        self.prebuffered_slot = None
+
+        threading.Thread(target=old_deck.stop, daemon=True).start()
+
+        with stream_lock:
+            stream_metadata["currentSlot"] = target_slot
+            stream_metadata["currentVideo"] = os.path.basename(video_p)
+            save_stream_metadata()
+
+    def _pacer_loop(self):
+        FRAME_PERIOD = 1.0 / 24.0
+        next_tick = time.time()
+
+        while not self.stop_event.is_set():
+            now = time.time()
+            if now < next_tick:
+                time.sleep(max(0.001, next_tick - now))
+            next_tick += FRAME_PERIOD
+            if next_tick < time.time() - 0.2:
+                next_tick = time.time()
+
+            # Pre-buffering trigger pada 85% durasi
+            prog = self.active_deck.progress_pct()
+            if prog >= 85.0 and not self.is_prebuffering:
+                self._handle_prebuffer_trigger()
+
+            pair = self.active_deck.get_frame()
+
+            # Transisi mulus saat active deck mencapai EOF
+            if not pair and self.active_deck.is_eof():
+                if self.is_prebuffering and self.standby_deck.buffered_count() > 0:
+                    print(f"[DeckFeeder] Active deck finished ({self.active_deck.name}). Auto-switching 0ms to {self.standby_deck.name} (Slot {self.prebuffered_slot})")
+                    old_deck = self.active_deck
+                    self.active_deck = self.standby_deck
+                    self.standby_deck = old_deck
+                    self.current_slot = self.prebuffered_slot
+                    self.is_prebuffering = False
+                    self.prebuffered_slot = None
+                    threading.Thread(target=old_deck.stop, daemon=True).start()
+
+                    with stream_lock:
+                        stream_metadata["currentSlot"] = self.current_slot
+                        save_stream_metadata()
+
+                    pair = self.active_deck.get_frame()
+                else:
+                    self._on_active_deck_exhausted()
+                    pair = self.active_deck.get_frame()
+
+            # Fallback Frame Mechanism (41.6ms): hold last valid frame jika data tertunda
+            if pair:
+                v_chunk, a_chunk = pair
+                self.last_valid_v = v_chunk
+                self.last_valid_a = a_chunk
+            else:
+                v_chunk = self.last_valid_v
+                a_chunk = b"\x00" * self.AUDIO_SIZE
+
+            try:
+                self.v_q.put_nowait(v_chunk)
+                self.a_q.put_nowait(a_chunk)
+                self.frames_sent += 1
+            except queue.Full:
+                pass
+
+    def _handle_prebuffer_trigger(self):
+        self.is_prebuffering = True
+        next_slot = 1
+        with queue_lock:
+            if len(gift_queue) > 0:
+                item = gift_queue[0]
+                next_slot = item.get("slot", 1)
+            else:
+                next_slot = 1
+
+        self.prebuffered_slot = next_slot
+        next_video = get_ramdisk_slot_video(next_slot)
+        print(f"[DeckFeeder] ⚡ 85% Trigger: Pre-buffering Slot {next_slot} ({os.path.basename(next_video)}) on {self.standby_deck.name}...")
+        self.standby_deck.start(next_video, slot_num=next_slot)
+
+    def _on_active_deck_exhausted(self):
+        finished_slot = self.current_slot
+        if finished_slot != 1:
+            threading.Thread(target=on_slot_finished, args=(finished_slot,), daemon=True).start()
+        else:
+            video_p = get_ramdisk_slot_video(1)
+            self.active_deck.start(video_p, slot_num=1)
+
+    def recover(self):
+        print(f"[DeckFeeder] Recovery triggered! Active deck: {self.active_deck.name}, buffered: {self.active_deck.buffered_count()}")
+        try:
+            video_p = get_ramdisk_slot_video(self.current_slot)
+            self.active_deck.start(video_p, slot_num=self.current_slot)
+        except Exception as e:
+            print(f"[DeckFeeder] Recovery error: {e}")
+
+    def stop(self):
+        self.is_running = False
+        self.stop_event.set()
+
+        self.deck_a.stop()
+        self.deck_b.stop()
+
+        if self.v_holder:
+            try: os.close(self.v_holder)
+            except Exception: pass
+            self.v_holder = None
+        if self.a_holder:
+            try: os.close(self.a_holder)
+            except Exception: pass
+            self.a_holder = None
+
+        for p in (RAMDISK_VIDEO_FIFO, RAMDISK_AUDIO_FIFO):
+            if os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
+        print("[DeckFeeder] Stopped and cleaned up.")
+
+deck_feeder = ContinuousDeckFeeder()
+
+master_watchdog_thread = None
+master_watchdog_stop = threading.Event()
+
+def master_watchdog_loop():
+    global master_watchdog_stop
+    print("[StreamWatchdog] Master FFmpeg watchdog thread started.")
+    last_frame = -1
+    idle_count = 0
+
+    while not master_watchdog_stop.is_set():
+        time.sleep(1.0)
+        if not stream_metadata.get("active") or get_ffmpeg_pid() is None:
+            idle_count = 0
+            continue
+
+        cur_frame = None
+        cur_fps = 0.0
+        cur_speed = "1.0x"
+
+        if os.path.exists(RAMDISK_PROGRESS_FILE):
+            try:
+                with open(RAMDISK_PROGRESS_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                    for line in reversed(lines[-20:]):
+                        if line.startswith("frame=") and cur_frame is None:
+                            try: cur_frame = int(line.strip().split("=")[1])
+                            except Exception: pass
+                        elif line.startswith("fps=") and cur_fps == 0.0:
+                            try: cur_fps = float(line.strip().split("=")[1])
+                            except Exception: pass
+                        elif line.startswith("speed=") and cur_speed == "1.0x":
+                            cur_speed = line.strip().split("=")[1]
+            except Exception:
+                pass
+
+        if cur_frame is not None:
+            if cur_frame == last_frame:
+                idle_count += 1
+                if idle_count >= 3:
+                    print(f"[StreamWatchdog] ⚠️ Stream freeze detected! Frame count {cur_frame} unchanged for {idle_count}s. Executing feeder recovery...")
+                    if deck_feeder.is_running:
+                        deck_feeder.recover()
+                    idle_count = 0
+            else:
+                last_frame = cur_frame
+                idle_count = 0
+
+def start_master_watchdog():
+    global master_watchdog_thread, master_watchdog_stop
+    master_watchdog_stop.clear()
+    if master_watchdog_thread is None or not master_watchdog_thread.is_alive():
+        master_watchdog_thread = threading.Thread(target=master_watchdog_loop, name="MasterStreamWatchdog", daemon=True)
+        master_watchdog_thread.start()
+
 def stop_ffmpeg_stream(close_tiktok_room=False):
-    global streaming_process, stream_metadata
+    global streaming_process, stream_metadata, deck_feeder, master_watchdog_stop
+    master_watchdog_stop.set()
+    try:
+        deck_feeder.stop()
+    except Exception as e:
+        print(f"[StreamingEngine] Error stopping deck feeder: {e}")
+
     with stream_lock:
         if streaming_process:
             proc = streaming_process
@@ -1451,11 +2585,18 @@ def find_slot_video(slot_num):
     return None
 
 def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_override=None, loop=True, slot_num=1):
-    global streaming_process, stream_metadata
-    # HANYA matikan proses FFmpeg lokal, JANGAN tutup room TikTok
+    global streaming_process, stream_metadata, deck_feeder
+
+    # 1. Jika Master FFmpeg dan Deck Feeder SUDAH AKTIF, alihkan slot secara instan (0ms gap) tanpa restart!
+    if deck_feeder.is_running and get_ffmpeg_pid() is not None:
+        print(f"[StreamingEngine] Master FFmpeg aktif (PID: {get_ffmpeg_pid()}). Mengalihkan feeder ke Slot {slot_num} secara instan (0ms gap)...")
+        deck_feeder.switch_to_slot(slot_num)
+        return
+
+    # 2. Jika belum aktif, mulai proses Persistent Master FFmpeg
     stop_ffmpeg_stream(close_tiktok_room=False)
-    time.sleep(1.2) # Jeda untuk memastikan socket RTMP di sisi edge server TikTok benar-benar rilis
-    
+    time.sleep(0.5)
+
     if not rtmp_url:
         rtmp_url = stream_metadata.get("rtmpUrl", "")
     if not stream_key:
@@ -1465,19 +2606,11 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
 
     if not rtmp_url or not stream_key:
         raise Exception("Stream RTMP URL atau Stream Key belum tersedia. Harap Start Live terlebih dahulu.")
-    
-    video_path = video_override
-    if not video_path:
-        video_path = find_slot_video(slot_num)
-    if not video_path:
-        video_path = os.path.join(BASE_DIR, "media", "standby-loop.mp4")
-    
-    if not os.path.exists(video_path):
-        raise Exception(f"Video file tidak ditemukan untuk Slot {slot_num}: uploads/videos/video_{slot_num}.webm atau media/standby-loop.mp4")
 
+    init_ramdisk_cache()
     clean_rtmp = rtmp_url.rstrip('/')
     destination = f"{clean_rtmp}/{stream_key}"
-    
+
     char_cfg = load_character_config()
     overlay_enabled = char_cfg.get("overlay_enabled", True)
 
@@ -1495,42 +2628,51 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
     if overlay_enabled and not os.path.exists(GUIDE_OVERLAY_FILE):
         try:
             generate_guide_overlay(char_cfg)
+            init_ramdisk_cache()
         except Exception as e:
             print(f"[StreamingEngine] Error generating overlay: {e}")
 
-    has_overlay = overlay_enabled and os.path.exists(GUIDE_OVERLAY_FILE)
-    has_audio = check_has_audio(video_path)
+    has_overlay = overlay_enabled and os.path.exists(GUIDE_OVERLAY_SHM)
 
-    loop_args = ["-stream_loop", "-1"] if loop else []
-    # Full-screen 720x1280 layout + Floating top-right PiP webcam box (dynamic coords from compositor_config.json)
-    scale_filter = f"scale=720:1280:flags=lanczos:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,drawbox=x={cam_x}:y={cam_y}:w={cam_w}:h={cam_h}:color=0x181820@0.85:t=fill,drawbox=x={cam_x}:y={cam_y}:w={cam_w}:h={cam_h}:color=0x25f4ee:t=2"
+    # ZERO runtime scaling (video sudah 720x1280 24fps)
+    drawbox_filter = f"drawbox=x={cam_x}:y={cam_y}:w={cam_w}:h={cam_h}:color=0x181820@0.85:t=fill,drawbox=x={cam_x}:y={cam_y}:w={cam_w}:h={cam_h}:color=0x25f4ee:t=2"
+
+    # Jalankan Continuous Deck Feeder
+    deck_feeder.start(initial_slot=slot_num)
 
     cmd = [
         "ffmpeg",
+        "-y",
+        "-nostdin",
         "-nostats",
         "-loglevel", "warning",
-        "-re"
-    ] + loop_args + [
-        "-i", video_path
+        "-probesize", "32",
+        "-analyzeduration", "0",
+        "-thread_queue_size", "1024",
+        "-f", "rawvideo",
+        "-pix_fmt", "yuv420p",
+        "-s", "720x1280",
+        "-r", "24",
+        "-i", RAMDISK_VIDEO_FIFO,
+        "-probesize", "32",
+        "-analyzeduration", "0",
+        "-thread_queue_size", "1024",
+        "-f", "s16le",
+        "-ar", "44100",
+        "-ac", "2",
+        "-i", RAMDISK_AUDIO_FIFO,
     ]
 
     if has_overlay:
-        cmd += ["-i", GUIDE_OVERLAY_FILE]
-        filter_str = f"[0:v]{scale_filter}[vscaled];[vscaled][1:v]overlay=x={pos_x}:y={pos_y}:eof_action=repeat[outv]"
+        cmd += ["-i", GUIDE_OVERLAY_SHM]
+        filter_str = f"[0:v]{drawbox_filter}[vboxed];[vboxed][2:v]overlay=x={pos_x}:y={pos_y}:eof_action=repeat[outv]"
     else:
-        filter_str = f"[0:v]{scale_filter}[outv]"
-
-    if not has_audio:
-        cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
-        silent_audio_idx = 2 if has_overlay else 1
-        audio_map = f"{silent_audio_idx}:a"
-    else:
-        audio_map = "0:a"
+        filter_str = f"[0:v]{drawbox_filter}[outv]"
 
     cmd += [
         "-filter_complex", filter_str,
         "-map", "[outv]",
-        "-map", audio_map,
+        "-map", "1:a",
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-tune", "zerolatency",
@@ -1550,7 +2692,8 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
         "-ar", "44100",
         "-flvflags", "no_duration_filesize",
         "-f", "flv",
-        destination
+        destination,
+        "-progress", RAMDISK_PROGRESS_FILE
     ]
 
     vpn_cfg = load_vpn_config()
@@ -1567,13 +2710,13 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
             cmd = ["proxychains4", "-q", "-f", PROXYCHAINS_CONF] + cmd
 
     rotate_ffmpeg_log_if_needed()
-    print(f"[StreamingEngine] Starting standardized ffmpeg push to TikTok (Slot {slot_num}): {' '.join(cmd[:12])}...")
-    
+    print(f"[StreamingEngine] Starting Persistent Master FFmpeg to TikTok (Initial Slot {slot_num}): {' '.join(cmd[:16])}...")
+
     with stream_lock:
         err_sink = subprocess.DEVNULL
         try:
             ffmpeg_log_fp = open(FFMPEG_LOG_FILE, "a", encoding="utf-8")
-            ffmpeg_log_fp.write(f"\n--- [FFmpeg Stream Start: {time.strftime('%Y-%m-%d %H:%M:%S')} | Slot: {slot_num}] ---\n")
+            ffmpeg_log_fp.write(f"\n--- [Persistent Master FFmpeg Start: {time.strftime('%Y-%m-%d %H:%M:%S')} | Slot: {slot_num}] ---\n")
             ffmpeg_log_fp.write(f"Command: {' '.join(cmd)}\n")
             if should_use_vpn:
                 ffmpeg_log_fp.write("Network: Cloudflare WARP SOCKS5 Tunnel (127.0.0.1:40000)\n")
@@ -1590,7 +2733,6 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
             env=ffmpeg_env
         )
 
-        # Close log file descriptor in parent process immediately after Popen
         if err_sink and err_sink != subprocess.DEVNULL:
             try:
                 err_sink.close()
@@ -1604,8 +2746,11 @@ def start_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id="", video_overri
         stream_metadata["rawStreamKey"] = stream_key
         stream_metadata["roomId"] = room_id
         stream_metadata["currentSlot"] = slot_num
-        stream_metadata["currentVideo"] = os.path.basename(video_path)
+        video_p = get_ramdisk_slot_video(slot_num)
+        stream_metadata["currentVideo"] = os.path.basename(video_p)
         save_stream_metadata()
+
+        start_master_watchdog()
 
 def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
     global streaming_process, stream_metadata, dual_screen_active
@@ -1627,6 +2772,8 @@ def start_dual_screen_ffmpeg_stream(rtmp_url=None, stream_key=None, room_id=""):
 
     cmd = [
         "ffmpeg",
+        "-y",
+        "-nostdin",
         "-nostats",
         "-loglevel", "warning",
         "-thread_queue_size", "4096",
@@ -1943,7 +3090,7 @@ def match_gift_to_slot(gift_name, gift_id_str):
     for m in mappings:
         slot = m.get("slot")
         cfg_gift = str(m.get("gift_id", "")).lower().strip()
-        if not slot or slot < 2 or slot > 6:
+        if not slot or slot < 2:
             continue
         if cfg_gift == norm_name or cfg_gift == norm_id:
             return slot
@@ -1959,7 +3106,7 @@ def match_gift_to_slot(gift_name, gift_id_str):
             slot = int(slot_str)
         except Exception:
             continue
-        if slot < 2 or slot > 6:
+        if slot < 2:
             continue
         cfg_gift_norm = str(cfg_gift).lower().strip()
         if cfg_gift_norm == norm_name or cfg_gift_norm == norm_id:
@@ -2047,6 +3194,20 @@ def play_slot(slot_num, source_info=None):
             threading.Thread(target=_slot_timer, args=(slot_num,), daemon=True).start()
         return True
 
+    # Persistent Master FFmpeg: jika feeder dan Master FFmpeg sudah aktif, beralih slot 0ms tanpa restart!
+    if deck_feeder.is_running and get_ffmpeg_pid() is not None:
+        print(f"[StreamingEngine] Master FFmpeg aktif (PID: {get_ffmpeg_pid()}). Mengalihkan feeder ke Slot {slot_num} secara instan (0ms gap)...")
+        deck_feeder.switch_to_slot(slot_num)
+        if not is_standby:
+            duration = get_video_duration(slot_video_path)
+            print(f"[QueueManager] Memutar Slot {slot_num} ({os.path.basename(slot_video_path)}), durasi: {duration:.2f}s")
+            def _slot_timer(expected_slot):
+                sleep_time = max(1.0, duration - 0.5)
+                time.sleep(sleep_time)
+                on_slot_finished(expected_slot)
+            threading.Thread(target=_slot_timer, args=(slot_num,), daemon=True).start()
+        return True
+
     try:
         start_ffmpeg_stream(
             rtmp_url=stream_metadata.get("rtmpUrl"),
@@ -2063,12 +3224,10 @@ def play_slot(slot_num, source_info=None):
     if not is_standby:
         duration = get_video_duration(slot_video_path)
         print(f"[QueueManager] Memutar Slot {slot_num} ({os.path.basename(slot_video_path)}), durasi: {duration:.2f}s")
-        
         def _slot_timer(expected_slot):
             sleep_time = max(1.0, duration - 0.5)
             time.sleep(sleep_time)
             on_slot_finished(expected_slot)
-
         threading.Thread(target=_slot_timer, args=(slot_num,), daemon=True).start()
 
     return True
@@ -2403,6 +3562,23 @@ def fetch_tiktok_stream_key():
     return rtmp_url, stream_key, json_data, room_id
 
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
+    def send_json_response(self, data, status_code=200):
+        self.send_response(status_code)
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+    def read_json_body(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length <= 0:
+            return {}
+        body = self.rfile.read(content_length).decode('utf-8')
+        try:
+            return json.loads(body)
+        except Exception:
+            return {}
+
     def check_auth(self):
         client_ip = self.client_address[0]
         if client_ip in ["127.0.0.1", "::1", "localhost"]:
@@ -2450,10 +3626,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             50% { background-position: 100% 100%; }
                             100% { background-position: 0% 0%; }
                         }
-                        @keyframes spin-around {
-                            0% { transform: translateZ(0) rotate(0deg); }
-                            100% { transform: translateZ(0) rotate(360deg); }
-                        }
+
                         @keyframes floating {
                             0%, 100% { transform: translateY(0px); }
                             50% { transform: translateY(-6px); }
@@ -2484,11 +3657,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         }
                         .shimmer-btn {
                             --spread: 90deg;
-                            --shimmer-color: #ffffff;
-                            --radius: 100px;
+                            --shimmer-color: #25f4ee;
+                            --radius: 10px;
                             --speed: 3s;
                             --cut: 1.5px;
-                            --bg: rgba(15, 15, 20, 0.95);
                             position: relative;
                             z-index: 0;
                             display: inline-flex;
@@ -2497,30 +3669,61 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             overflow: hidden;
                             white-space: nowrap;
                             cursor: pointer;
-                            border: 1px solid rgba(255, 255, 255, 0.12);
+                            border: 1px solid rgba(37, 244, 238, 0.5);
                             border-radius: var(--radius);
-                            background: var(--bg);
+                            background: rgba(37, 244, 238, 0.15);
+                            backdrop-filter: blur(12px) url("#container-glass");
+                            -webkit-backdrop-filter: blur(12px) url("#container-glass");
                             color: #ffffff;
                             padding: 12px 24px;
-                            font-weight: 600;
+                            font-weight: 700;
                             font-size: 14px;
                             transform: translateZ(0);
-                            transition: transform 0.3s ease-in-out, box-shadow 0.3s ease-in-out;
-                            box-shadow: inset 0 -8px 10px #ffffff1f;
+                            transition: all 250ms cubic-bezier(0.1, 0.4, 0.2, 1);
+                            box-shadow: 
+                                0 0 8px rgba(0,0,0,0.25),
+                                0 2px 6px rgba(0,0,0,0.35),
+                                inset 3px 3px 0.5px -3.5px rgba(255,255,255,0.25),
+                                inset -3px -3px 0.5px -3.5px rgba(255,255,255,0.85),
+                                inset 1px 1px 1px -0.5px rgba(255,255,255,0.6),
+                                inset -1px -1px 1px -0.5px rgba(255,255,255,0.6),
+                                inset 0 0 6px 6px rgba(255,255,255,0.10),
+                                inset 0 0 2px 2px rgba(255,255,255,0.06),
+                                0 0 12px rgba(37,244,238,0.25);
                             width: 100%;
                             text-decoration: none;
+                            outline: none;
                         }
-                        .shimmer-btn:hover {
-                            box-shadow: inset 0 -6px 10px #ffffff3f;
-                        }
-                        .shimmer-btn::before {
+                        .shimmer-btn::after {
                             content: "";
                             position: absolute;
-                            inset: calc(var(--cut) * -1);
-                            z-index: -1;
+                            top: 0;
+                            left: 0;
+                            right: 0;
+                            height: 48%;
+                            background: linear-gradient(180deg, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0) 100%);
                             border-radius: inherit;
-                            background: conic-gradient(from calc(270deg - (var(--spread) / 2)), transparent 0, var(--shimmer-color) var(--spread), transparent var(--spread));
-                            animation: spin-around var(--speed) infinite linear;
+                            pointer-events: none;
+                            z-index: 1;
+                        }
+                        .shimmer-btn:hover {
+                            transform: translateY(-1.5px) scale(1.02);
+                            filter: brightness(1.15);
+                            box-shadow: 
+                                0 6px 20px rgba(0, 0, 0, 0.5),
+                                0 0 20px rgba(37, 244, 238, 0.45),
+                                inset 3px 3px 1px -3px rgba(255,255,255,0.45),
+                                inset -3px -3px 1px -3.5px rgba(255,255,255,0.95),
+                                inset 0 0 8px 8px rgba(255,255,255,0.15);
+                        }
+                        .shimmer-btn:active {
+                            transform: translateY(2px) scale(0.98);
+                            filter: brightness(0.95);
+                            box-shadow: 0 1px 3px rgba(0,0,0,0.6), inset 2px 2px 2px rgba(0,0,0,0.5);
+                        }
+                        .shimmer-btn::before {
+                            display: none !important;
+                            content: none !important;
                         }
                         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f11; color: #f1f1f3; margin: 0; display: flex; align-items: center; justify-content: center; height: 100vh; }
                         .login-container { width: 100%; max-width: 380px; padding: 20px; box-sizing: border-box; }
@@ -2529,6 +3732,30 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     </style>
                 </head>
                 <body>
+
+<!-- SVG Liquid Glass Turbulence Filter -->
+<svg class="hidden" style="position:fixed; top:-9999px; left:-9999px; width:0; height:0; pointer-events:none;" aria-hidden="true">
+  <defs>
+    <filter id="container-glass" x="0%" y="0%" width="100%" height="100%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.05 0.05" numOctaves="1" seed="1" result="turbulence" />
+      <feGaussianBlur in="turbulence" stdDeviation="2" result="blurredNoise" />
+      <feDisplacementMap in="SourceGraphic" in2="blurredNoise" scale="70" xChannelSelector="R" yChannelSelector="B" result="displaced" />
+      <feGaussianBlur in="displaced" stdDeviation="4" result="finalBlur" />
+      <feComposite in="finalBlur" in2="finalBlur" operator="over" />
+    </filter>
+  </defs>
+</svg>
+                    <svg class="hidden" style="position:fixed; top:-9999px; left:-9999px; width:0; height:0; pointer-events:none;" aria-hidden="true">
+                      <defs>
+                        <filter id="container-glass" x="0%" y="0%" width="100%" height="100%" color-interpolation-filters="sRGB">
+                          <feTurbulence type="fractalNoise" baseFrequency="0.05 0.05" numOctaves="1" seed="1" result="turbulence" />
+                          <feGaussianBlur in="turbulence" stdDeviation="2" result="blurredNoise" />
+                          <feDisplacementMap in="SourceGraphic" in2="blurredNoise" scale="70" xChannelSelector="R" yChannelSelector="B" result="displaced" />
+                          <feGaussianBlur in="displaced" stdDeviation="4" result="finalBlur" />
+                          <feComposite in="finalBlur" in2="finalBlur" operator="over" />
+                        </filter>
+                      </defs>
+                    </svg>
                     <div class="login-container">
                         <div class="shine-border-card">
                             <h2>TikTok Live Dashboard</h2>
@@ -2566,12 +3793,22 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     ip_lock_badge = "<span style='background:rgba(113,113,122,0.18); border:1px solid #71717a; color:#a1a1aa; padding:2px 10px; border-radius:12px; font-size:11px; margin-left:10px;'>⚪ Belum Diverifikasi</span>"
 
-                account_status_banner = f"""<div style='background: rgba(52, 199, 89, 0.15); border: 1px solid #34c759; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; color: #34c759; font-weight: bold; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;'>
-                    <div>✅ Akun Terhubung: @{tiktok_username.lstrip('@')} {ip_lock_badge}</div>
-                    <div style='font-size:12px; font-weight:normal; color:#aaa;'>Verifikasi Terakhir: {last_time or '-'}</div>
+                account_status_banner = f"""<div style='background: rgba(52, 199, 89, 0.15); border: 1px solid #34c759; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; color: #34c759; font-weight: bold; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;'>
+                    <div style='display:flex; align-items:center; gap:8px; flex-wrap:wrap;'>
+                        <span>✅ Akun Terhubung: <b>@{tiktok_username.lstrip('@')}</b></span>
+                        {ip_lock_badge}
+                    </div>
+                    <div style='display:flex; align-items:center; gap:10px; flex-wrap:wrap;'>
+                        <span style='font-size:12px; font-weight:normal; color:#aaa;'>Verifikasi: {last_time or '-'}</span>
+                        <button type="button" onclick="window.focusAccountInput()" class="modern-btn" style="padding:5px 12px; font-size:12px; background:rgba(37,244,238,0.15); color:#25f4ee; border:1px solid #25f4ee; cursor:pointer; border-radius:6px; font-weight:bold;">🔄 Ganti Akun</button>
+                        <button type="button" onclick="window.disconnectTikTokAccount()" class="modern-btn" style="padding:5px 12px; font-size:12px; background:rgba(255,59,48,0.15); color:#ff3b30; border:1px solid #ff3b30; cursor:pointer; border-radius:6px; font-weight:bold;">🔌 Putus Akun</button>
+                    </div>
                 </div>"""
             else:
-                account_status_banner = f"<div style='background: rgba(255, 59, 48, 0.15); border: 1px solid #ff3b30; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; color: #ff3b30; font-weight: bold;'>⚠️ Akun TikTok Belum Dikonfigurasi — Silakan isi konfigurasi akun di bawah sebelum memulai Live</div>"
+                account_status_banner = f"""<div style='background: rgba(255, 59, 48, 0.15); border: 1px solid #ff3b30; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; color: #ff3b30; font-weight: bold; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;'>
+                    <div>⚠️ Akun TikTok Belum Dikonfigurasi — Silakan isi Username & Cookies di bawah sebelum memulai Live</div>
+                    <button type="button" onclick="window.focusAccountInput()" class="modern-btn" style="padding:6px 14px; font-size:12px; background:#ff3b30; color:#fff; border:none; cursor:pointer; border-radius:6px; font-weight:bold;">⚙️ Hubungkan Akun</button>
+                </div>"""
 
             is_live = get_ffmpeg_pid() is not None
             live_color = "#34c759" if is_live else "#ff3b30"
@@ -2751,9 +3988,62 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
             gift_config = load_gift_config()
             video_meta = load_video_meta()
-            video_slots_html = ""
+            active_slots = get_active_video_slots()
+            next_slot_id = get_next_slot_number()
+
+            new_slot_gift_options = []
+            for g in GIFTS_CATALOG:
+                sel = "selected" if g["id"] == "rose" else ""
+                new_slot_gift_options.append(f'<option value="{g["id"]}" {sel}>{g["icon"]} {g["name"]} ({g["coins"]} koin)</option>')
+            new_slot_gift_options_html = "\n".join(new_slot_gift_options)
+
+            video_slots_html = f"""
+            <div style="background:#15151c; border:1px solid #27272a; border-radius:10px; padding:16px; margin-bottom:18px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+                    <div>
+                        <div style="font-size:16px; font-weight:bold; color:var(--cyan); display:flex; align-items:center; gap:8px;">
+                            <span>🎬</span> Dynamic Video Slots Management
+                            <span style="font-size:11px; background:rgba(37,244,238,0.15); color:#25f4ee; padding:2px 8px; border-radius:10px;">{len(active_slots)} Slot Aktif</span>
+                        </div>
+                        <div style="font-size:12px; color:#888; margin-top:4px;">
+                            Slot 1 (Standby Loop). Slot 2 ke atas (Reaksi Gift Dinamis). Anda dapat terus menambahkan slot tanpa batas.
+                        </div>
+                    </div>
+                    <button type="button" class="modern-btn" style="background:rgba(37,244,238,0.18); border:1px solid #25f4ee; color:#25f4ee; padding:8px 16px; font-size:13px; font-weight:bold; cursor:pointer;" onclick="toggleAddSlotForm()">
+                        ➕ Tambah Slot Baru (Slot {next_slot_id})
+                    </button>
+                </div>
+                
+                <div id="add-new-slot-panel" style="display:none; margin-top:16px; padding-top:16px; border-top:1px dashed #27272a; background:#101014; padding:14px; border-radius:8px;">
+                    <div style="font-size:13px; font-weight:bold; color:#25f4ee; margin-bottom:10px;">
+                        📤 Unggah Video untuk Slot Baru (Slot {next_slot_id})
+                    </div>
+                    <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                        <input type="file" id="videofile-{next_slot_id}" accept="video/webm,video/mp4,.webm,.mp4" style="color:#aaa; font-size:12px;" />
+                        <div style="display:flex; align-items:center; gap:6px;">
+                            <span style="font-size:12px; color:#a1a1aa;">Pemicu Gift Awal:</span>
+                            <select id="new-slot-initial-gift" style="background:#1c1c1e; color:#fff; border:1px solid #3f3f46; border-radius:6px; padding:6px 10px; font-size:12px;">
+                                {new_slot_gift_options_html}
+                            </select>
+                        </div>
+                        <button type="button" class="modern-btn btn-upload" id="btn-upload-{next_slot_id}" style="padding:6px 16px; font-size:12px; background:linear-gradient(135deg, #25f4ee, #34c759); color:#000; font-weight:bold; border:none; cursor:pointer;" onclick="startChunkedUpload({next_slot_id})">
+                            🚀 Mulai Unggah & Buat Slot
+                        </button>
+                    </div>
+                    <div id="progress-box-{next_slot_id}" style="display:none; background:#121214; padding:8px 12px; border-radius:6px; border:1px solid #27272a; margin-top:10px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; font-size:11px; margin-bottom:5px;">
+                            <span id="progress-status-{next_slot_id}" style="color:#25f4ee; font-weight:600;">Mengunggah: 0%</span>
+                            <span id="progress-size-{next_slot_id}" style="color:#888;">0 / 0 MB</span>
+                        </div>
+                        <div style="background:#222; height:8px; border-radius:4px; overflow:hidden; border:1px solid #333;">
+                            <div id="progress-bar-{next_slot_id}" style="background:linear-gradient(90deg, #25f4ee, #34c759); width:0%; height:100%; transition:width 0.1s ease;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """
             
-            for i in range(1, 7):
+            for i in active_slots:
                 # ponytail: first-found wins; upgrade when mixed webm+mp4 per slot matters
                 existing_file = None
                 for ext in ("webm", "mp4"):
@@ -2783,25 +4073,60 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     else:
                         bypass_badge = "<span style='background:rgba(52,199,89,0.18); border:1px solid #34c759; color:#34c759; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; margin-right:8px;'>⚡ 720x1280 Ready</span>"
 
+                    delete_btn = f"<a href='/delete-video?name={existing_file}&slot=1' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:5px 10px; font-size:11px; text-decoration:none;'>Reset Video</a>" if i == 1 else f"<button type='button' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:5px 10px; font-size:11px; cursor:pointer;' onclick='confirmDeleteSlot({i})'>Hapus</button>"
+
                     file_status_ui = f"""
-                    {bypass_badge}
-                    <span style='color:#34c759; margin-right:8px;'>✅ <b>Video Tersedia</b> <span style='color:#888; font-size:12px;'>({size_mb} MB)</span></span>
-                    <button type="button" class="modern-btn" style="padding:5px 12px; font-size:11px; margin-right:6px; background:#27272a; color:#25f4ee; border:1px solid #3f3f46; cursor:pointer;" onclick="editVideoName('{i}', '{display_name}')">✏️ Edit</button>
-                    <button type="button" id="btn-preview-slot-{i}" class="modern-btn" style="padding:5px 12px; font-size:11px; margin-right:6px; background:rgba(37,244,238,0.1); color:#25f4ee; border:1px solid #25f4ee; cursor:pointer;" onclick="toggleSlotPreview('{i}', '{existing_file}', '{v_mime}', '{display_name}', '{size_mb}')">👁️ Tampilkan Preview</button>
-                    <a href='/delete-video?name={existing_file}&slot={i}' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:5px 12px; font-size:11px; text-decoration:none;'>Hapus</a>
+                    <div style='display:flex; flex-direction:column; gap:6px; align-items:flex-end;'>
+                        <div style='display:flex; align-items:center; flex-wrap:wrap; justify-content:flex-end; gap:6px;'>
+                            {bypass_badge}
+                            <span style='color:#34c759; margin-right:4px;'>✅ <b>Video Tersedia</b> <span style='color:#888; font-size:12px;'>({size_mb} MB)</span></span>
+                            <button type="button" class="modern-btn" style="padding:5px 10px; font-size:11px; background:#27272a; color:#25f4ee; border:1px solid #3f3f46; cursor:pointer;" onclick="editVideoName('{i}', '{display_name}')">✏️ Edit</button>
+                            <button type="button" id="btn-preview-slot-{i}" class="modern-btn" style="padding:5px 10px; font-size:11px; background:rgba(37,244,238,0.1); color:#25f4ee; border:1px solid #25f4ee; cursor:pointer;" onclick="toggleSlotPreview('{i}', '{existing_file}', '{v_mime}', '{display_name}', '{size_mb}')">👁️ Preview</button>
+                            <button type="button" class="modern-btn" style="padding:5px 10px; font-size:11px; background:rgba(37,244,238,0.15); color:#25f4ee; border:1px solid #25f4ee; cursor:pointer;" onclick="toggleReplaceSlot('{i}')">🔄 Ganti</button>
+                            {delete_btn}
+                        </div>
+                        <div id="replace-slot-box-{i}" style="display:none; width:100%; margin-top:6px; background:#121214; padding:8px 12px; border-radius:6px; border:1px solid #27272a;">
+                            <div style='display:flex; align-items:center; gap:10px; flex-wrap:wrap;'>
+                                <span style="color:#a1a1aa; font-size:12px;">Pilih Video Baru (.mp4/.webm):</span>
+                                <input type="file" id="videofile-{i}" accept="video/webm,video/mp4,.webm,.mp4" style="color:#aaa; font-size:12px;" />
+                                <button type="button" class="modern-btn btn-upload" id="btn-upload-{i}" style="padding:6px 14px; font-size:12px;" onclick="startChunkedUpload({i})">Mulai Upload</button>
+                            </div>
+                            <div id="progress-box-{i}" style="display:none; margin-top:8px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; font-size:11px; margin-bottom:5px;">
+                                    <span id="progress-status-{i}" style="color:#25f4ee; font-weight:600;">Mengunggah: 0%</span>
+                                    <span id="progress-size-{i}" style="color:#888;">0 / 0 MB</span>
+                                </div>
+                                <div style="background:#222; height:8px; border-radius:4px; overflow:hidden; border:1px solid #333;">
+                                    <div id="progress-bar-{i}" style="background:linear-gradient(90deg, #25f4ee, #34c759); width:0%; height:100%; transition:width 0.1s ease;"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                     """
                     
                     preview_html = f"""
                     <div id="preview-container-{i}" style="display:none; margin-top:10px;"></div>
                     """
                 else:
+                    delete_empty_btn = f"<button type='button' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:6px 12px; font-size:12px; cursor:pointer;' onclick='confirmDeleteSlot({i})'>Hapus Slot</button>" if i >= 2 else ""
                     file_status_ui = f"""
-                    <form action="/upload-video" method="POST" enctype="multipart/form-data" style='display:flex; align-items:center; gap:10px; margin:0;' onsubmit="return validateUpload(this);">
-                        <input type="hidden" name="slot" value="{i}" />
-                        <span style="color:#a1a1aa; font-size:12px;">Format .webm / .mp4</span>
-                        <input type="file" name="videofile" accept="video/webm,video/mp4,.webm,.mp4" style="color:#aaa; font-size:12px;" />
-                        <button type="submit" class="modern-btn btn-upload" style="padding:6px 14px; font-size:12px;">Upload</button>
-                    </form>
+                    <div style='display:flex; flex-direction:column; gap:6px; min-width:320px;'>
+                        <div style='display:flex; align-items:center; gap:10px; flex-wrap:wrap;'>
+                            <span style="color:#a1a1aa; font-size:12px;">Format .mp4 / .webm</span>
+                            <input type="file" id="videofile-{i}" accept="video/webm,video/mp4,.webm,.mp4" style="color:#aaa; font-size:12px;" />
+                            <button type="button" class="modern-btn btn-upload" id="btn-upload-{i}" style="padding:6px 14px; font-size:12px;" onclick="startChunkedUpload({i})">Upload Video</button>
+                            {delete_empty_btn}
+                        </div>
+                        <div id="progress-box-{i}" style="display:none; background:#121214; padding:8px 12px; border-radius:6px; border:1px solid #27272a; margin-top:4px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; font-size:11px; margin-bottom:5px;">
+                                <span id="progress-status-{i}" style="color:#25f4ee; font-weight:600;">Mengunggah: 0%</span>
+                                <span id="progress-size-{i}" style="color:#888;">0 / 0 MB</span>
+                            </div>
+                            <div style="background:#222; height:8px; border-radius:4px; overflow:hidden; border:1px solid #333;">
+                                <div id="progress-bar-{i}" style="background:linear-gradient(90deg, #25f4ee, #34c759); width:0%; height:100%; transition:width 0.1s ease;"></div>
+                            </div>
+                        </div>
+                    </div>
                     """
 
                 video_slots_html += f"""
@@ -2830,7 +4155,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 video_slots_html += "</div>"
 
             simulation_buttons_html = ""
-            for s in range(2, 7):
+            reaction_slots = [s for s in active_slots if s >= 2]
+            for s in reaction_slots:
                 cfg_gift_id = gift_config.get(str(s), "rose")
                 gift_title = cfg_gift_id.replace("_", " ").title()
                 gift_icon = "🎁"
@@ -2932,13 +4258,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 char_thumbs_items.append(thumb_markup)
             characters_thumbnails_html = "\n".join(char_thumbs_items)
 
-            # 2. Build 5 mapping rows (Slot 2 s.d. Slot 6)
+            # 2. Build mapping rows for dynamic reaction slots (Slot 2 s.d. N)
             mappings_list = char_cfg.get("mappings", [])
             mapping_rows_items = []
-            for r in range(5):
-                slot_target = r + 2
-                row_data = mappings_list[r] if r < len(mappings_list) else {"slot": slot_target, "gift_id": "rose", "character_ids": ["1"]}
-                cur_gift = row_data.get("gift_id", "rose")
+            mapping_reaction_slots = [s for s in active_slots if s >= 2]
+            for r, slot_target in enumerate(mapping_reaction_slots):
+                existing_map = next((m for m in mappings_list if m.get("slot") == slot_target), None)
+                row_data = existing_map if existing_map else {"slot": slot_target, "gift_id": gift_config.get(str(slot_target), "rose"), "character_ids": ["1"]}
+                cur_gift = row_data.get("gift_id", gift_config.get(str(slot_target), "rose"))
                 cur_chars = [str(x) for x in row_data.get("character_ids", [])]
 
                 gift_options = []
@@ -2963,6 +4290,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                 row_html = f"""
                 <div style="background:#121214; padding:12px 14px; border-radius:8px; border:1px solid #27272a; display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px;">
+                    <input type="hidden" name="slot_order_{r}" value="{slot_target}" />
                     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                         <span style="font-size:12px; font-weight:bold; color:#a1a1aa; width:50px;">Slot {slot_target}:</span>
                         <select name="row_{r}_gift" style="background:#1c1c1e; color:#fff; border:1px solid #3f3f46; border-radius:6px; padding:6px 10px; font-size:12px; outline:none;">
@@ -2990,7 +4318,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
             overlay_enabled_checked = "checked" if overlay_is_on else ""
 
-            # --- Dynamic Random Overlay Layers (Slot 1 - 10) ---
+            # --- Dynamic Random Overlay Layers ---
             dyn_cfg = load_dynamic_overlay_config()
             dyn_slots_cfg = dyn_cfg.get("slots", {})
             dyn_sched_cfg = dyn_cfg.get("scheduler", {})
@@ -2999,11 +4327,29 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             dyn_max_int = dyn_sched_cfg.get("max_interval_sec", 60)
             dyn_layer_pos = dyn_cfg.get("layer_position", "above_webcam")
 
+            def slot_sort_key(k):
+                try:
+                    return (0, int(k))
+                except ValueError:
+                    return (1, str(k))
+
+            sorted_slot_keys = sorted(dyn_slots_cfg.keys(), key=slot_sort_key)
+            total_slots = len(sorted_slot_keys)
+
             dyn_overlay_slots_html = ""
-            for s in range(1, 11):
+            if not sorted_slot_keys:
+                dyn_overlay_slots_html = """
+                <div style='background:#181820; padding:24px; border-radius:8px; border:1px dashed #3f3f46; text-align:center; color:#71717a; margin:10px 0;'>
+                    <p style='margin:0 0 12px 0; font-size:13px;'>Belum ada slot layer animasi.</p>
+                    <button type="button" class="modern-btn" onclick="addNewDynamicOverlaySlot()" style="padding:6px 14px; font-size:12px; background:rgba(37,244,238,0.18); color:#25f4ee; border:1px solid #25f4ee; border-radius:6px; font-weight:bold; cursor:pointer; display:inline-flex; align-items:center; gap:6px;">
+                        <span>➕</span> Tambah Slot Layer Pertama
+                    </button>
+                </div>
+                """
+            for s in sorted_slot_keys:
                 s_str = str(s)
                 s_meta = dyn_slots_cfg.get(s_str, {})
-                s_name = s_meta.get("name", f"Layer Animasi {s}")
+                s_name = s_meta.get("name", f"Layer Animasi {s_str}")
                 s_name_escaped = s_name.replace("'", "\\'")
                 s_enabled = s_meta.get("enabled", True)
                 s_checked = "checked" if s_enabled else ""
@@ -3012,43 +4358,44 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 
                 existing_dyn_file = None
                 for ext in ("webm", "mp4"):
-                    cand = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{s}.{ext}")
+                    cand = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{s_str}.{ext}")
                     if os.path.exists(cand):
-                        existing_dyn_file = f"overlay_{s}.{ext}"
+                        existing_dyn_file = f"overlay_{s_str}.{ext}"
                         break
                 
                 if existing_dyn_file:
                     size_mb = round(os.path.getsize(os.path.join(DYNAMIC_OVERLAYS_DIR, existing_dyn_file)) / (1024 * 1024), 2)
                     file_info_ui = f"<span style='color:#34c759; font-size:11px; font-weight:600;'>✅ <b>File Siap</b> ({size_mb} MB)</span>"
-                    test_btn_ui = f"<button type='button' class='modern-btn' style='padding:4px 10px; font-size:11px; background:rgba(37,244,238,0.15); color:#25f4ee; border:1px solid #25f4ee; border-radius:4px; cursor:pointer;' onclick=\"testDynamicOverlay('{s}')\">▶ Test Layer</button>"
-                    delete_btn_ui = f"<a href='/delete-dynamic-overlay?slot={s}' class='shimmer-btn' style='background:rgba(255, 59, 48, 0.2); border-color:#ff3b30; color:#ff3b30; padding:4px 8px; font-size:11px; border-radius:4px; text-decoration:none;' onclick=\"return confirm('Hapus overlay slot {s}?');\">Hapus</a>"
+                    test_btn_ui = f"<button type='button' class='modern-btn' style='padding:4px 10px; font-size:11px; background:rgba(37,244,238,0.15); color:#25f4ee; border:1px solid #25f4ee; border-radius:4px; cursor:pointer;' onclick=\"testDynamicOverlay('{s_str}')\">▶ Test Layer</button>"
+                    delete_file_btn_ui = f"<a href='/delete-dynamic-overlay?slot={s_str}' class='shimmer-btn' style='background:rgba(255, 149, 0, 0.15); border-color:#ff9500; color:#ff9500; padding:4px 8px; font-size:11px; border-radius:4px; text-decoration:none;' onclick=\"return confirm('Hapus file video dari slot {s_str}?');\">Hapus File</a>"
                     upload_btn_label = "Ganti"
                 else:
                     file_info_ui = "<span style='color:#71717a; font-size:11px;'>⚪ Belum ada file</span>"
                     test_btn_ui = "<button type='button' class='modern-btn' style='padding:4px 10px; font-size:11px; background:rgba(255,255,255,0.05); color:#52525b; border:1px solid #3f3f46; border-radius:4px; cursor:not-allowed;' disabled title='Upload file .webm terlebih dahulu'>▶ Test Layer</button>"
-                    delete_btn_ui = ""
+                    delete_file_btn_ui = ""
                     upload_btn_label = "Upload"
 
                 dyn_overlay_slots_html += f"""
                 <div style='background:#181820; padding:10px 14px; margin:8px 0; border-radius:8px; border:1px solid #27272a; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;'>
                     <div style='display:flex; align-items:center; gap:10px; flex-wrap:wrap;'>
-                        <span style='font-size:13px; font-weight:bold; color:#25f4ee;'>Slot {s}</span>
+                        <span style='font-size:13px; font-weight:bold; color:#25f4ee;'>Slot {s_str}</span>
                         <span style='color:#fff; font-size:13px; font-weight:500;'>{s_name}</span>
-                        <button type="button" class="modern-btn" style="padding:2px 8px; font-size:10px; background:#27272a; color:#a1a1aa; border:1px solid #3f3f46; border-radius:4px; cursor:pointer;" onclick="editDynamicOverlayName('{s}', '{s_name_escaped}')">✏️ Ubah Nama</button>
+                        <button type="button" class="modern-btn" style="padding:2px 8px; font-size:10px; background:#27272a; color:#a1a1aa; border:1px solid #3f3f46; border-radius:4px; cursor:pointer;" onclick="editDynamicOverlayName('{s_str}', '{s_name_escaped}')">✏️ Ubah Nama</button>
                         <label style="display:inline-flex; align-items:center; gap:5px; font-size:11px; color:#fff; cursor:pointer; background:#121216; padding:3px 8px; border-radius:4px; border:1px solid #3f3f46;">
-                            <input type="checkbox" id="dynSlotToggle_{s}" {s_checked} onchange="toggleDynamicOverlaySlot('{s}', this.checked)" style="accent-color:#25f4ee; cursor:pointer;" />
-                            <span id="dynSlotLabel_{s}" style="color:{s_status_color}; font-weight:bold;">{s_status_text}</span>
+                            <input type="checkbox" id="dynSlotToggle_{s_str}" {s_checked} onchange="toggleDynamicOverlaySlot('{s_str}', this.checked)" style="accent-color:#25f4ee; cursor:pointer;" />
+                            <span id="dynSlotLabel_{s_str}" style="color:{s_status_color}; font-weight:bold;">{s_status_text}</span>
                         </label>
                     </div>
                     <div style='display:flex; align-items:center; gap:8px; flex-wrap:wrap;'>
                         {file_info_ui}
                         {test_btn_ui}
-                        {delete_btn_ui}
+                        {delete_file_btn_ui}
                         <form action="/upload-dynamic-overlay" method="POST" enctype="multipart/form-data" style='display:inline-flex; align-items:center; gap:6px; margin:0;'>
-                            <input type="hidden" name="slot" value="{s}" />
+                            <input type="hidden" name="slot" value="{s_str}" />
                             <input type="file" name="overlayfile" accept="video/webm,video/mp4,.webm,.mp4" style="color:#aaa; font-size:10px; max-width:145px;" required />
                             <button type="submit" class="modern-btn btn-upload" style="padding:3px 10px; font-size:11px;">{upload_btn_label}</button>
                         </form>
+                        <button type="button" class="modern-btn" style="padding:4px 8px; font-size:11px; background:rgba(255, 59, 48, 0.15); border:1px solid rgba(255, 59, 48, 0.4); color:#ff3b30; border-radius:4px; cursor:pointer;" onclick="deleteDynamicOverlaySlot('{s_str}')" title="Hapus slot layer {s_str} beserta filenya">🗑️ Hapus Slot</button>
                     </div>
                 </div>
                 """
@@ -3062,13 +4409,16 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:8px;">
                     <div>
                         <h3 style="margin:0; color:#fff; display:flex; align-items:center; gap:8px;">
-                            <span>🎭</span> Dynamic Random Overlay Layers (Slot 1 - 10)
+                            <span>🎭</span> Dynamic Random Overlay Layers ({total_slots} Slot Layer)
                         </h3>
                         <p style="color:#a1a1aa; font-size:13px; margin:4px 0 0 0;">
                             Lapisan animasi transparan (.webm VP8/VP9 dengan Alpha Channel) yang dipicu secara random untuk menjaga variasi visual anti-bot TikTok.
                         </p>
                     </div>
-                    <div>
+                    <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                        <button type="button" class="modern-btn" onclick="addNewDynamicOverlaySlot()" style="padding:6px 14px; font-size:12px; background:rgba(37,244,238,0.18); color:#25f4ee; border:1px solid #25f4ee; border-radius:6px; font-weight:bold; cursor:pointer; display:inline-flex; align-items:center; gap:6px;">
+                            <span>➕</span> Tambah Slot Layer
+                        </button>
                         <span id="overlaySchedulerStatusBadge" style="font-size:11px; padding:4px 10px; border-radius:12px; background:rgba(37,244,238,0.12); color:#25f4ee; border:1px solid #25f4ee; font-weight:bold;">
                             ⏱️ Scheduler Standby
                         </span>
@@ -3100,7 +4450,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     </div>
                 </div>
 
-                <!-- 10 Slots List -->
+                <!-- Slots List -->
                 <div>
                     {dyn_overlay_slots_html}
                 </div>
@@ -3150,7 +4500,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             <h4 style="margin:0; color:#25f4ee; font-size:14px; display:flex; align-items:center; gap:8px;">
                                 <span>🎯</span> Bagian 2: Pemetaan Visual (Ikon Gift = Karakter Target)
                             </h4>
-                            <span style="font-size:11px; color:#888;">Mewakili Pemicu Slot 2 s.d. Slot 6</span>
+                            <span style="font-size:11px; color:#888;">Mewakili Pemicu Slot Reaksi Dinamis (Slot 2 s.d. N)</span>
                         </div>
                         
                         <div style="display:flex; flex-direction:column; gap:10px;">
@@ -3283,15 +4633,15 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             compositor_cfg_json = json.dumps(comp_cfg)
 
             cookies_card_html = f"""
-            <!-- 🍪 TikTok Session / JSON Cookies Card (Bento Grid 2.0) -->
+            <!-- 🍪 TikTok Account & Session Cookies Card (Bento Grid 2.0) -->
             <div class="card" style="margin-top: 15px; border: 1px solid rgba(37, 244, 238, 0.25); background: #13131a;">
                 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
                     <div>
                         <h3 style="margin:0; color:var(--cyan); font-size:17px; display:flex; align-items:center; gap:8px;">
-                            <span>🍪</span> TikTok Session / JSON Cookies
+                            <span>🍪</span> TikTok Account & Session Cookies
                         </h3>
                         <p style="color:#a1a1aa; font-size:12px; margin:4px 0 0 0;">
-                            Tempelkan JSON Cookies akun TikTok Anda (format JSON Array dari Cookie-Editor / EditThisCookie). Digunakan untuk otentikasi live room TikTok & gift listener.
+                            Atur Username target akun TikTok dan tempelkan JSON Cookies (Cookie-Editor / EditThisCookie) untuk live RTMP & gift listener.
                         </p>
                     </div>
                     <div style="display:flex; align-items:center; gap:8px;">
@@ -3299,6 +4649,22 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             {cookies_badge_text}
                         </span>
                     </div>
+                </div>
+
+                <!-- Input Username Target Akun TikTok -->
+                <div style="margin-bottom:14px; background:#0d0d12; border:1px solid #27272a; border-radius:8px; padding:12px;">
+                    <label style="display:block; font-size:13px; font-weight:bold; margin-bottom:6px; color:#fff;">
+                        👤 Target Username Akun TikTok:
+                    </label>
+                    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                        <input type="text" id="tiktok-username-input" value="{tiktok_username}" placeholder="@username_tiktok" style="flex:1; min-width:220px; background:#18181f; color:#25f4ee; border:1px solid #3f3f46; border-radius:6px; padding:9px 12px; font-size:13px; font-weight:bold; font-family:monospace;" />
+                        <button type="button" onclick="window.disconnectTikTokAccount()" class="modern-btn" style="padding:9px 14px; font-size:12px; background:rgba(255,59,48,0.12); color:#ff3b30; border:1px solid rgba(255,59,48,0.3); cursor:pointer; white-space:nowrap; border-radius:6px;">
+                            🔌 Putus / Reset Akun
+                        </button>
+                    </div>
+                    <p style="color:#71717a; font-size:11px; margin:6px 0 0 0;">
+                        💡 <b>Fleksibel</b>: Anda bisa hanya memperbarui username lalu klik <i>Simpan</i> tanpa mengisi ulang cookies. Jika Anda menempelkan cookies baru, sistem otomatis memverifikasi dan menyinkronkan username pemilik cookies.
+                    </p>
                 </div>
 
                 <div style="margin-bottom:12px;">
@@ -3316,7 +4682,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                 <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
                     <button type="button" id="btnSaveCookies" onclick="window.saveJsonCookies(event)" class="shimmer-btn" style="--shimmer-color:#25f4ee; --bg:rgba(37,244,238,0.15); padding:9px 18px; font-size:13px; font-weight:bold; cursor:pointer; border-radius:8px;">
-                        💾 Simpan / Update Cookies
+                        💾 Simpan Akun / Cookies
                     </button>
                     <button type="button" id="btnValidateCookies" onclick="window.triggerAccountValidation(event)" class="shimmer-btn" style="--shimmer-color:#34c759; --bg:rgba(52,199,89,0.15); padding:9px 18px; font-size:13px; font-weight:bold; cursor:pointer; border-radius:8px;">
                         🔍 Validasi Session Akun (via WARP Proxy)
@@ -3324,6 +4690,23 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 </div>
             </div>
             """
+
+            persistent_slot_videos = []
+            slot_video_files_map = {}
+            for s in active_slots:
+                v_file = f"video_{s}.mp4"
+                for ext in ("webm", "mp4"):
+                    if os.path.exists(os.path.join(VIDEOS_DIR, f"video_{s}.{ext}")):
+                        v_file = f"video_{s}.{ext}"
+                        break
+                slot_video_files_map[s] = v_file
+                loop_attr = "loop muted" if s == 1 else "muted"
+                persistent_slot_videos.append(
+                    f'<video id="dualSlotVideo_{s}" playsinline {loop_attr} preload="metadata" crossorigin="anonymous" src="/video-stream?name={v_file}" style="width:720px; height:1280px;"></video>'
+                )
+            persistent_slot_videos_html = "\n    ".join(persistent_slot_videos)
+            active_slots_json = json.dumps(active_slots)
+            slot_video_files_json = json.dumps(slot_video_files_map)
 
             html = f"""<!DOCTYPE html>
 <html>
@@ -3353,6 +4736,25 @@ body {{ margin:0; background:var(--bg-main); color:#fff; font-family:-apple-syst
 .toast {{ position:fixed; bottom:80px; left:50%; transform:translateX(-50%); background:var(--bg-card); border:1px solid var(--cyan); color:var(--cyan); padding:12px 24px; border-radius:8px; font-family:var(--font-mono); opacity:0; transition:opacity 0.3s; pointer-events:none; z-index:9999; box-shadow:0 10px 30px rgba(0,0,0,0.8); }}
 .toast.show {{ opacity:1; }}
 
+/* Profiles & Presets Styling */
+.sidebar-preset-container {{ box-sizing: border-box; }}
+.preset-card {{
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 8px 10px;
+    transition: all 0.2s ease;
+}}
+.preset-card:hover {{
+    border-color: rgba(37, 244, 238, 0.3);
+    background: rgba(255, 255, 255, 0.05);
+}}
+.preset-card.active-preset {{
+    border-color: var(--cyan);
+    background: rgba(37, 244, 238, 0.08);
+    box-shadow: 0 0 10px rgba(37, 244, 238, 0.12);
+}}
+
 /* Persistent Media Engine offscreen */
 #persistent-media-engine {{ position:fixed; top:0; left:-9999px; width:720px; height:1280px; opacity:0.001; pointer-events:none; z-index:-999; }}
 
@@ -3372,10 +4774,7 @@ body {{ margin:0; background:var(--bg-main); color:#fff; font-family:-apple-syst
     50% {{ background-position: 100% 100%; }}
     100% {{ background-position: 0% 0%; }}
 }}
-@keyframes spin-around {{
-    0% {{ transform: translateZ(0) rotate(0deg); }}
-    100% {{ transform: translateZ(0) rotate(360deg); }}
-}}
+
 .shine-border-card {{
     position: relative;
     border-radius: 14px;
@@ -3399,59 +4798,333 @@ body {{ margin:0; background:var(--bg-main); color:#fff; font-family:-apple-syst
     animation: shine 14s infinite linear;
     pointer-events: none;
 }}
+/* ==========================================================================
+   Liquid Glass & Metal Button System (Standardized from liquid-glass-button.tsx)
+   ========================================================================== */
+button:not(.close-btn),
+.btn,
+.modern-btn,
+.shimmer-btn,
+a.shimmer-btn {{
+    position: relative !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 7px !important;
+    cursor: pointer !important;
+    border-radius: 9px !important;
+    font-weight: 600 !important;
+    font-family: var(--font-mono, inherit) !important;
+    white-space: nowrap !important;
+    outline: none !important;
+    transition: all 250ms cubic-bezier(0.1, 0.4, 0.2, 1) !important;
+    transform-origin: center center !important;
+    will-change: transform, box-shadow, filter !important;
+    text-decoration: none !important;
+    isolation: isolate !important;
+
+    /* Liquid Glass Core: Translucency + Backdrop Filter */
+    background: rgba(18, 20, 28, 0.7) !important;
+    backdrop-filter: blur(12px) url("#container-glass") !important;
+    -webkit-backdrop-filter: blur(12px) url("#container-glass") !important;
+    border: 1px solid rgba(255, 255, 255, 0.18) !important;
+    color: #ffffff !important;
+
+    /* Multi-tier Specular Liquid Glass Shadows (Dark Mode spec from liquid-glass-button.tsx) */
+    box-shadow: 
+        0 0 8px rgba(0,0,0,0.25),
+        0 2px 6px rgba(0,0,0,0.35),
+        inset 3px 3px 0.5px -3.5px rgba(255,255,255,0.25),
+        inset -3px -3px 0.5px -3.5px rgba(255,255,255,0.85),
+        inset 1px 1px 1px -0.5px rgba(255,255,255,0.6),
+        inset -1px -1px 1px -0.5px rgba(255,255,255,0.6),
+        inset 0 0 6px 6px rgba(255,255,255,0.10),
+        inset 0 0 2px 2px rgba(255,255,255,0.06),
+        0 0 12px rgba(255,255,255,0.12) !important;
+}}
+
+/* Glass Inner Specular Shine Layer */
+button:not(.close-btn)::after,
+.btn::after,
+.modern-btn::after,
+.shimmer-btn::after,
+a.shimmer-btn::after {{
+    content: "" !important;
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    height: 48% !important;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0) 100%) !important;
+    border-radius: 8px 8px 0 0 !important;
+    pointer-events: none !important;
+    z-index: 1 !important;
+}}
+
+/* Hover Interaction: Scale + Specular Bloom */
+button:not(.close-btn):hover,
+.btn:hover,
+.modern-btn:hover,
+.shimmer-btn:hover,
+a.shimmer-btn:hover {{
+    transform: translateY(-1.5px) scale(1.025) !important;
+    filter: brightness(1.12) !important;
+    box-shadow: 
+        0 6px 20px rgba(0, 0, 0, 0.5),
+        0 0 16px rgba(255, 255, 255, 0.22),
+        inset 3px 3px 1px -3px rgba(255,255,255,0.45),
+        inset -3px -3px 1px -3.5px rgba(255,255,255,0.95),
+        inset 1px 1px 1px -0.5px rgba(255,255,255,0.8),
+        inset -1px -1px 1px -0.5px rgba(255,255,255,0.8),
+        inset 0 0 8px 8px rgba(255,255,255,0.15) !important;
+}}
+
+/* Active / Press Interaction: Tactile Depression (from MetalButton spec) */
+button:not(.close-btn):active,
+.btn:active,
+.modern-btn:active,
+.shimmer-btn:active,
+a.shimmer-btn:active {{
+    transform: translateY(2px) scale(0.975) !important;
+    filter: brightness(0.94) !important;
+    box-shadow: 
+        0 1px 3px rgba(0, 0, 0, 0.6),
+        inset 2px 2px 2px rgba(0, 0, 0, 0.5),
+        inset -1px -1px 1px rgba(255,255,255,0.3) !important;
+}}
+
+/* Disabled State */
+button:disabled,
+.btn:disabled,
+.modern-btn:disabled,
+.shimmer-btn:disabled {{
+    pointer-events: none !important;
+    opacity: 0.45 !important;
+    filter: grayscale(0.8) !important;
+}}
+
+/* Crimson / Red / Destructive Liquid Glass Variant (START LIVE & STOP LIVE) */
+.btn-primary,
+#btnMainStartLive {{
+    background: linear-gradient(145deg, rgba(255, 43, 84, 0.88) 0%, rgba(210, 20, 60, 0.75) 100%) !important;
+    border-color: rgba(255, 120, 160, 0.6) !important;
+    color: #ffffff !important;
+    text-shadow: 0 -1px 0 rgba(140, 10, 30, 0.9) !important;
+    box-shadow: 
+        0 4px 15px rgba(255, 43, 84, 0.45),
+        0 0 10px rgba(255, 43, 84, 0.25),
+        inset 3px 3px 0.5px -3px rgba(255,255,255,0.7),
+        inset -3px -3px 0.5px -3px rgba(180, 0, 30, 0.8),
+        inset 0 0 6px 4px rgba(255,255,255,0.15) !important;
+}}
+.btn-primary:hover,
+#btnMainStartLive:hover {{
+    box-shadow: 
+        0 6px 24px rgba(255, 43, 84, 0.7),
+        0 0 16px rgba(255, 120, 160, 0.5),
+        inset 3px 3px 1px -2px rgba(255,255,255,0.85) !important;
+}}
+
+#btnMainStopLive,
+#btnStopDualStream,
+button[onclick*="disconnect"],
+button[onclick*="confirmDelete"],
+a[href*="delete-video"],
+button[onclick*="clearJsonCookies"],
+button[onclick*="destroySlotPreview"] {{
+    background: linear-gradient(145deg, rgba(255, 59, 48, 0.25) 0%, rgba(180, 20, 20, 0.35) 100%) !important;
+    border-color: rgba(255, 59, 48, 0.6) !important;
+    color: #ffffff !important;
+    text-shadow: 0 0 8px rgba(255, 59, 48, 0.4) !important;
+    box-shadow: 
+        0 2px 10px rgba(255, 59, 48, 0.25),
+        inset 2px 2px 1px rgba(255,255,255,0.25),
+        inset -2px -2px 1px rgba(180,0,0,0.4) !important;
+}}
+#btnMainStopLive:hover,
+#btnStopDualStream:hover,
+button[onclick*="disconnect"]:hover,
+button[onclick*="confirmDelete"]:hover,
+a[href*="delete-video"]:hover,
+button[onclick*="clearJsonCookies"]:hover,
+button[onclick*="destroySlotPreview"]:hover {{
+    background: linear-gradient(145deg, rgba(255, 59, 48, 0.4) 0%, rgba(200, 20, 20, 0.5) 100%) !important;
+    color: #ffffff !important;
+    box-shadow: 
+        0 4px 18px rgba(255, 59, 48, 0.5),
+        inset 2px 2px 1px rgba(255,255,255,0.5) !important;
+}}
+
+/* Cyan Liquid Glass Variant (Save, Reconnect, Focus, Monitor, Edit, Preview) */
+#btnSaveCookies,
+#btnToggleMic,
+#btnToggleMonitorOutput,
+#btnReconnectCamDeck,
+button[onclick*="reconnectCamera"],
+button[onclick*="toggleAddSlotForm"],
+button[onclick*="editVideoName"],
+button[onclick*="toggleSlotPreview"],
+button[onclick*="toggleReplaceSlot"],
+button[onclick*="focusAccountInput"],
+button[onclick*="formatJsonCookies"],
+button[onclick*="saveCompositorSettings"],
+button[onclick*="saveDynamicOverlayConfig"],
+button[onclick*="fetchFfmpegLogs"] {{
+    background: linear-gradient(145deg, rgba(37, 244, 238, 0.22) 0%, rgba(15, 120, 140, 0.28) 100%) !important;
+    border-color: rgba(37, 244, 238, 0.6) !important;
+    color: #ffffff !important;
+    text-shadow: 0 0 6px rgba(37, 244, 238, 0.35) !important;
+    box-shadow: 
+        0 2px 10px rgba(37, 244, 238, 0.25),
+        inset 2px 2px 1px rgba(255,255,255,0.35),
+        inset -2px -2px 1px rgba(0, 100, 120, 0.4) !important;
+}}
+#btnSaveCookies:hover,
+#btnToggleMic:hover,
+#btnToggleMonitorOutput:hover,
+#btnReconnectCamDeck:hover,
+button[onclick*="reconnectCamera"]:hover,
+button[onclick*="toggleAddSlotForm"]:hover,
+button[onclick*="editVideoName"]:hover,
+button[onclick*="toggleSlotPreview"]:hover,
+button[onclick*="toggleReplaceSlot"]:hover,
+button[onclick*="focusAccountInput"]:hover,
+button[onclick*="formatJsonCookies"]:hover,
+button[onclick*="saveCompositorSettings"]:hover,
+button[onclick*="saveDynamicOverlayConfig"]:hover,
+button[onclick*="fetchFfmpegLogs"]:hover {{
+    background: linear-gradient(145deg, rgba(37, 244, 238, 0.38) 0%, rgba(20, 150, 170, 0.45) 100%) !important;
+    color: #ffffff !important;
+    box-shadow: 
+        0 4px 18px rgba(37, 244, 238, 0.5),
+        inset 2px 2px 1px rgba(255,255,255,0.6) !important;
+}}
+
+/* Green / Success Liquid Glass Variant (Validate, Toggle Cam, Uji Slot 1-6) */
+#btnValidateCookies,
+#btnToggleCam,
+button[id^="btn-sim-slot-"],
+button[onclick*="simulateGift"] {{
+    background: linear-gradient(145deg, rgba(52, 199, 89, 0.22) 0%, rgba(20, 120, 50, 0.3) 100%) !important;
+    border-color: rgba(52, 199, 89, 0.6) !important;
+    color: #ffffff !important;
+    text-shadow: 0 0 6px rgba(52, 199, 89, 0.35) !important;
+    box-shadow: 
+        0 2px 10px rgba(52, 199, 89, 0.25),
+        inset 2px 2px 1px rgba(255,255,255,0.35),
+        inset -2px -2px 1px rgba(0, 80, 30, 0.4) !important;
+}}
+#btnValidateCookies:hover,
+#btnToggleCam:hover,
+button[id^="btn-sim-slot-"]:hover,
+button[onclick*="simulateGift"]:hover {{
+    background: linear-gradient(145deg, rgba(52, 199, 89, 0.38) 0%, rgba(30, 150, 70, 0.45) 100%) !important;
+    color: #ffffff !important;
+    box-shadow: 
+        0 4px 18px rgba(52, 199, 89, 0.5),
+        inset 2px 2px 1px rgba(255,255,255,0.6) !important;
+}}
+
+/* Amber / Gold Liquid Glass Variant (Dual Stream) */
+#btnStartDualStream {{
+    background: linear-gradient(145deg, rgba(255, 184, 0, 0.28) 0%, rgba(180, 120, 0, 0.35) 100%) !important;
+    border-color: rgba(255, 184, 0, 0.65) !important;
+    color: #ffffff !important;
+    text-shadow: 0 0 8px rgba(255, 184, 0, 0.4) !important;
+    box-shadow: 
+        0 3px 12px rgba(255, 184, 0, 0.3),
+        inset 2px 2px 1px rgba(255,255,255,0.4),
+        inset -2px -2px 1px rgba(120, 70, 0, 0.4) !important;
+}}
+#btnStartDualStream:hover {{
+    background: linear-gradient(145deg, rgba(255, 184, 0, 0.45) 0%, rgba(210, 140, 0, 0.5) 100%) !important;
+    color: #ffffff !important;
+    box-shadow: 
+        0 6px 20px rgba(255, 184, 0, 0.55),
+        inset 2px 2px 1px rgba(255,255,255,0.7) !important;
+}}
+
+/* Violet / Purple Liquid Glass Variant (Gift Modal & Mirror) */
+.btn-gift,
+#btnToggleMirror {{
+    background: linear-gradient(145deg, rgba(160, 124, 254, 0.25) 0%, rgba(90, 50, 170, 0.35) 100%) !important;
+    border-color: rgba(160, 124, 254, 0.6) !important;
+    color: #ffffff !important;
+    text-shadow: 0 0 6px rgba(160, 124, 254, 0.35) !important;
+    box-shadow: 
+        0 2px 10px rgba(160, 124, 254, 0.25),
+        inset 2px 2px 1px rgba(255,255,255,0.35),
+        inset -2px -2px 1px rgba(60, 20, 120, 0.4) !important;
+}}
+.btn-gift:hover,
+#btnToggleMirror:hover {{
+    background: linear-gradient(145deg, rgba(160, 124, 254, 0.4) 0%, rgba(120, 70, 200, 0.45) 100%) !important;
+    color: #ffffff !important;
+    box-shadow: 
+        0 4px 18px rgba(160, 124, 254, 0.45),
+        inset 2px 2px 1px rgba(255,255,255,0.6) !important;
+}}
+
+/* Upload Buttons with Gradient Glow */
+.btn-upload,
+button[id^="btn-upload-"] {{
+    background: linear-gradient(135deg, rgba(37, 244, 238, 0.35) 0%, rgba(52, 199, 89, 0.3) 100%) !important;
+    border-color: rgba(37, 244, 238, 0.65) !important;
+    color: #ffffff !important;
+    box-shadow: 
+        0 2px 12px rgba(37, 244, 238, 0.25),
+        inset 2px 2px 1px rgba(255,255,255,0.4) !important;
+}}
+.btn-upload:hover,
+button[id^="btn-upload-"]:hover {{
+    background: linear-gradient(135deg, rgba(37, 244, 238, 0.5) 0%, rgba(52, 199, 89, 0.45) 100%) !important;
+    box-shadow: 
+        0 4px 18px rgba(37, 244, 238, 0.45),
+        inset 2px 2px 1px rgba(255,255,255,0.6) !important;
+}}
+
+/* Blue Standby Liquid Glass Variant */
+#btn-reset-standby,
+button[onclick*="resetStandby"] {{
+    background: linear-gradient(145deg, rgba(0, 122, 255, 0.25) 0%, rgba(0, 70, 180, 0.35) 100%) !important;
+    border-color: rgba(0, 122, 255, 0.6) !important;
+    color: #ffffff !important;
+    box-shadow: 
+        0 2px 10px rgba(0, 122, 255, 0.25),
+        inset 2px 2px 1px rgba(255,255,255,0.35) !important;
+}}
+#btn-reset-standby:hover,
+button[onclick*="resetStandby"]:hover {{
+    background: linear-gradient(145deg, rgba(0, 122, 255, 0.4) 0%, rgba(0, 90, 220, 0.45) 100%) !important;
+    color: #ffffff !important;
+    box-shadow: 
+        0 4px 18px rgba(0, 122, 255, 0.45),
+        inset 2px 2px 1px rgba(255,255,255,0.6) !important;
+}}
+
+/* Force all text in all buttons to white */
+button:not(.close-btn),
+button:not(.close-btn) *,
+.btn,
+.btn *,
+.modern-btn,
+.modern-btn *,
+.shimmer-btn,
+.shimmer-btn *,
+a.shimmer-btn,
+a.shimmer-btn * {{
+    color: #ffffff !important;
+}}
+
+/* Static Clean Design for shimmer-btn (No spinning/rotating animations) */
 .shimmer-btn {{
-    --spread: 90deg;
-    --shimmer-color: #ffffff;
-    --radius: 8px;
-    --speed: 3s;
-    --cut: 1.5px;
-    --bg: rgba(18, 18, 24, 0.95);
-    position: relative;
-    z-index: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    overflow: hidden;
-    white-space: nowrap;
-    cursor: pointer;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: var(--radius);
-    background: var(--bg);
-    color: #ffffff;
-    padding: 9px 18px;
-    font-weight: 600;
-    font-size: 13px;
-    transition: transform 0.2s, box-shadow 0.2s;
-    text-decoration: none;
+    border: 1px solid var(--shimmer-color, rgba(255, 255, 255, 0.25)) !important;
+    background: var(--bg, rgba(18, 20, 28, 0.7)) !important;
 }}
-.shimmer-btn:hover {{ box-shadow: inset 0 -6px 10px #ffffff2f; }}
-.shimmer-btn:active {{ transform: translateY(1px); }}
 .shimmer-btn::before {{
-    content: "";
-    position: absolute;
-    inset: calc(var(--cut) * -1);
-    z-index: -1;
-    border-radius: inherit;
-    background: conic-gradient(from calc(270deg - (var(--spread) / 2)), transparent 0, var(--shimmer-color) var(--spread), transparent var(--spread));
-    animation: spin-around var(--speed) infinite linear;
+    display: none !important;
+    content: none !important;
 }}
-.modern-btn {{
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    border-radius: 8px;
-    font-weight: 600;
-    font-size: 13px;
-    color: #ffffff;
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    transition: background 0.2s ease, border-color 0.2s ease;
-    text-decoration: none;
-}}
-.btn-upload {{ background: #1e293b; }}
-.btn-upload:hover {{ background: #334155; border-color: rgba(255, 255, 255, 0.3); }}
-.btn-gift {{ background: #2e1065; }}
-.btn-gift:hover {{ background: #4c1d95; border-color: rgba(255, 255, 255, 0.3); }}
 
 /* Modal */
 .modal-overlay {{
@@ -3501,6 +5174,9 @@ input[type="text"], input[type="number"], select, textarea {{
 }}
 </style>
 <script>
+window.ACTIVE_SLOTS = {active_slots_json};
+window.SLOT_VIDEO_FILES = {slot_video_files_json};
+window.NEXT_SLOT_ID = {next_slot_id};
 let compositorConfig = {compositor_cfg_json};
 
                         let lastProcessedGiftSeq = -1;
@@ -3520,8 +5196,11 @@ let compositorConfig = {compositor_cfg_json};
                         }}
                         function validateStartLive() {{
                             const username = "{tiktok_username}";
-                            if (!username) {{
+                            const inputEl = document.getElementById('tiktok-username-input');
+                            const liveUser = inputEl ? inputEl.value.trim() : username;
+                            if (!liveUser) {{
                                 alert("Peringatan: Akun TikTok belum dikonfigurasi! Harap isi Username TikTok dan simpan konfigurasi akun terlebih dahulu.");
+                                if (typeof window.focusAccountInput === 'function') window.focusAccountInput();
                                 return false;
                             }}
                             return true;
@@ -3537,6 +5216,172 @@ let compositorConfig = {compositor_cfg_json};
                             modal.style.display = 'none';
                             location.reload();
                         }}
+                        function toggleReplaceSlot(slot) {{
+                            const box = document.getElementById('replace-slot-box-' + slot);
+                            if (box) {{
+                                box.style.display = (box.style.display === 'none' || !box.style.display) ? 'block' : 'none';
+                            }}
+                        }}
+
+                        function toggleAddSlotForm() {{
+                            const p = document.getElementById('add-new-slot-panel');
+                            if (p) {{
+                                p.style.display = (p.style.display === 'none' || !p.style.display) ? 'block' : 'none';
+                            }}
+                        }}
+
+                        function confirmDeleteSlot(slot) {{
+                            if (confirm('Konfirmasi: Hapus Slot ' + slot + ' beserta konfigurasinya?\\nJika slot ini sedang diputar di live stream, sistem akan otomatis kembali ke Slot 1 (Standby).')) {{
+                                window.location.href = '/delete-video?slot=' + encodeURIComponent(slot) + '&delete_slot=1';
+                            }}
+                        }}
+
+                        async function startChunkedUpload(slot) {{
+                            const fileInput = document.getElementById('videofile-' + slot);
+                            if (!fileInput || !fileInput.files || fileInput.files.length === 0) {{
+                                alert("Peringatan: Silakan pilih file video (.mp4 atau .webm) terlebih dahulu.");
+                                return;
+                            }}
+
+                            const file = fileInput.files[0];
+                            const filename = file.name.toLowerCase();
+                            if (!filename.endsWith('.mp4') && !filename.endsWith('.webm')) {{
+                                alert("Peringatan: Format file harus .mp4 atau .webm!");
+                                return;
+                            }}
+
+                            const maxLimit = 2500 * 1024 * 1024; // 2.5 GB
+                            if (file.size > maxLimit) {{
+                                alert("Peringatan: Ukuran file melebihi batas maksimum 2.5 GB!");
+                                return;
+                            }}
+
+                            const btn = document.getElementById('btn-upload-' + slot);
+                            const progressBox = document.getElementById('progress-box-' + slot);
+                            const progressBar = document.getElementById('progress-bar-' + slot);
+                            const progressStatus = document.getElementById('progress-status-' + slot);
+                            const progressSize = document.getElementById('progress-size-' + slot);
+
+                            if (btn) btn.disabled = true;
+                            if (fileInput) fileInput.disabled = true;
+                            if (progressBox) progressBox.style.display = 'block';
+                            if (progressStatus) {{
+                                progressStatus.style.color = '#25f4ee';
+                                progressStatus.innerText = 'Menyiapkan upload potongan...';
+                            }}
+                            if (progressBar) progressBar.style.width = '0%';
+
+                            const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB per chunk
+                            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+                            const uploadId = 'up_' + slot + '_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+                            const totalMb = (file.size / (1024 * 1024)).toFixed(1);
+
+                            try {{
+                                for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {{
+                                    const start = chunkIdx * CHUNK_SIZE;
+                                    const end = Math.min(start + CHUNK_SIZE, file.size);
+                                    const chunkBlob = file.slice(start, end);
+
+                                    let success = false;
+                                    let lastErr = null;
+                                    // Retry up to 3 times per chunk for mobile connection resiliency
+                                    for (let retry = 0; retry < 3; retry++) {{
+                                        try {{
+                                            const url = '/api/upload-video-chunk?upload_id=' + encodeURIComponent(uploadId) +
+                                                        '&slot=' + encodeURIComponent(slot) +
+                                                        '&chunk_index=' + chunkIdx +
+                                                        '&total_chunks=' + totalChunks;
+
+                                            const res = await fetch(url, {{
+                                                method: 'POST',
+                                                body: chunkBlob
+                                            }});
+
+                                            if (res.ok) {{
+                                                const json = await res.json();
+                                                if (json.success) {{
+                                                    success = true;
+                                                    break;
+                                                }} else {{
+                                                    throw new Error(json.error || 'Server menolak potongan chunk');
+                                                }}
+                                            }} else {{
+                                                throw new Error('HTTP status ' + res.status);
+                                            }}
+                                        }} catch (err) {{
+                                            lastErr = err;
+                                            console.warn('[ChunkUpload] Slot ' + slot + ' Chunk ' + (chunkIdx + 1) + ' coba ke-' + (retry + 1) + ' gagal:', err);
+                                            await new Promise(r => setTimeout(r, 1000 * (retry + 1)));
+                                        }}
+                                    }}
+
+                                    if (!success) {{
+                                        throw new Error('Gagal mengunggah potongan ' + (chunkIdx + 1) + '/' + totalChunks + ': ' + (lastErr ? lastErr.message : 'koneksi terputus'));
+                                    }}
+
+                                    const uploadedMb = (end / (1024 * 1024)).toFixed(1);
+                                    const percent = Math.min(95, Math.round((end / file.size) * 95));
+                                    if (progressBar) progressBar.style.width = percent + '%';
+                                    if (progressStatus) progressStatus.innerText = 'Mengunggah potongan ' + (chunkIdx + 1) + '/' + totalChunks + ' (' + percent + '%)...';
+                                    if (progressSize) progressSize.innerText = uploadedMb + ' / ' + totalMb + ' MB';
+                                }}
+
+                                // All chunks uploaded -> finalize on server
+                                if (progressBar) progressBar.style.width = '96%';
+                                if (progressStatus) progressStatus.innerText = 'Menggabungkan potongan & remux faststart (0% CPU)...';
+                                if (progressSize) progressSize.innerText = totalMb + ' / ' + totalMb + ' MB';
+
+                                let initialGift = '';
+                                const initialGiftEl = document.getElementById('new-slot-initial-gift');
+                                if (initialGiftEl && (String(slot) === String(window.NEXT_SLOT_ID || slot))) {{
+                                    initialGift = initialGiftEl.value || '';
+                                }}
+
+                                const finRes = await fetch('/api/upload-video-finish', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{
+                                        upload_id: uploadId,
+                                        slot: String(slot),
+                                        filename: file.name,
+                                        total_chunks: totalChunks,
+                                        initial_gift: initialGift
+                                    }})
+                                }});
+
+                                if (!finRes.ok) {{
+                                    throw new Error('HTTP ' + finRes.status + ' saat menggabungkan file');
+                                }}
+
+                                const finData = await finRes.json();
+                                if (!finData.success) {{
+                                    throw new Error(finData.error || 'Gagal finalisasi video di server');
+                                }}
+
+                                if (progressBar) progressBar.style.width = '100%';
+                                if (progressStatus) {{
+                                    progressStatus.innerText = '✅ Selesai! Video Slot ' + slot + ' siap (' + finData.size_mb + ' MB). Memuat ulang...';
+                                    progressStatus.style.color = '#34c759';
+                                }}
+
+                                setTimeout(() => {{
+                                    location.reload();
+                                }}, 1200);
+
+                            }} catch (e) {{
+                                console.error('[ChunkUpload Error]', e);
+                                if (progressStatus) {{
+                                    progressStatus.innerText = '❌ Gagal: ' + e.message;
+                                    progressStatus.style.color = '#ff3b30';
+                                }}
+                                if (btn) {{
+                                    btn.disabled = false;
+                                    btn.innerText = 'Coba Lagi';
+                                }}
+                                if (fileInput) fileInput.disabled = false;
+                            }}
+                        }}
+
                         function editVideoName(slot, currentName) {{
                             const newName = prompt("Ubah nama tampilan file video Slot " + slot + ":", currentName);
                             if (newName && newName.trim() && newName.trim() !== currentName) {{
@@ -3751,28 +5596,31 @@ let compositorConfig = {compositor_cfg_json};
                         window.saveJsonCookies = async function(e) {{
                             const btn = e ? (e.target.closest('button') || e.target) : document.getElementById('btnSaveCookies');
                             const ta = document.getElementById('json-cookies-input');
-                            if (!ta) return;
-                            const rawVal = ta.value.trim();
-                            if (!rawVal) {{
-                                window.showCookiesFeedback("⚠️ Box cookies kosong! Harap tempelkan JSON cookies terlebih dahulu.", "warn");
+                            const userInput = document.getElementById('tiktok-username-input');
+                            const usernameVal = userInput ? userInput.value.trim() : '';
+                            const rawCookies = ta ? ta.value.trim() : '';
+
+                            if (!rawCookies && !usernameVal) {{
+                                window.showCookiesFeedback("⚠️ Harap isi Username TikTok atau tempelkan JSON Cookies!", "warn");
                                 return;
                             }}
 
-                            // Defensive client-side JSON parsing validation
-                            let parsedCookies;
-                            try {{
-                                parsedCookies = JSON.parse(rawVal);
-                            }} catch (err) {{
-                                window.showCookiesFeedback("❌ Format JSON Tidak Valid: " + err.message, "error");
-                                return;
+                            let parsedCookies = null;
+                            if (rawCookies) {{
+                                try {{
+                                    parsedCookies = JSON.parse(rawCookies);
+                                }} catch (err) {{
+                                    window.showCookiesFeedback("❌ Format JSON Cookies Tidak Valid: " + err.message, "error");
+                                    return;
+                                }}
+
+                                if (!Array.isArray(parsedCookies) && (typeof parsedCookies !== 'object' || parsedCookies === null)) {{
+                                    window.showCookiesFeedback("❌ Cookies harus berupa JSON array ([...]) atau JSON object!", "error");
+                                    return;
+                                }}
                             }}
 
-                            if (!Array.isArray(parsedCookies) && (typeof parsedCookies !== 'object' || parsedCookies === null)) {{
-                                window.showCookiesFeedback("❌ Cookies harus berupa JSON array ([...]) atau JSON object!", "error");
-                                return;
-                            }}
-
-                            const count = Array.isArray(parsedCookies) ? parsedCookies.length : Object.keys(parsedCookies).length;
+                            const count = parsedCookies ? (Array.isArray(parsedCookies) ? parsedCookies.length : Object.keys(parsedCookies).length) : 0;
                             const origHtml = btn ? btn.innerHTML : 'Simpan';
                             if (btn) {{
                                 btn.innerHTML = "⏳ Menyimpan & Memvalidasi...";
@@ -3780,21 +5628,27 @@ let compositorConfig = {compositor_cfg_json};
                             }}
 
                             try {{
+                                const payload = {{}};
+                                if (usernameVal) payload.username = usernameVal;
+                                if (parsedCookies) payload.cookies = parsedCookies;
+
                                 const res = await fetch('/save-account-config', {{
                                     method: 'POST',
                                     headers: {{
                                         'Content-Type': 'application/json',
                                         'Accept': 'application/json'
                                     }},
-                                    body: JSON.stringify({{
-                                        cookies: parsedCookies
-                                    }})
+                                    body: JSON.stringify(payload)
                                 }});
 
                                 const data = await res.json();
                                 if (res.ok && data.success) {{
+                                    const verifiedUser = (data.val_res && (data.val_res.official_username || data.val_res.username)) || data.username || usernameVal;
+                                    if (verifiedUser && userInput) {{
+                                        userInput.value = verifiedUser.startsWith('@') ? verifiedUser : '@' + verifiedUser;
+                                    }}
                                     const badge = document.getElementById('cookieStatusBadge');
-                                    if (badge) {{
+                                    if (badge && count > 0) {{
                                         const isValid = data.val_res && data.val_res.success;
                                         badge.style.background = isValid ? 'rgba(52, 199, 89, 0.15)' : 'rgba(255, 184, 0, 0.15)';
                                         badge.style.borderColor = isValid ? '#34c759' : '#ffb800';
@@ -3805,37 +5659,58 @@ let compositorConfig = {compositor_cfg_json};
                                     if (updatedEl) {{
                                         updatedEl.innerText = new Date().toLocaleTimeString('id-ID') + ' WIB';
                                     }}
-                                    window.showCookiesFeedback("✅ Cookies berhasil disimpan! " + (data.message || "") + " (" + count + " entries)", "success");
+                                    const successMsg = data.message || "Konfigurasi akun berhasil disimpan!";
+                                    window.showCookiesFeedback("✅ " + successMsg + (count > 0 ? " (" + count + " entries)" : ""), "success");
                                     if (typeof syncListenerStatus === 'function') {{
                                         syncListenerStatus();
                                     }}
+                                    setTimeout(() => location.reload(), 1400);
                                 }} else {{
-                                    window.showCookiesFeedback("❌ Gagal menyimpan cookies: " + (data.message || 'Error server'), "error");
+                                    window.showCookiesFeedback("❌ Gagal menyimpan: " + (data.message || 'Error server'), "error");
                                 }}
                             }} catch (err) {{
-                                // Fallback for form-encoded URLSearchParams
-                                try {{
-                                    const formBody = new URLSearchParams();
-                                    formBody.append('cookies', rawVal);
-                                    const fallbackRes = await fetch('/save-account-config', {{
-                                        method: 'POST',
-                                        headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                                        body: formBody.toString()
-                                    }});
-                                    if (fallbackRes.ok) {{
-                                        window.showCookiesFeedback("✅ Cookies berhasil disimpan (" + count + " entries)", "success");
-                                        setTimeout(() => location.reload(), 1500);
-                                    }} else {{
-                                        window.showCookiesFeedback("❌ Gagal menyimpan cookies: HTTP " + fallbackRes.status, "error");
-                                    }}
-                                }} catch (fbErr) {{
-                                    window.showCookiesFeedback("🚨 Error koneksi: " + err.message, "error");
-                                }}
+                                window.showCookiesFeedback("🚨 Error koneksi: " + err.message, "error");
                             }} finally {{
                                 if (btn) {{
                                     btn.innerHTML = origHtml;
                                     btn.disabled = false;
                                 }}
+                            }}
+                        }};
+
+                        window.focusAccountInput = function() {{
+                            const el = document.getElementById('tiktok-username-input') || document.getElementById('json-cookies-input');
+                            if (el) {{
+                                el.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                                el.focus();
+                                const origBorder = el.style.borderColor;
+                                el.style.borderColor = '#25f4ee';
+                                el.style.boxShadow = '0 0 15px rgba(37,244,238,0.5)';
+                                setTimeout(() => {{
+                                    el.style.borderColor = origBorder;
+                                    el.style.boxShadow = '';
+                                }}, 2000);
+                            }}
+                        }};
+
+                        window.disconnectTikTokAccount = async function() {{
+                            if (!confirm("⚠️ Apakah Anda yakin ingin memutuskan / mereset akun TikTok saat ini?\\n\\nKonfigurasi username dan session cookies akan dikosongkan.")) {{
+                                return;
+                            }}
+                            try {{
+                                const res = await fetch('/api/disconnect-account', {{
+                                    method: 'POST',
+                                    headers: {{ 'Accept': 'application/json' }}
+                                }});
+                                const data = await res.json();
+                                if (res.ok && data.success) {{
+                                    alert("✅ Akun TikTok berhasil diputuskan. Halaman akan dimuat ulang.");
+                                    location.reload();
+                                }} else {{
+                                    alert("❌ Gagal memutuskan akun: " + (data.message || 'Error server'));
+                                }}
+                            }} catch (err) {{
+                                alert("🚨 Gagal menghubungi server: " + err.message);
                             }}
                         }};
 
@@ -3893,7 +5768,7 @@ let compositorConfig = {compositor_cfg_json};
                                 if (e.preventDefault) e.preventDefault();
                                 if (e.stopPropagation) e.stopPropagation();
                             }}
-                            if (!slot || slot < 2 || slot > 6) return;
+                            if (!slot || slot < 2) return;
 
                             if (dualGiftQueue && dualGiftQueue.length >= 50) {{
                                 showSimStatus('Antrean penuh (maksimal 50 gift)', false, true);
@@ -4017,11 +5892,11 @@ let compositorConfig = {compositor_cfg_json};
                             }}
 
                             // Destroy any other open slot previews to strictly conserve hardware decoders
-                            for (let s = 1; s <= 6; s++) {{
+                            (window.ACTIVE_SLOTS || [1]).forEach(s => {{
                                 if (s !== parseInt(slot)) {{
                                     destroySlotPreview(s);
                                 }}
-                            }}
+                            }});
 
                             // Mount video dynamically on-demand
                             container.innerHTML = '<div style="background:#121216; padding:10px; border-radius:8px; border:1px solid #27272a;">' +
@@ -4070,9 +5945,9 @@ let compositorConfig = {compositor_cfg_json};
                         }}
 
                         function destroyAllSlotPreviews() {{
-                            for (let s = 1; s <= 6; s++) {{
+                            (window.ACTIVE_SLOTS || [1]).forEach(s => {{
                                 destroySlotPreview(s);
-                            }}
+                            }});
                         }}
 
                         // --- Dual-Screen Live Studio (Client-Side Canvas Compositing - PiP Layout) ---
@@ -4083,6 +5958,28 @@ let compositorConfig = {compositor_cfg_json};
                         let dualAudioCtx = null;
                         let dualAudioDest = null;
                         let dualMicGain = null;
+                        let dualMicSrc = null;
+                        let dualAnalyser = null;
+                        let dualVuAnimFrame = null;
+                        let _guideOverlayImg = null;
+                        let _isDualRendering = false;
+                        let _lastDualRenderTime = 0;
+                        let isReconnectingCamera = false;
+                        let isInitializingCamera = false;
+                        let _visibilityDebounce = null;
+
+                        function resyncVideoDecoder(vElem) {{
+                            if (!vElem) return;
+                            try {{
+                                if (vElem.readyState >= 2) {{
+                                    const curTime = vElem.currentTime;
+                                    vElem.currentTime = curTime;
+                                }}
+                                vElem.playbackRate = 1.0;
+                                const p = vElem.play();
+                                if (p && p.catch) p.catch(() => {{}});
+                            }} catch(e) {{}}
+                        }}
                         let dualCatAudioSource = null;
                         let dualMonitorGain = null;
                         let dualCanvasStream = null;
@@ -4186,6 +6083,41 @@ let compositorConfig = {compositor_cfg_json};
                             }}
                         }}
 
+                        function addNewDynamicOverlaySlot() {{
+                            const newName = prompt('Masukkan nama slot layer animasi baru (opsional):', '');
+                            if (newName === null) return;
+                            fetch('/add-dynamic-overlay-slot', {{
+                                method: 'POST',
+                                headers: {{ 'Content-Type': 'application/json' }},
+                                body: JSON.stringify({{ name: newName.trim() }})
+                            }}).then(r => r.json()).then(res => {{
+                                if (res.success) {{
+                                    showToast('Slot layer baru (' + (res.slot || '') + ') berhasil ditambahkan');
+                                    setTimeout(() => window.location.reload(), 300);
+                                }} else {{
+                                    alert('Gagal menambahkan slot: ' + (res.error || 'Terjadi kesalahan'));
+                                }}
+                            }}).catch(e => alert('Error: ' + e));
+                        }}
+
+                        function deleteDynamicOverlaySlot(slot) {{
+                            if (!confirm('Apakah Anda yakin ingin menghapus Slot Layer ' + slot + ' beserta filenya secara permanen?')) {{
+                                return;
+                            }}
+                            fetch('/delete-dynamic-overlay-slot', {{
+                                method: 'POST',
+                                headers: {{ 'Content-Type': 'application/json' }},
+                                body: JSON.stringify({{ slot: slot }})
+                            }}).then(r => r.json()).then(res => {{
+                                if (res.success) {{
+                                    showToast('Slot ' + slot + ' berhasil dihapus');
+                                    setTimeout(() => window.location.reload(), 300);
+                                }} else {{
+                                    alert('Gagal menghapus slot: ' + (res.error || 'Terjadi kesalahan'));
+                                }}
+                            }}).catch(e => alert('Error: ' + e));
+                        }}
+
                         function testDynamicOverlay(slot) {{
                             console.log('[DynamicOverlay] Manual test trigger slot:', slot);
                             if (!isRenderLoopRunning && typeof startRenderLoop === 'function') {{
@@ -4272,12 +6204,12 @@ let compositorConfig = {compositor_cfg_json};
                                     dualOverlayConfig = data;
                                     const availSlots = [];
                                     if (data && data.slots) {{
-                                        for (let s = 1; s <= 10; s++) {{
-                                            const sd = data.slots[String(s)];
+                                        Object.keys(data.slots).forEach(s => {{
+                                            const sd = data.slots[s];
                                             if (sd && sd.file && sd.enabled !== false) {{
                                                 availSlots.push(s);
                                             }}
-                                        }}
+                                        }});
                                     }}
                                     if (availSlots.length === 0) {{
                                         const badge = document.getElementById('overlaySchedulerStatusBadge');
@@ -4354,35 +6286,39 @@ let compositorConfig = {compositor_cfg_json};
                         }}
 
                         function initSlotVideoPool() {{
-                            for (let s = 1; s <= 6; s++) {{
+                            const activeSlots = window.ACTIVE_SLOTS || [1];
+                            activeSlots.forEach(s => {{
                                 let vid = document.getElementById('dualSlotVideo_' + s);
+                                const targetFile = (window.SLOT_VIDEO_FILES && window.SLOT_VIDEO_FILES[s]) ? window.SLOT_VIDEO_FILES[s] : ('video_' + s + '.mp4');
                                 if (!vid) {{
                                     vid = document.createElement('video');
                                     vid.id = 'dualSlotVideo_' + s;
                                     vid.playsInline = true;
-                                    vid.muted = (s !== 1);
-                                    vid.preload = 'auto';
+                                    vid.muted = true;
+                                    vid.preload = 'metadata';
                                     vid.crossOrigin = 'anonymous';
-                                    vid.src = '/video-stream?name=video_' + s + '.mp4';
+                                    vid.src = '/video-stream?name=' + encodeURIComponent(targetFile);
                                     const container = document.getElementById('persistent-media-engine') || document.body;
                                     container.appendChild(vid);
+                                }} else if (!vid.src || vid.src === '' || (targetFile && !vid.src.includes(targetFile))) {{
+                                    vid.src = '/video-stream?name=' + encodeURIComponent(targetFile);
                                 }}
                                 vid.loop = (s === 1);
-                                vid.preload = 'auto';
+                                vid.preload = 'metadata';
                                 vid.playsInline = true;
                                 vid.crossOrigin = 'anonymous';
-                                vid.muted = (s !== 1);
+                                vid.muted = true;
 
                                 // Pre-warm first frame into decoder memory
                                 vid.addEventListener('loadeddata', () => {{
-                                    console.log('[VideoPool] Slot ' + s + ' pre-warmed & ready in decoder memory (dur: ' + (vid.duration ? vid.duration.toFixed(2) : 0) + 's, readyState: ' + vid.readyState + ')');
+                                    console.log('[VideoPool] Slot ' + s + ' pre-warmed & ready in decoder memory (file: ' + targetFile + ', dur: ' + (vid.duration ? vid.duration.toFixed(2) : 0) + 's, readyState: ' + vid.readyState + ')');
                                     try {{
                                         if (s !== 1) vid.currentTime = 0;
                                     }} catch(e) {{}}
                                 }}, {{ once: true }});
 
                                 vid.addEventListener('error', (e) => {{
-                                    console.warn('[VideoPool] Error loading slot ' + s + ':', e);
+                                    console.warn('[VideoPool] Error loading slot ' + s + ' (' + targetFile + '):', e);
                                 }});
 
                                 try {{
@@ -4390,7 +6326,7 @@ let compositorConfig = {compositor_cfg_json};
                                 }} catch(e) {{}}
 
                                 slotVideoPool[s] = vid;
-                            }}
+                            }});
 
                             if (!window.activeSlotVideo) {{
                                 window.activeSlotVideo = slotVideoPool[1];
@@ -4428,11 +6364,12 @@ let compositorConfig = {compositor_cfg_json};
                                 clearInterval(window._dualFallbackTimer);
                                 window._dualFallbackTimer = null;
                             }}
-                            for (let s = 1; s <= 6; s++) {{
+                            Object.keys(slotVideoPool).forEach(k => {{
+                                const s = parseInt(k);
                                 if (slotVideoPool[s]) {{
                                     try {{ slotVideoPool[s].pause(); }} catch(e) {{}}
                                 }}
-                            }}
+                            }});
                             const catVid = document.getElementById('dualCatVideo');
                             if (catVid) {{
                                 try {{ catVid.pause(); }} catch(e) {{}}
@@ -4531,8 +6468,9 @@ let compositorConfig = {compositor_cfg_json};
                         }}
 
                         function playSlotImmediate(slot, giftName) {{
-                            if (!slot || slot < 1 || slot > 6) slot = 1;
+                            if (!slot || slot < 1) slot = 1;
                             initSlotVideoPool();
+                            if (!slotVideoPool[slot]) slot = 1;
                             const prevSlot = dualCurrentSlot;
                             dualCurrentSlot = slot;
 
@@ -4567,11 +6505,12 @@ let compositorConfig = {compositor_cfg_json};
                             if (!targetVid) return;
 
                             // 2. Unmute dinamis: HANYA targetVid aktif yang unmuted, slot lainnya di-mute
-                            for (let s = 1; s <= 6; s++) {{
+                            Object.keys(slotVideoPool).forEach(k => {{
+                                const s = parseInt(k);
                                 if (slotVideoPool[s]) {{
                                     slotVideoPool[s].muted = (s !== slot);
                                 }}
-                            }}
+                            }});
 
                             // 3. Instant Audio Gain Switching via Web Audio API (0ms gap, zero click/pop)
                             if (dualAudioCtx) {{
@@ -4579,13 +6518,14 @@ let compositorConfig = {compositor_cfg_json};
                                     dualAudioCtx.resume();
                                 }}
                                 const curTime = dualAudioCtx.currentTime;
-                                for (let s = 1; s <= 6; s++) {{
+                                Object.keys(slotVideoPool).forEach(k => {{
+                                    const s = parseInt(k);
                                     if (slotAudioGains[s]) {{
                                         const targetGain = (s === slot) ? 1.0 : 0.0;
                                         slotAudioGains[s].gain.cancelScheduledValues(curTime);
                                         slotAudioGains[s].gain.setValueAtTime(targetGain, curTime);
                                     }}
-                                }}
+                                }});
                             }}
 
                             // 4. Instant Video Pointer Switching (Cut-to-Cut in 1 frame)
@@ -4768,14 +6708,16 @@ let compositorConfig = {compositor_cfg_json};
                         function startCanvasLoop() {{
                             const canvas = document.getElementById('dualCompositeCanvas');
                             if (!canvas) return;
-                            const ctx = canvas.getContext('2d');
+                            const ctx = canvas.getContext('2d', {{ alpha: false, desynchronized: true }});
                             const camVid = document.getElementById('dualCamVideo');
-                            let guideOverlayImg = new Image();
-                            guideOverlayImg.src = '/overlay-preview?v=' + Date.now();
+                            if (!_guideOverlayImg) {{
+                                _guideOverlayImg = new Image();
+                                _guideOverlayImg.src = '/overlay-preview?v=' + Date.now();
+                            }}
 
-                            // High-quality bicubic image smoothing for maximum crispness
+                            // Hardware-accelerated bilinear smoothing (zero CPU/GPU latency on mobile)
                             ctx.imageSmoothingEnabled = true;
-                            ctx.imageSmoothingQuality = 'high';
+                            ctx.imageSmoothingQuality = 'low';
                             let _canvasInitialized = false;
 
                             function draw() {{
@@ -4789,21 +6731,20 @@ let compositorConfig = {compositor_cfg_json};
                                         const fitScale = Math.min(720 / vW, 1280 / vH);
                                         const drawW = vW * fitScale;
                                         const drawH = vH * fitScale;
-                                        const drawX = (720 - drawW) * 0.5;
-                                        const drawY = (1280 - drawH) * 0.5;
-                                        ctx.drawImage(vElem, drawX, drawY, drawW, drawH);
+                                        ctx.drawImage(vElem, (720 - drawW) * 0.5, (1280 - drawH) * 0.5, drawW, drawH);
                                     }} else {{
-                                        const fillScale = Math.max(720 / vW, 1280 / vH);
-                                        const drawW = vW * fillScale;
-                                        const drawH = vH * fillScale;
-                                        const drawX = (720 - drawW) * 0.5;
-                                        const drawY = (1280 - drawH) * 0.5;
-                                        ctx.save();
-                                        ctx.beginPath();
-                                        ctx.rect(0, 0, 720, 1280);
-                                        ctx.clip();
-                                        ctx.drawImage(vElem, drawX, drawY, drawW, drawH);
-                                        ctx.restore();
+                                        // Direct hardware source cropping (zero canvas clipping / stencil overhead)
+                                        const targetAspect = 720 / 1280;
+                                        const srcAspect = vW / vH;
+                                        let sx = 0, sy = 0, sw = vW, sh = vH;
+                                        if (srcAspect > targetAspect) {{
+                                            sw = vH * targetAspect;
+                                            sx = (vW - sw) * 0.5;
+                                        }} else {{
+                                            sh = vW / targetAspect;
+                                            sy = (vH - sh) * 0.5;
+                                        }}
+                                        ctx.drawImage(vElem, sx, sy, sw, sh, 0, 0, 720, 1280);
                                     }}
                                     return true;
                                 }}
@@ -4826,11 +6767,11 @@ let compositorConfig = {compositor_cfg_json};
                                 const guideCfg = (typeof compositorConfig !== 'undefined' && compositorConfig.guide) ? compositorConfig.guide : {{x: 60, y: 150}};
                                 const guideX = guideCfg.x || 60;
                                 const guideY = guideCfg.y || 150;
-                                if (guideOverlayImg && guideOverlayImg.complete && guideOverlayImg.naturalWidth > 0) {{
-                                    ctx.drawImage(guideOverlayImg, guideX, guideY);
+                                if (_guideOverlayImg && _guideOverlayImg.complete && _guideOverlayImg.naturalWidth > 0) {{
+                                    ctx.drawImage(_guideOverlayImg, guideX, guideY);
                                 }}
 
-                                // 3. Single Webcam Box at Top-Right (200x200 at x=476, y=160)
+                                // 3. Single Webcam Box at Top-Right (200x200 at x=440, y=160)
                                 function renderWebcamBox() {{
                                     const camCfg = (typeof compositorConfig !== 'undefined' && compositorConfig.webcam) ? compositorConfig.webcam : {{x: 440, y: 160, width: 200, height: 200}};
                                     const camW = camCfg.width || 200;
@@ -4845,19 +6786,16 @@ let compositorConfig = {compositor_cfg_json};
                                         const sX = (cW - minDim) * 0.5;
                                         const sY = (cH - minDim) * 0.5;
 
-                                        ctx.save();
-                                        ctx.beginPath();
-                                        ctx.rect(camX, camY, camW, camH);
-                                        ctx.clip();
-
+                                        // Direct quad blit without expensive ctx.clip() stencil passes
                                         if (dualIsMirror) {{
+                                            ctx.save();
                                             ctx.translate(camX + camW, camY);
                                             ctx.scale(-1, 1);
                                             ctx.drawImage(camVid, sX, sY, minDim, minDim, 0, 0, camW, camH);
+                                            ctx.restore();
                                         }} else {{
                                             ctx.drawImage(camVid, sX, sY, minDim, minDim, camX, camY, camW, camH);
                                         }}
-                                        ctx.restore();
 
                                         // Cyan Neon border 2px
                                         ctx.strokeStyle = '#25f4ee';
@@ -5010,12 +6948,33 @@ let compositorConfig = {compositor_cfg_json};
                                         '}};'
                                     ], {{ type: 'application/javascript' }});
                                     dualTickWorker = new Worker(URL.createObjectURL(workerBlob));
-                                    dualTickWorker.onmessage = function(e) {{
-                                        if (e.data === 'tick' && isRenderLoopRunning) {{
-                                            draw();
-                                        }}
-                                    }};
                                 }}
+                                dualTickWorker.onmessage = function(e) {{
+                                    if (e.data === 'tick' && isRenderLoopRunning) {{
+                                        const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                                        if (_isDualRendering) {{
+                                            // Self-healing: if RAF was dropped/frozen by Chromium > 90ms, force release lock
+                                            if (now - _lastDualRenderTime > 90) {{
+                                                _isDualRendering = false;
+                                            }} else {{
+                                                return; // Drop frame if previous is genuinely still rendering
+                                            }}
+                                        }}
+                                        _isDualRendering = true;
+                                        _lastDualRenderTime = now;
+                                        if (document.hidden) {{
+                                            try {{ draw(); }} finally {{ _isDualRendering = false; }}
+                                        }} else {{
+                                            dualAnimFrame = requestAnimationFrame(() => {{
+                                                try {{
+                                                    if (isRenderLoopRunning) draw();
+                                                }} finally {{
+                                                    _isDualRendering = false;
+                                                }}
+                                            }});
+                                        }}
+                                    }}
+                                }};
                                 if (dualTickWorker && isRenderLoopRunning) {{
                                     dualTickWorker.postMessage('start');
                                 }}
@@ -5023,7 +6982,11 @@ let compositorConfig = {compositor_cfg_json};
                                 console.warn('[DualScreen] Web Worker timer fallback to setInterval:', wErr);
                                 if (!window._dualFallbackTimer) {{
                                     window._dualFallbackTimer = setInterval(function() {{
-                                        if (isRenderLoopRunning) draw();
+                                        if (isRenderLoopRunning && !_isDualRendering) {{
+                                            _isDualRendering = true;
+                                            _lastDualRenderTime = Date.now();
+                                            try {{ draw(); }} finally {{ _isDualRendering = false; }}
+                                        }}
                                     }}, 1000 / 24);
                                 }}
                             }}
@@ -5032,30 +6995,158 @@ let compositorConfig = {compositor_cfg_json};
                             draw();
                         }}
 
+                        function isCameraLockedError(err) {{
+                            if (!err) return false;
+                            const name = err.name || '';
+                            const msg = (err.message || '').toLowerCase();
+                            return name === 'NotReadableError' ||
+                                   name === 'TrackStartError' ||
+                                   name === 'AbortError' ||
+                                   msg.includes('could not start video source') ||
+                                   msg.includes('device in use') ||
+                                   msg.includes('busy') ||
+                                   msg.includes('concurrent') ||
+                                   msg.includes('source failed');
+                        }}
+
+                        function isOverconstrainedError(err) {{
+                            if (!err) return false;
+                            return err.name === 'OverconstrainedError' ||
+                                   err.name === 'ConstraintNotSatisfiedError';
+                        }}
+
+                        function showCameraNotice(title, htmlContent) {{
+                            const banner = document.getElementById('dualCamNoticeBanner');
+                            const t = document.getElementById('dualCamNoticeTitle');
+                            const msg = document.getElementById('dualCamNoticeText');
+                            if (banner && t && msg) {{
+                                t.innerHTML = title;
+                                msg.innerHTML = htmlContent;
+                                banner.style.display = 'block';
+                            }}
+                        }}
+
+                        function hideCameraNotice() {{
+                            const banner = document.getElementById('dualCamNoticeBanner');
+                            if (banner) banner.style.display = 'none';
+                        }}
+
+                        async function cleanupAggressiveMediaStreams(cooldownMs = 500) {{
+                            console.log('[MediaEngine] Performing aggressive media stream cleanup (Android HAL release)...');
+                            // 1. Cek & hentikan seluruh track pada dualMediaStream global jika masih ada stream aktif
+                            if (dualMediaStream) {{
+                                try {{
+                                    dualMediaStream.getTracks().forEach(t => {{
+                                        try {{
+                                            t.stop();
+                                            console.log('[MediaEngine] Stopped dualMediaStream track:', t.kind);
+                                        }} catch(e) {{}}
+                                    }});
+                                }} catch(e) {{}}
+                                dualMediaStream = null;
+                            }}
+
+                            // 2. Cek & hentikan track pada videoElement (dualCamVideo) dan kosongkan srcObject = null
+                            const camVid = document.getElementById('dualCamVideo');
+                            if (camVid) {{
+                                if (camVid.srcObject) {{
+                                    try {{
+                                        const oldStream = camVid.srcObject;
+                                        if (oldStream && typeof oldStream.getTracks === 'function') {{
+                                            oldStream.getTracks().forEach(t => {{
+                                                try {{
+                                                    t.stop();
+                                                    console.log('[MediaEngine] Stopped camVid track:', t.kind);
+                                                }} catch(e) {{}}
+                                            }});
+                                        }}
+                                    }} catch(e) {{}}
+                                    camVid.srcObject = null;
+                                }}
+                                try {{ camVid.pause(); }} catch(e) {{}}
+                                camVid.removeAttribute('src');
+                                try {{ camVid.load(); }} catch(e) {{}}
+                            }}
+
+                            // 3. Scan semua elemen video di DOM untuk memastikan tidak ada stream liar yang menahan sensor
+                            try {{
+                                document.querySelectorAll('video').forEach(v => {{
+                                    if (v.id !== 'dualSlotVideo_1' && v.srcObject) {{
+                                        try {{
+                                            if (typeof v.srcObject.getTracks === 'function') {{
+                                                v.srcObject.getTracks().forEach(t => {{
+                                                    try {{ t.stop(); }} catch(e) {{}}
+                                                }});
+                                            }}
+                                        }} catch(e) {{}}
+                                        v.srcObject = null;
+                                    }}
+                                }});
+                            }} catch(e) {{}}
+
+                            // 4. Reset VU Meter & Audio Nodes
+                            if (dualVuAnimFrame) {{
+                                cancelAnimationFrame(dualVuAnimFrame);
+                                dualVuAnimFrame = null;
+                            }}
+                            const bar = document.getElementById('dualVuLevel');
+                            if (bar) bar.style.width = '0%';
+
+                            if (dualMicSrc) {{
+                                try {{ dualMicSrc.disconnect(); }} catch(e) {{}}
+                                dualMicSrc = null;
+                            }}
+                            if (dualMicGain) {{
+                                try {{ dualMicGain.disconnect(); }} catch(e) {{}}
+                                dualMicGain = null;
+                            }}
+                            if (dualAnalyser) {{
+                                try {{ dualAnalyser.disconnect(); }} catch(e) {{}}
+                                dualAnalyser = null;
+                            }}
+
+                            // 5. Jeda cooldown pelepasan sensor hardware kamera Android (500ms)
+                            if (cooldownMs > 0) {{
+                                await new Promise(r => setTimeout(r, cooldownMs));
+                            }}
+                        }}
+
                         async function toggleCamera() {{
+                            // Poin 3: Pasang guard/flag isInitializingCamera untuk mencegah race condition
+                            if (isInitializingCamera) {{
+                                console.warn('[MediaEngine] Kamera sedang dalam proses inisialisasi, cegah race condition.');
+                                showToast('⏳ Kamera sedang disiapkan, mohon tunggu...');
+                                return;
+                            }}
+
                             const btn = document.getElementById('btnToggleCam');
                             const badge = document.getElementById('dualStatusBadge');
                             const camVid = document.getElementById('dualCamVideo');
                             const catVid = document.getElementById('dualCatVideo');
 
-                            if (dualMediaStream) {{
-                                dualMediaStream.getTracks().forEach(t => t.stop());
-                                dualMediaStream = null;
-                                if (camVid) camVid.srcObject = null;
-                                if (btn) {{
-                                    btn.innerHTML = '📷 Aktifkan Kamera & Mic';
-                                    btn.style.setProperty('--shimmer-color', '#34c759');
-                                    btn.style.setProperty('--bg', 'rgba(52, 199, 89, 0.15)');
+                            // Jika sedang aktif, lakukan turn OFF bersih
+                            if (isDualScreenActive || dualMediaStream) {{
+                                isInitializingCamera = true;
+                                try {{
+                                    await cleanupAggressiveMediaStreams(500);
+                                    if (btn) {{
+                                        btn.innerHTML = '📷 Aktifkan Kamera & Mic';
+                                        btn.style.setProperty('--shimmer-color', '#34c759');
+                                        btn.style.setProperty('--bg', 'rgba(52, 199, 89, 0.15)');
+                                    }}
+                                    if (badge) {{
+                                        badge.innerText = '⚪ Standby (Kamera Nonaktif)';
+                                        badge.style.color = '#a1a1aa';
+                                        badge.style.borderColor = '#71717a';
+                                        badge.style.background = 'rgba(113, 113, 122, 0.2)';
+                                    }}
+                                    const bTopOff = document.getElementById('camStatusBadge');
+                                    if (bTopOff) {{ bTopOff.innerText = '📷 Cam: OFF'; bTopOff.style.color = '#a1a1aa'; }}
+                                    hideCameraNotice();
+                                    isDualScreenActive = false;
+                                }} finally {{
+                                    isInitializingCamera = false;
                                 }}
-                                if (badge) {{
-                                    badge.innerText = '⚪ Standby (Kamera Nonaktif)';
-                                    badge.style.color = '#a1a1aa';
-                                    badge.style.borderColor = '#71717a';
-                                    badge.style.background = 'rgba(113, 113, 122, 0.2)';
-                                }}
-                                const bTopOff = document.getElementById('camStatusBadge');
-                                if (bTopOff) {{ bTopOff.innerText = '📷 Cam: OFF'; bTopOff.style.color = '#a1a1aa'; }}
-                                isDualScreenActive = false;
                                 return;
                             }}
 
@@ -5064,11 +7155,31 @@ let compositorConfig = {compositor_cfg_json};
                                 return;
                             }}
 
+                            isInitializingCamera = true;
+                            hideCameraNotice();
+                            if (btn) {{
+                                btn.disabled = true;
+                                btn.innerHTML = '⏳ Menyiapkan Kamera...';
+                                btn.style.setProperty('--shimmer-color', '#ffb800');
+                            }}
+                            if (badge) {{
+                                badge.innerText = '🟡 Membersihkan & Inisialisasi Sensor...';
+                                badge.style.color = '#ffb800';
+                                badge.style.borderColor = '#ffb800';
+                            }}
+
+                            let firstError = null;
+                            let fallbackError = null;
+
                             try {{
+                                // Poin 1 & 2: Cleanup stream aktif & jeda delay 500ms sebelum pemanggilan getUserMedia
+                                await cleanupAggressiveMediaStreams(500);
+
                                 const camId = document.getElementById('cameraSourceSelect') ? document.getElementById('cameraSourceSelect').value : null;
                                 const micId = document.getElementById('micSourceSelect') ? document.getElementById('micSourceSelect').value : null;
 
-                                const constraints = {{
+                                // Poin 1: Kembalikan format constraint kamera depan seperti semula yang dulu lancar
+                                const primaryConstraints = {{
                                     video: {{
                                         ...(camId && camId !== '' ? {{ deviceId: {{ ideal: camId }} }} : {{ facingMode: 'user' }}),
                                         width: {{ ideal: 320, max: 480 }},
@@ -5078,20 +7189,81 @@ let compositorConfig = {compositor_cfg_json};
                                     audio: micId && micId !== '' ? {{ deviceId: {{ ideal: micId }} }} : true
                                 }};
 
-                                let stream;
+                                let stream = null;
+
+                                // --- Percobaan 1: Constraint Utama yang terbukti lancar ---
                                 try {{
-                                    stream = await navigator.mediaDevices.getUserMedia(constraints);
+                                    console.log('[MediaEngine] [Percobaan 1] Membuka kamera dengan constraint utama:', JSON.stringify(primaryConstraints));
+                                    stream = await navigator.mediaDevices.getUserMedia(primaryConstraints);
+                                    console.log('[MediaEngine] [Percobaan 1] BERHASIL membuka kamera depan!');
                                 }} catch (camErr) {{
-                                    console.warn('[MediaEngine] Preferred constraints failed, falling back to permissive mode:', camErr);
+                                    firstError = camErr;
+                                    console.warn('[MediaEngine] [Percobaan 1] GAGAL:', camErr.name, camErr.message, camErr);
+
+                                    // Jika izin ditolak, jangan lanjutkan fallback
+                                    if (camErr.name === 'NotAllowedError' || camErr.name === 'PermissionDeniedError') {{
+                                        throw camErr;
+                                    }}
+
+                                    // Poin 2: Fallback ke facingMode: user tanpa memaksa resolusi 480x360 atau deviceId bentrok
+                                    if (badge) {{
+                                        badge.innerText = '🟡 Mencoba Fallback Kamera Depan (facingMode: user)...';
+                                        badge.style.color = '#ffb800';
+                                        badge.style.borderColor = '#ffb800';
+                                    }}
+                                    showToast('🔄 Percobaan 1 gagal (' + camErr.name + '). Menjalankan fallback kamera depan...');
+
+                                    // Cleanup & delay 500ms
+                                    await cleanupAggressiveMediaStreams(500);
+
+                                    // Fallback Langkah 1: Kamera depan murni facingMode: 'user' + audio standar
                                     try {{
-                                        stream = await navigator.mediaDevices.getUserMedia({{
+                                        const fbConstraint1 = {{
                                             video: {{ facingMode: 'user' }},
-                                            audio: true
-                                        }});
-                                    }} catch (fallbackErr) {{
-                                        stream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: true }});
+                                            audio: micId && micId !== '' ? {{ deviceId: {{ ideal: micId }} }} : true
+                                        }};
+                                        console.log('[MediaEngine] [Fallback 1] Meminta facingMode: user + audio...');
+                                        stream = await navigator.mediaDevices.getUserMedia(fbConstraint1);
+                                        console.log('[MediaEngine] [Fallback 1] BERHASIL dengan facingMode: user!');
+                                        showToast('🟢 Kamera depan berhasil diaktifkan via fallback mode');
+                                        const camSel = document.getElementById('cameraSourceSelect');
+                                        if (camSel && camId && camId !== '') camSel.value = '';
+                                    }} catch (fb1Err) {{
+                                        console.warn('[MediaEngine] [Fallback 1] GAGAL:', fb1Err.name, fb1Err.message, fb1Err);
+
+                                        // Fallback Langkah 2: Kamera depan murni TANPA AUDIO (facingMode: user, audio: false)
+                                        await cleanupAggressiveMediaStreams(500);
+                                        try {{
+                                            console.log('[MediaEngine] [Fallback 2] Meminta video murni facingMode: user (audio: false)...');
+                                            stream = await navigator.mediaDevices.getUserMedia({{
+                                                video: {{ facingMode: 'user' }},
+                                                audio: false
+                                            }});
+                                            console.log('[MediaEngine] [Fallback 2] BERHASIL dengan video murni facingMode: user!');
+                                            showToast('🟢 Kamera depan aktif (video murni)');
+                                            const camSel = document.getElementById('cameraSourceSelect');
+                                            if (camSel && camId && camId !== '') camSel.value = '';
+
+                                            // Upayakan ambil audio mic terpisah jika memungkinkan
+                                            try {{
+                                                const micSeparate = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+                                                micSeparate.getAudioTracks().forEach(t => stream.addTrack(t));
+                                                console.log('[MediaEngine] Audio mic terpisah berhasil digabungkan ke stream');
+                                            }} catch (micErr) {{
+                                                console.warn('[MediaEngine] Audio mic terpisah tidak aktif:', micErr.name, micErr.message);
+                                            }}
+                                        }} catch (fb2Err) {{
+                                            fallbackError = fb2Err;
+                                            console.error('[MediaEngine] [Fallback 2] GAGAL TOTAL:', fb2Err.name, fb2Err.message, fb2Err);
+                                        }}
                                     }}
                                 }}
+
+                                if (!stream) {{
+                                    const finalErr = fallbackError || firstError || new Error('Tidak dapat memperoleh stream kamera.');
+                                    throw finalErr;
+                                }}
+
                                 dualMediaStream = stream;
 
                                 stream.getTracks().forEach(track => {{
@@ -5117,25 +7289,28 @@ let compositorConfig = {compositor_cfg_json};
                                         if (bDeck) {{ bDeck.innerText = '🟢 Kamera Siap'; bDeck.style.color = '#34c759'; }}
                                     }};
                                 }});
+
                                 const bTopInit = document.getElementById('camStatusBadge');
                                 if (bTopInit) {{ bTopInit.innerText = '🟢 Cam: ON'; bTopInit.style.color = '#34c759'; }}
                                 if (camVid) {{
+                                    camVid.muted = true;
                                     camVid.srcObject = stream;
                                     camVid.play().catch(e => console.warn(e));
                                 }}
 
                                 initSlotVideoPool();
-                                for (let s = 1; s <= 6; s++) {{
+                                Object.keys(slotVideoPool).forEach(k => {{
+                                    const s = parseInt(k);
                                     if (slotVideoPool[s]) {{
                                         slotVideoPool[s].muted = (s !== dualCurrentSlot);
                                     }}
-                                }}
+                                }});
 
                                 setupDualAudioMixing(stream, catVid);
 
-                                const activeVid = window.activeSlotVideo || slotVideoPool[1];
-                                if (activeVid && (isRenderLoopRunning || dualIsStreaming || isMonitorOutputVisible)) {{
-                                    activeVid.play().catch(e => console.warn(e));
+                                const activeVid = window.activeSlotVideo || (typeof slotVideoPool !== 'undefined' && slotVideoPool[dualCurrentSlot]) || (typeof slotVideoPool !== 'undefined' && slotVideoPool[1]);
+                                if (activeVid) {{
+                                    resyncVideoDecoder(activeVid);
                                 }}
 
                                 if (btn) {{
@@ -5149,20 +7324,116 @@ let compositorConfig = {compositor_cfg_json};
                                     badge.style.borderColor = '#34c759';
                                     badge.style.background = 'rgba(52, 199, 89, 0.2)';
                                 }}
+                                hideCameraNotice();
                                 isDualScreenActive = true;
+                                showToast('🟢 Kamera depan & Mikrofon aktif');
                             }} catch (err) {{
-                                alert('Gagal mengakses kamera/mic: ' + err.message);
-                                console.error(err);
+                                console.error('[MediaEngine] Gagal mengaktifkan kamera/mic:', err);
+                                console.error('[MediaEngine] Rincian Error - Percobaan 1:', firstError, '| Fallback:', fallbackError);
+                                await cleanupAggressiveMediaStreams(500);
+                                isDualScreenActive = false;
+
+                                const isLock = isCameraLockedError(err) || (firstError && isCameraLockedError(firstError)) || (fallbackError && isCameraLockedError(fallbackError));
+                                const isOverconstrained = isOverconstrainedError(err) || (firstError && isOverconstrainedError(firstError));
+
+                                // Poin 4: Format teks error detail untuk UI Banner
+                                const errDiagnostics = '<div style="margin:10px 0; padding:10px; background:rgba(0,0,0,0.5); border:1px solid rgba(255,184,0,0.4); border-radius:6px; font-family:monospace; font-size:11px; line-height:1.4;">' +
+                                    '<div style="color:#ffb800; font-weight:bold; margin-bottom:4px;">🔍 Log Diagnostik Error Sensor:</div>' +
+                                    '<div style="color:#eee;"><b>1. Percobaan Utama:</b> ' + (firstError ? ('<span style="color:#ff453a;">' + firstError.name + '</span>: ' + firstError.message) : 'Tidak ada error') + '</div>' +
+                                    '<div style="color:#eee; margin-top:2px;"><b>2. Fallback (facingMode: user):</b> ' + (fallbackError ? ('<span style="color:#ff453a;">' + fallbackError.name + '</span>: ' + fallbackError.message) : (firstError ? 'Belum/Gagal dieksekusi' : '-')) + '</div>' +
+                                    '</div>';
+
+                                if (isLock) {{
+                                    if (badge) {{
+                                        badge.innerText = '🔴 Kamera Dikunci Aplikasi Lain';
+                                        badge.style.color = '#ff453a';
+                                        badge.style.borderColor = '#ff453a';
+                                        badge.style.background = 'rgba(255, 69, 58, 0.2)';
+                                    }}
+                                    if (btn) {{
+                                        btn.innerHTML = '🔄 Coba Aktifkan Lagi';
+                                        btn.style.setProperty('--shimmer-color', '#ff9500');
+                                        btn.style.setProperty('--bg', 'rgba(255, 149, 0, 0.15)');
+                                    }}
+                                    showCameraNotice(
+                                        '⚠️ Kamera Sedang Digunakan Aplikasi Lain (Could not start video source)',
+                                        'Sensor kamera Android tidak dapat diakses karena masih dikunci oleh sistem atau background tab browser.<br>' +
+                                        errDiagnostics +
+                                        '<b>Solusi Cepat Jika Kamera HP Terlanjur Mengunci Saat Ini:</b><br>' +
+                                        '1. <b>Tutup Paksa Browser dari Recent Apps:</b> Geser (swipe) aplikasi browser hingga benar-benar tertutup dari daftar aplikasi berjalan, tunggu 5 detik, lalu buka kembali. Background tab yang menggantung sering kali masih menahan wake lock kamera.<br>' +
+                                        '2. <b>Reset Izin Kamera di Bar Alamat:</b> Ketuk ikon gembok/pengaturan situs di sebelah URL browser, matikan izin Kamera, tunggu 2 detik, lalu aktifkan kembali dan muat ulang halaman.<br>' +
+                                        '3. Tutup aplikasi yang sedang/baru saja menggunakan kamera (TikTok, Kamera Bawaan HP, WhatsApp, Zoom/Meet).<br>' +
+                                        '4. Klik tombol <b>Coba Aktifkan Lagi</b> di bawah.'
+                                    );
+                                    showToast('⚠️ Kamera dikunci: ' + (firstError ? firstError.name : err.name));
+                                }} else if (isOverconstrained) {{
+                                    if (badge) {{
+                                        badge.innerText = '🔴 Konfigurasi Perangkat Gagal';
+                                        badge.style.color = '#ff9500';
+                                        badge.style.borderColor = '#ff9500';
+                                        badge.style.background = 'rgba(255, 149, 0, 0.2)';
+                                    }}
+                                    if (btn) {{
+                                        btn.innerHTML = '🔄 Coba Kamera Default';
+                                        btn.style.setProperty('--shimmer-color', '#ff9500');
+                                    }}
+                                    showCameraNotice(
+                                        '⚠️ Resolusi atau Perangkat Tidak Didukung (OverconstrainedError)',
+                                        'Kamera yang dipilih tidak dapat memenuhi resolusi atau frame rate yang diminta.<br>' +
+                                        errDiagnostics +
+                                        '<b>Panduan Penyelesaian:</b><br>' +
+                                        '1. Ubah pilihan kamera ke <b>Default Kamera Depan</b>.<br>' +
+                                        '2. Klik tombol <b>Coba Kamera Default</b>.'
+                                    );
+                                    showToast('⚠️ Overconstrained: ' + (firstError ? firstError.name : err.name));
+                                }} else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {{
+                                    if (badge) {{
+                                        badge.innerText = '🔴 Izin Kamera Ditolak';
+                                        badge.style.color = '#ff453a';
+                                    }}
+                                    if (btn) {{
+                                        btn.innerHTML = '📷 Aktifkan Kamera & Mic';
+                                        btn.style.setProperty('--shimmer-color', '#34c759');
+                                    }}
+                                    showCameraNotice(
+                                        '🚫 Izin Akses Kamera Ditolak',
+                                        'Browser memblokir akses ke kamera atau mikrofon.<br>' +
+                                        errDiagnostics +
+                                        'Buka Setelan Situs di Chrome/Browser Anda dan ubah izin Kamera & Mikrofon menjadi <b>Izinkan (Allow)</b>.'
+                                    );
+                                    showToast('🚫 Izin kamera ditolak oleh browser.');
+                                }} else {{
+                                    if (badge) {{
+                                        badge.innerText = '🔴 Gagal Akses Kamera';
+                                        badge.style.color = '#ff453a';
+                                    }}
+                                    if (btn) {{
+                                        btn.innerHTML = '📷 Aktifkan Kamera & Mic';
+                                    }}
+                                    showCameraNotice(
+                                        '⚠️ Galat Akses Kamera',
+                                        'Terjadi kesalahan saat membuka media: ' + (err.message || err.name) + '<br>' +
+                                        errDiagnostics
+                                    );
+                                    showToast('⚠️ Galat: ' + (err.message || err.name));
+                                }}
+                            }} finally {{
+                                isInitializingCamera = false;
+                                if (btn) btn.disabled = false;
                             }}
                         }}
 
                         function setupDualAudioMixing(micStream, catVid) {{
                             try {{
                                 if (!dualAudioCtx) {{
-                                    dualAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                                    try {{
+                                        dualAudioCtx = new (window.AudioContext || window.webkitAudioContext)({{ latencyHint: 'playback' }});
+                                    }} catch(e) {{
+                                        dualAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                                    }}
                                 }}
-                                if (dualAudioCtx.state === 'suspended') {{
-                                    dualAudioCtx.resume();
+                                if (dualAudioCtx.state === 'suspended' || dualAudioCtx.state === 'interrupted') {{
+                                    dualAudioCtx.resume().catch(e => console.warn(e));
                                 }}
                                 if (!dualAudioDest) {{
                                     dualAudioDest = dualAudioCtx.createMediaStreamDestination();
@@ -5178,33 +7449,55 @@ let compositorConfig = {compositor_cfg_json};
                                 }}
 
                                 if (micStream && micStream.getAudioTracks().length > 0) {{
-                                    const micSrc = dualAudioCtx.createMediaStreamSource(micStream);
+                                    if (dualMicSrc) {{
+                                        try {{ dualMicSrc.disconnect(); }} catch(e) {{}}
+                                        dualMicSrc = null;
+                                    }}
+                                    if (dualMicGain) {{
+                                        try {{ dualMicGain.disconnect(); }} catch(e) {{}}
+                                        dualMicGain = null;
+                                    }}
+                                    if (dualAnalyser) {{
+                                        try {{ dualAnalyser.disconnect(); }} catch(e) {{}}
+                                        dualAnalyser = null;
+                                    }}
+                                    if (dualVuAnimFrame) {{
+                                        cancelAnimationFrame(dualVuAnimFrame);
+                                        dualVuAnimFrame = null;
+                                    }}
+
+                                    dualMicSrc = dualAudioCtx.createMediaStreamSource(micStream);
                                     dualMicGain = dualAudioCtx.createGain();
                                     dualMicGain.gain.value = dualIsMicMuted ? 0 : 1.0;
-                                    micSrc.connect(dualMicGain);
+                                    dualMicSrc.connect(dualMicGain);
                                     dualMicGain.connect(dualAudioDest);
 
-                                    const analyser = dualAudioCtx.createAnalyser();
-                                    analyser.fftSize = 64;
-                                    micSrc.connect(analyser);
-                                    const dataArray = new Uint8Array(analyser.frequencyBinCount);
-                                    function updateVu() {{
+                                    dualAnalyser = dualAudioCtx.createAnalyser();
+                                    dualAnalyser.fftSize = 64;
+                                    dualMicSrc.connect(dualAnalyser);
+                                    const dataArray = new Uint8Array(dualAnalyser.frequencyBinCount);
+                                    let lastVuTime = 0;
+                                    function updateVu(timestamp) {{
                                         if (!dualMediaStream) return;
-                                        analyser.getByteFrequencyData(dataArray);
-                                        let sum = 0;
-                                        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-                                        const avg = sum / dataArray.length;
-                                        const pct = Math.min(100, Math.round((avg / 128) * 100));
-                                        const bar = document.getElementById('dualVuLevel');
-                                        if (bar) bar.style.width = pct + '%';
-                                        requestAnimationFrame(updateVu);
+                                        if (!lastVuTime || timestamp - lastVuTime >= 66) {{
+                                            lastVuTime = timestamp;
+                                            dualAnalyser.getByteFrequencyData(dataArray);
+                                            let sum = 0;
+                                            for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                                            const avg = sum / dataArray.length;
+                                            const pct = Math.min(100, Math.round((avg / 128) * 100));
+                                            const bar = document.getElementById('dualVuLevel');
+                                            if (bar) bar.style.width = pct + '%';
+                                        }}
+                                        dualVuAnimFrame = requestAnimationFrame(updateVu);
                                     }}
-                                    updateVu();
+                                    dualVuAnimFrame = requestAnimationFrame(updateVu);
                                 }}
 
                                 // Hubungkan semua slot di slotVideoPool ke Web Audio graph dengan individual GainNodes
                                 initSlotVideoPool();
-                                for (let s = 1; s <= 6; s++) {{
+                                (window.ACTIVE_SLOTS || Object.keys(slotVideoPool)).forEach(sVal => {{
+                                    const s = parseInt(sVal);
                                     const sVid = slotVideoPool[s];
                                     if (sVid && !slotAudioSources[s]) {{
                                         try {{
@@ -5221,7 +7514,7 @@ let compositorConfig = {compositor_cfg_json};
                                             console.warn('[VideoPool Audio] setup error slot ' + s + ':', e);
                                         }}
                                     }}
-                                }}
+                                }});
 
                                 if (catVid && !dualCatAudioSource && !slotAudioSources[1]) {{
                                     try {{
@@ -5245,17 +7538,19 @@ let compositorConfig = {compositor_cfg_json};
                         }}
 
                         async function switchCameraDevice() {{
-                            if (dualMediaStream) {{
-                                await toggleCamera();
-                                await new Promise(r => setTimeout(r, 400));
+                            if (isInitializingCamera) return;
+                            if (dualMediaStream || isDualScreenActive) {{
+                                await cleanupAggressiveMediaStreams(500);
+                                isDualScreenActive = false;
                                 await toggleCamera();
                             }}
                         }}
 
                         async function switchMicDevice() {{
-                            if (dualMediaStream) {{
-                                await toggleCamera();
-                                await new Promise(r => setTimeout(r, 400));
+                            if (isInitializingCamera) return;
+                            if (dualMediaStream || isDualScreenActive) {{
+                                await cleanupAggressiveMediaStreams(500);
+                                isDualScreenActive = false;
                                 await toggleCamera();
                             }}
                         }}
@@ -5433,6 +7728,9 @@ let compositorConfig = {compositor_cfg_json};
                         async function handleStartLiveClick(ev) {{
                             if (ev) ev.preventDefault();
                             if (!validateStartLive()) return;
+                            if (!confirm('Mulai siaran langsung TikTok Live sekarang? Kamera, mikrofon, dan streaming ke TikTok RTMP akan diaktifkan.')) {{
+                                return;
+                            }}
 
                             // Destroy all slot previews immediately to free hardware decoders
                             destroyAllSlotPreviews();
@@ -5579,38 +7877,68 @@ let compositorConfig = {compositor_cfg_json};
                     
                         // --- Mobile Chrome Resilience & Reconnect Camera ---
                         async function reconnectCamera() {{
+                            if (isReconnectingCamera || isInitializingCamera) return;
+                            isReconnectingCamera = true;
                             console.log('[MediaEngine] Reconnecting camera...');
-                            const bTop = document.getElementById('camStatusBadge');
-                            const bDeck = document.getElementById('dualStatusBadge');
-                            if (bTop) {{ bTop.innerText = '🟡 Cam: Recon...'; bTop.style.color = '#ffb800'; }}
-                            if (bDeck) {{ bDeck.innerText = '🟡 Reconnecting Camera...'; bDeck.style.color = '#ffb800'; }}
+                            try {{
+                                const bTop = document.getElementById('camStatusBadge');
+                                const bDeck = document.getElementById('dualStatusBadge');
+                                if (bTop) {{ bTop.innerText = '🟡 Cam: Recon...'; bTop.style.color = '#ffb800'; }}
+                                if (bDeck) {{ bDeck.innerText = '🟡 Reconnecting Camera...'; bDeck.style.color = '#ffb800'; }}
 
-                            if (dualMediaStream) {{
-                                dualMediaStream.getTracks().forEach(t => {{
-                                    try {{ t.stop(); }} catch(e) {{}}
-                                }});
-                                dualMediaStream = null;
+                                await cleanupAggressiveMediaStreams(500);
+                                isDualScreenActive = false;
+
+                                await toggleCamera();
+
+                                const activeVid = window.activeSlotVideo || (typeof slotVideoPool !== 'undefined' && slotVideoPool[dualCurrentSlot]) || (typeof slotVideoPool !== 'undefined' && slotVideoPool[1]);
+                                if (activeVid) {{
+                                    resyncVideoDecoder(activeVid);
+                                }}
+
+                                showToast('📷 Kamera terhubung kembali');
+                            }} catch(err) {{
+                                console.error('[MediaEngine] Reconnect failed:', err);
+                            }} finally {{
+                                isReconnectingCamera = false;
                             }}
-                            const camVid = document.getElementById('dualCamVideo');
-                            if (camVid) camVid.srcObject = null;
-                            isDualScreenActive = false;
-
-                            await new Promise(r => setTimeout(r, 400));
-                            await toggleCamera();
-                            showToast('📷 Kamera terhubung kembali');
                         }}
 
                         document.addEventListener('visibilitychange', () => {{
                             if (document.visibilityState === 'visible') {{
-                                console.log('[MediaEngine] Tab became visible. Checking camera status...');
-                                if (isDualScreenActive && dualMediaStream) {{
-                                    const tracks = dualMediaStream.getVideoTracks();
-                                    const isDead = tracks.length === 0 || tracks.some(t => t.readyState === 'ended' || t.muted);
-                                    if (isDead) {{
-                                        console.warn('[MediaEngine] Camera track dead after tab hidden. Auto-reconnecting...');
-                                        reconnectCamera();
-                                    }}
+                                console.log('[MediaEngine] Tab became visible. Resuming render loop and checking audio/video sync...');
+                                _isDualRendering = false;
+                                if (dualAnimFrame) {{
+                                    cancelAnimationFrame(dualAnimFrame);
+                                    dualAnimFrame = null;
                                 }}
+
+                                if (dualAudioCtx && (dualAudioCtx.state === 'suspended' || dualAudioCtx.state === 'interrupted')) {{
+                                    dualAudioCtx.resume().catch(e => console.warn('[AudioContext] resume error on visible:', e));
+                                }}
+
+                                const activeVid = window.activeSlotVideo || (typeof slotVideoPool !== 'undefined' && slotVideoPool[dualCurrentSlot]) || (typeof slotVideoPool !== 'undefined' && slotVideoPool[1]);
+                                if (activeVid) {{
+                                    resyncVideoDecoder(activeVid);
+                                }}
+
+                                if (_visibilityDebounce) clearTimeout(_visibilityDebounce);
+                                _visibilityDebounce = setTimeout(() => {{
+                                    if (isDualScreenActive && dualMediaStream) {{
+                                        const tracks = dualMediaStream.getVideoTracks();
+                                        const isDead = tracks.length === 0 || tracks.some(t => t.readyState === 'ended' || t.muted);
+                                        if (isDead) {{
+                                            console.warn('[MediaEngine] Camera track dead after tab hidden. Auto-reconnecting...');
+                                            reconnectCamera();
+                                        }}
+                                    }}
+                                }}, 300);
+                            }} else {{
+                                if (dualAnimFrame) {{
+                                    cancelAnimationFrame(dualAnimFrame);
+                                    dualAnimFrame = null;
+                                }}
+                                _isDualRendering = false;
                             }}
                         }});
 
@@ -5703,6 +8031,377 @@ let compositorConfig = {compositor_cfg_json};
                                 }}).catch(e => console.warn(e));
                         }}
 
+                        // --- Profile & Preset Modular Management Engine ---
+                        let currentProfilesMeta = null;
+
+                        function escapeHtml(str) {{
+                            if (!str) return '';
+                            return String(str)
+                                .replace(/&/g, '&amp;')
+                                .replace(/</g, '&lt;')
+                                .replace(/>/g, '&gt;')
+                                .replace(/"/g, '&quot;')
+                                .replace(/'/g, '&#039;');
+                        }}
+
+                        function escapeJs(str) {{
+                            if (!str) return '';
+                            return String(str).replace(/'/g, "\\'").replace(/"/g, '&quot;');
+                        }}
+
+                        async function loadProfilesData() {{
+                            try {{
+                                const res = await fetch('/api/profiles');
+                                const data = await res.json();
+                                if (data && (data.success || data.profiles)) {{
+                                    currentProfilesMeta = data;
+                                    renderProfilesUI();
+                                }}
+                            }} catch (e) {{
+                                console.error('Failed to load profiles:', e);
+                            }}
+                        }}
+
+                        function renderProfilesUI() {{
+                            if (!currentProfilesMeta || !currentProfilesMeta.profiles) return;
+                            const activeProfId = currentProfilesMeta.active_profile_id;
+                            const profiles = currentProfilesMeta.profiles;
+                            const currentProf = profiles[activeProfId] || Object.values(profiles)[0];
+                            if (!currentProf) return;
+
+                            // Top-bar indicator
+                            const activePreset = currentProf.presets ? currentProf.presets[currentProf.active_preset_id] : null;
+                            const presetName = activePreset ? activePreset.name : 'Belum Ada';
+                            const topText = document.getElementById('topBarPresetText');
+                            if (topText) {{
+                                topText.textContent = currentProf.name + ' › ' + presetName;
+                            }}
+
+                            // Update Overwrite Button state
+                            const btnSidebarOvr = document.getElementById('btnSidebarOverwrite');
+                            const btnModalOvr = document.getElementById('btnModalOverwrite');
+                            const hasActivePreset = Boolean(activePreset);
+                            if (btnSidebarOvr) {{
+                                btnSidebarOvr.style.display = hasActivePreset ? 'flex' : 'none';
+                                btnSidebarOvr.title = hasActivePreset ? 'Perbarui preset \"' + presetName + '\" dengan kondisi aktif saat ini' : '';
+                            }}
+                            if (btnModalOvr) {{
+                                btnModalOvr.style.display = hasActivePreset ? 'flex' : 'none';
+                                btnModalOvr.title = hasActivePreset ? 'Perbarui preset \"' + presetName + '\" dengan kondisi aktif saat ini' : '';
+                            }}
+
+                            // Select dropdowns
+                            const selects = [document.getElementById('profileSelect'), document.getElementById('modalProfileSelect')];
+                            selects.forEach(sel => {{
+                                if (!sel) return;
+                                sel.innerHTML = '';
+                                Object.values(profiles).forEach(p => {{
+                                    const opt = document.createElement('option');
+                                    opt.value = p.id;
+                                    opt.textContent = p.name + (p.id === activeProfId ? ' (Aktif)' : '');
+                                    if (p.id === activeProfId) opt.selected = true;
+                                    sel.appendChild(opt);
+                                }});
+                            }});
+
+                            // Preset lists
+                            const containers = [document.getElementById('presetListContainer'), document.getElementById('modalPresetListContainer')];
+                            containers.forEach(container => {{
+                                if (!container) return;
+                                container.innerHTML = '';
+                                const presets = currentProf.presets || {{}};
+                                const presetKeys = Object.keys(presets);
+                                if (presetKeys.length === 0) {{
+                                    container.innerHTML = '<div style=\"color:#71717a; font-size:11px; padding:8px; text-align:center;\">Belum ada preset tersimpan.</div>';
+                                    return;
+                                }}
+
+                                presetKeys.forEach(pId => {{
+                                    const p = presets[pId];
+                                    const isActive = (pId === currentProf.active_preset_id && currentProf.id === activeProfId);
+                                    const card = document.createElement('div');
+                                    card.className = 'preset-card' + (isActive ? ' active-preset' : '');
+
+                                    const dateStr = p.updated_at ? new Date(p.updated_at * 1000).toLocaleString('id-ID', {{day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'}}) : '';
+
+                                    let actionsHtml = '';
+                                    if (isActive) {{
+                                        actionsHtml = `
+                                            <button type="button" class="btn btn-secondary" onclick="confirmOverwriteActivePreset()" style="font-size:10px; padding:3px 8px; background:rgba(245,158,11,0.15); border-color:#f59e0b; color:#f59e0b; display:inline-flex; align-items:center; gap:4px;" title="Update preset ini dengan pengaturan & video aktif saat ini">
+                                                🔄 Update
+                                            </button>
+                                        `;
+                                    }} else {{
+                                        actionsHtml = `
+                                            <button type="button" class="btn btn-secondary" onclick="loadPreset('${{currentProf.id}}', '${{p.id}}', '${{escapeJs(p.name)}}')" style="font-size:10px; padding:3px 8px; background:rgba(37,244,238,0.1); border-color:var(--cyan); color:var(--cyan); display:inline-flex; align-items:center; gap:4px;">
+                                                ⚡ Load
+                                            </button>
+                                        `;
+                                    }}
+
+                                    actionsHtml += `
+                                        <button type="button" class="btn btn-secondary" onclick="promptRenamePreset('${{currentProf.id}}', '${{p.id}}', '${{escapeJs(p.name)}}')" style="font-size:10px; padding:3px 6px;" title="Ubah Nama">✏️</button>
+                                        <button type="button" class="btn btn-secondary" onclick="confirmDeletePreset('${{currentProf.id}}', '${{p.id}}', '${{escapeJs(p.name)}}')" style="font-size:10px; padding:3px 6px; color:#ff453a;" title="Hapus">🗑️</button>
+                                    `;
+
+                                    card.innerHTML = `
+                                        <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:4px;">
+                                            <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:140px;">
+                                                <span style="font-weight:bold; font-size:12px; color:${{isActive ? 'var(--cyan)' : '#f4f4f5'}};">${{escapeHtml(p.name)}}</span>
+                                                <div style="font-size:10px; color:#71717a;">${{escapeHtml(p.description || '')}} ${{dateStr ? '• ' + dateStr : ''}}</div>
+                                            </div>
+                                            ${{isActive ? '<span style="background:rgba(16,185,129,0.15); border:1px solid #10b981; color:#10b981; font-size:9px; font-weight:bold; padding:1px 5px; border-radius:4px;">AKTIF</span>' : ''}}
+                                        </div>
+                                        <div style="display:flex; gap:4px; margin-top:6px; flex-wrap:wrap; align-items:center;">
+                                            ${{actionsHtml}}
+                                        </div>
+                                    `;
+                                    container.appendChild(card);
+                                }});
+                            }});
+                        }}
+
+                        async function onProfileSelectChange(newProfId) {{
+                            if (!newProfId) return;
+                            try {{
+                                const res = await fetch('/api/profiles/switch', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ profile_id: newProfId }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    showToast('✅ Beralih ke profil ' + (data.name || newProfId) + '. Memuat...');
+                                    setTimeout(() => location.reload(), 800);
+                                }} else {{
+                                    alert('Gagal beralih profil: ' + (data.error || 'Terjadi kesalahan'));
+                                }}
+                            }} catch (e) {{
+                                console.error(e);
+                                alert('Error: ' + e);
+                            }}
+                        }}
+
+                        async function promptCreateProfile() {{
+                            const name = prompt('Masukkan Nama Profil Baru:');
+                            if (!name || !name.trim()) return;
+                            try {{
+                                const res = await fetch('/api/profiles/create', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ name: name.trim() }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    showToast('✅ Profil baru \"' + name.trim() + '\" dibuat!');
+                                    loadProfilesData();
+                                }} else {{
+                                    alert('Gagal membuat profil: ' + (data.error || 'Error'));
+                                }}
+                            }} catch (e) {{
+                                console.error(e);
+                                alert('Error: ' + e);
+                            }}
+                        }}
+
+                        async function promptRenameProfile() {{
+                            if (!currentProfilesMeta) return;
+                            const activeProfId = currentProfilesMeta.active_profile_id;
+                            const prof = currentProfilesMeta.profiles[activeProfId];
+                            if (!prof) return;
+                            const newName = prompt('Ubah Nama Profil:', prof.name);
+                            if (!newName || !newName.trim() || newName.trim() === prof.name) return;
+                            try {{
+                                const res = await fetch('/api/profiles/rename', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ profile_id: activeProfId, name: newName.trim() }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    showToast('✅ Nama profil diubah menjadi ' + newName.trim());
+                                    loadProfilesData();
+                                }} else {{
+                                    alert('Gagal mengubah nama: ' + (data.error || 'Error'));
+                                }}
+                            }} catch (e) {{
+                                console.error(e);
+                                alert('Error: ' + e);
+                            }}
+                        }}
+
+                        async function confirmDeleteProfile() {{
+                            if (!currentProfilesMeta) return;
+                            const activeProfId = currentProfilesMeta.active_profile_id;
+                            const prof = currentProfilesMeta.profiles[activeProfId];
+                            if (!prof) return;
+                            if (Object.keys(currentProfilesMeta.profiles).length <= 1) {{
+                                alert('Tidak dapat menghapus profil ini karena merupakan satu-satunya profil yang tersedia.');
+                                return;
+                            }}
+                            if (!confirm('Apakah Anda yakin ingin menghapus profil \"' + prof.name + '\" beserta seluruh preset di dalamnya?')) {{
+                                return;
+                            }}
+                            try {{
+                                const res = await fetch('/api/profiles/delete', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ profile_id: activeProfId }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    showToast('✅ Profil berhasil dihapus. Menyegarkan...');
+                                    setTimeout(() => location.reload(), 800);
+                                }} else {{
+                                    alert('Gagal menghapus profil: ' + (data.error || 'Error'));
+                                }}
+                            }} catch (e) {{
+                                console.error(e);
+                                alert('Error: ' + e);
+                            }}
+                        }}
+
+                        async function promptSaveNewPreset() {{
+                            if (!currentProfilesMeta) return;
+                            const activeProfId = currentProfilesMeta.active_profile_id;
+                            const name = prompt('Nama Preset Baru:');
+                            if (!name || !name.trim()) return;
+                            const desc = prompt('Deskripsi singkat (opsional):') || '';
+                            try {{
+                                const res = await fetch('/api/presets/save', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ profile_id: activeProfId, name: name.trim(), description: desc.trim() }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    showToast('✅ Preset \"' + name.trim() + '\" berhasil disimpan!');
+                                    loadProfilesData();
+                                }} else {{
+                                    alert('Gagal menyimpan preset: ' + (data.error || 'Error'));
+                                }}
+                            }} catch (e) {{
+                                console.error(e);
+                                alert('Error: ' + e);
+                            }}
+                        }}
+
+                        async function confirmOverwriteActivePreset() {{
+                            if (!currentProfilesMeta || !currentProfilesMeta.profiles) return;
+                            const activeProfId = currentProfilesMeta.active_profile_id;
+                            const prof = currentProfilesMeta.profiles[activeProfId];
+                            if (!prof) return;
+                            const activePresetId = prof.active_preset_id;
+                            const preset = prof.presets ? prof.presets[activePresetId] : null;
+                            const presetName = preset ? preset.name : 'Preset Aktif';
+
+                            if (!confirm('Perbarui isi snapshot preset \"' + presetName + '\" dengan seluruh konfigurasi dan berkas video saat ini?\\n\\nIsi file lama preset ini akan ditimpa (overwritten).')) {{
+                                return;
+                            }}
+                            try {{
+                                const res = await fetch('/api/presets/overwrite', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ profile_id: activeProfId, preset_id: activePresetId }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    showToast('✅ Preset \"' + presetName + '\" berhasil diperbarui!');
+                                    loadProfilesData();
+                                }} else {{
+                                    alert('Gagal memperbarui preset: ' + (data.error || 'Error'));
+                                }}
+                            }} catch (e) {{
+                                console.error(e);
+                                alert('Error: ' + e);
+                            }}
+                        }}
+
+                        async function loadPreset(profileId, presetId, name) {{
+                            if (!confirm('Muat dan aktifkan preset \"' + name + '\"?\\n\\nKonfigurasi aktif saat ini akan digantikan oleh preset ini.')) {{
+                                return;
+                            }}
+                            showToast('⏳ Memulihkan preset \"' + name + '\"...');
+                            try {{
+                                const res = await fetch('/api/presets/load', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ profile_id: profileId, preset_id: presetId }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    showToast('✅ Preset berhasil dimuat! Menyegarkan...');
+                                    setTimeout(() => location.reload(), 900);
+                                }} else {{
+                                    alert('Gagal memuat preset: ' + (data.error || 'Error'));
+                                }}
+                            }} catch (e) {{
+                                console.error(e);
+                                alert('Error: ' + e);
+                            }}
+                        }}
+
+                        async function promptRenamePreset(profileId, presetId, curName) {{
+                            const newName = prompt('Ubah Nama Preset:', curName);
+                            if (!newName || !newName.trim() || newName.trim() === curName) return;
+                            try {{
+                                const res = await fetch('/api/presets/rename', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ profile_id: profileId, preset_id: presetId, name: newName.trim() }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    showToast('✅ Nama preset diubah menjadi ' + newName.trim());
+                                    loadProfilesData();
+                                }} else {{
+                                    alert('Gagal mengubah nama preset: ' + (data.error || 'Error'));
+                                }}
+                            }} catch (e) {{
+                                console.error(e);
+                                alert('Error: ' + e);
+                            }}
+                        }}
+
+                        async function confirmDeletePreset(profileId, presetId, name) {{
+                            if (!currentProfilesMeta) return;
+                            const prof = currentProfilesMeta.profiles[profileId];
+                            if (prof && Object.keys(prof.presets || {{}}).length <= 1) {{
+                                alert('Tidak dapat menghapus preset terakhir dalam profil ini.');
+                                return;
+                            }}
+                            if (!confirm('Apakah Anda yakin ingin menghapus preset \"' + name + '\"?')) {{
+                                return;
+                            }}
+                            try {{
+                                const res = await fetch('/api/presets/delete', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ profile_id: profileId, preset_id: presetId }})
+                                }});
+                                const data = await res.json();
+                                if (data.success) {{
+                                    showToast('✅ Preset \"' + name + '\" berhasil dihapus!');
+                                    loadProfilesData();
+                                }} else {{
+                                    alert('Gagal menghapus preset: ' + (data.error || 'Error'));
+                                }}
+                            }} catch (e) {{
+                                console.error(e);
+                                alert('Error: ' + e);
+                            }}
+                        }}
+
+                        function openPresetModal() {{
+                            const m = document.getElementById('presetModal');
+                            if (m) m.style.display = 'flex';
+                        }}
+
+                        function closePresetModal() {{
+                            const m = document.getElementById('presetModal');
+                            if (m) m.style.display = 'none';
+                        }}
+
                         // Event Delegation untuk navigasi tab (sidebar .nav-item & .bottom-nav-item)
                         document.addEventListener('click', (e) => {{
                             const item = e.target.closest('[data-menu]');
@@ -5717,22 +8416,31 @@ let compositorConfig = {compositor_cfg_json};
                             window.switchMenu(saved);
                             if (typeof fetchFfmpegLogs === 'function') fetchFfmpegLogs();
                             if (typeof initSlotVideoPool === 'function') initSlotVideoPool();
+                            if (typeof loadProfilesData === 'function') loadProfilesData();
                         }});
 
 </script>
 </head>
 <body>
 
+<!-- SVG Liquid Glass Turbulence Filter -->
+<svg class="hidden" style="position:fixed; top:-9999px; left:-9999px; width:0; height:0; pointer-events:none;" aria-hidden="true">
+  <defs>
+    <filter id="container-glass" x="0%" y="0%" width="100%" height="100%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.05 0.05" numOctaves="1" seed="1" result="turbulence" />
+      <feGaussianBlur in="turbulence" stdDeviation="2" result="blurredNoise" />
+      <feDisplacementMap in="SourceGraphic" in2="blurredNoise" scale="70" xChannelSelector="R" yChannelSelector="B" result="displaced" />
+      <feGaussianBlur in="displaced" stdDeviation="4" result="finalBlur" />
+      <feComposite in="finalBlur" in2="finalBlur" operator="over" />
+    </filter>
+  </defs>
+</svg>
+
 <!-- Persistent Media Engine (Pre-loaded Video Pool for 0ms Cut-to-Cut Switching) -->
 <div id="persistent-media-engine" style="position:fixed; top:0; left:-9999px; width:720px; height:1280px; opacity:0.001; pointer-events:none; z-index:-999;">
     <video id="dualCatVideo" playsinline loop crossorigin="anonymous" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_1" playsinline loop preload="auto" crossorigin="anonymous" src="/video-stream?name=video_1.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_2" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_2.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_3" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_3.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_4" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_4.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_5" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_5.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualSlotVideo_6" playsinline muted preload="auto" crossorigin="anonymous" src="/video-stream?name=video_6.mp4" style="width:720px; height:1280px;"></video>
-    <video id="dualCamVideo" playsinline autoplay style="width:320px; height:240px;"></video>
+    {persistent_slot_videos_html}
+    <video id="dualCamVideo" playsinline autoplay muted style="width:320px; height:240px;"></video>
 </div>
 
 <!-- Sticky Top Bar -->
@@ -5743,6 +8451,9 @@ let compositorConfig = {compositor_cfg_json};
         </span>
         <span id="camStatusBadge" style="background:rgba(113,113,122,0.2); border:1px solid #71717a; color:#a1a1aa; padding:3px 8px; border-radius:6px; font-size:12px; font-weight:bold;">📷 Cam: OFF</span>
         <span style="font-family:var(--font-mono); font-size:12px; background:rgba(255,255,255,0.06); padding:3px 8px; border-radius:6px;">Q:<span id="queueCountVal">{queueCountVal}</span> | BR:1.2Mbps</span>
+        <span onclick="openPresetModal()" style="font-family:var(--font-mono); font-size:12px; background:rgba(37,244,238,0.12); border:1px solid rgba(37,244,238,0.4); color:var(--cyan); padding:3px 10px; border-radius:6px; cursor:pointer; display:inline-flex; align-items:center; gap:6px;" title="Klik untuk membuka Manager Profile & Preset">
+            <span>📁</span> <span id="topBarPresetText">Memuat Preset...</span>
+        </span>
     </div>
     <div style="display:flex; gap:8px; align-items:center;">
         <button type="button" class="btn btn-secondary" onclick="reconnectCamera()" style="font-size:12px; padding:6px 12px; display:inline-flex; align-items:center; gap:6px;">📷 Reconnect</button>
@@ -5765,6 +8476,39 @@ let compositorConfig = {compositor_cfg_json};
         <a href="#" class="nav-item" data-menu="overlays">🎭 Overlays</a>
         <a href="#" class="nav-item" data-menu="compositor">🎛️ Compositor</a>
         <a href="#" class="nav-item" data-menu="telemetry">⚡ Telemetry</a>
+
+        <!-- PROFILES & PRESETS SECTION -->
+        <div class="sidebar-preset-container" style="margin-top:18px; padding-top:14px; border-top:1px solid rgba(255,255,255,0.08);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <span style="font-size:11px; font-weight:bold; letter-spacing:1px; color:var(--cyan); text-transform:uppercase;">📂 Profile & Presets</span>
+                <button type="button" onclick="loadProfilesData()" style="background:transparent; border:none; color:#71717a; cursor:pointer; font-size:12px;" title="Refresh Presets">🔄</button>
+            </div>
+
+            <!-- Profile Selector Row -->
+            <div style="display:flex; gap:4px; align-items:center; margin-bottom:8px;">
+                <select id="profileSelect" onchange="onProfileSelectChange(this.value)" style="flex:1; background:#181820; border:1px solid var(--border); color:#fff; padding:5px 6px; border-radius:6px; font-size:11px; outline:none; max-width:130px; text-overflow:ellipsis; overflow:hidden; white-space:nowrap;">
+                </select>
+                <button type="button" onclick="promptCreateProfile()" class="btn btn-secondary" style="padding:4px 6px; font-size:11px;" title="Tambah Profil Baru">➕</button>
+                <button type="button" onclick="promptRenameProfile()" class="btn btn-secondary" style="padding:4px 6px; font-size:11px;" title="Ubah Nama Profil">✏️</button>
+                <button type="button" onclick="confirmDeleteProfile()" class="btn btn-secondary" style="padding:4px 6px; font-size:11px; color:#ff453a;" title="Hapus Profil">🗑️</button>
+            </div>
+
+            <!-- Action Buttons: Save New & Overwrite Active -->
+            <div style="display:flex; flex-direction:column; gap:5px; margin-bottom:10px;">
+                <button type="button" onclick="promptSaveNewPreset()" class="modern-btn" style="width:100%; padding:6px 8px; font-size:11px; font-weight:bold; background:rgba(37,244,238,0.12); color:#25f4ee; border:1px solid #25f4ee; border-radius:6px; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px;">
+                    <span>💾</span> <span>Simpan Preset Baru</span>
+                </button>
+                <button type="button" id="btnSidebarOverwrite" onclick="confirmOverwriteActivePreset()" class="modern-btn" style="width:100%; padding:5px 8px; font-size:10px; font-weight:600; background:rgba(245,158,11,0.12); color:#f59e0b; border:1px solid #f59e0b; border-radius:6px; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px;" title="Perbarui isi preset yang sedang aktif dengan setting & video saat ini">
+                    <span>🔄</span> <span>Update Preset Aktif</span>
+                </button>
+            </div>
+
+            <!-- Presets List -->
+            <div style="font-size:10px; color:#71717a; font-weight:bold; text-transform:uppercase; margin-bottom:6px; letter-spacing:0.5px;">Preset Tersimpan:</div>
+            <div id="presetListContainer" style="max-height:240px; overflow-y:auto; display:flex; flex-direction:column; gap:6px; padding-right:2px;">
+                <!-- Diisi via JS -->
+            </div>
+        </div>
     </nav>
 
     <!-- Main Content Area with 5 SPA Views -->
@@ -5787,6 +8531,20 @@ let compositorConfig = {compositor_cfg_json};
                         <p style="margin:4px 0 0 0; color:#888; font-size:12px;">Kontrol kanvas mixing 720x1280 (24 FPS) langsung ke TikTok Live RTMP.</p>
                     </div>
                     <span id="dualStatusBadge" style="background:rgba(113,113,122,0.2); border:1px solid #71717a; color:#a1a1aa; padding:4px 10px; border-radius:6px; font-size:12px; font-weight:bold;">⚪ Standby (Kamera Nonaktif)</span>
+                </div>
+
+                <!-- Guidance / Error Banner for Camera Conflicts -->
+                <div id="dualCamNoticeBanner" style="display:none; margin-bottom:14px; padding:12px 16px; border-radius:10px; background:rgba(255, 59, 48, 0.12); border:1px solid #ff3b30; color:#fff; font-size:13px; line-height:1.5;">
+                    <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:10px;">
+                        <div style="display:flex; gap:10px;">
+                            <span style="font-size:20px; line-height:1;">⚠️</span>
+                            <div>
+                                <b id="dualCamNoticeTitle" style="color:#ff453a; font-size:14px;">Kamera Sedang Digunakan Aplikasi Lain</b>
+                                <div id="dualCamNoticeText" style="color:#e4e4e7; margin-top:4px; font-size:12px;"></div>
+                            </div>
+                        </div>
+                        <button type="button" onclick="hideCameraNotice()" style="background:transparent; border:none; color:#a1a1aa; cursor:pointer; font-size:16px; line-height:1;">✕</button>
+                    </div>
                 </div>
 
                 <div style="display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap;">
@@ -5929,8 +8687,8 @@ let compositorConfig = {compositor_cfg_json};
         <!-- 2. VIEW VIDEO SLOTS -->
         <section id="view-slots" class="spa-view">
             <div class="card">
-                <h2 style="margin-top:0; color:var(--cyan);">🎬 Video Slots (Slot 1 - 6)</h2>
-                <p style="color:#aaa; font-size:13px; margin-bottom:15px;">Kelola video standby (Slot 1) dan video reaksi gift (Slot 2-6). Klik 'Pilih Gift' untuk memetakan jenis hadiah penonton ke slot reaksi.</p>
+                <h2 style="margin-top:0; color:var(--cyan);">🎬 Dynamic Video Slots</h2>
+                <p style="color:#aaa; font-size:13px; margin-bottom:15px;">Kelola video standby (Slot 1) dan video reaksi gift dinamis (Slot 2 s.d. N). Klik 'Pilih Gift' untuk memetakan jenis hadiah penonton ke slot reaksi.</p>
                 {video_slots_html}
             </div>
 
@@ -6088,6 +8846,51 @@ let compositorConfig = {compositor_cfg_json};
     </div>
 </div>
 
+<!-- Profiles & Presets Management Modal (Desktop & Mobile) -->
+<div id="presetModal" class="modal-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); z-index:10000; align-items:center; justify-content:center; backdrop-filter:blur(4px);">
+    <div class="modal-content" style="background:#11131a; border:1px solid var(--border); border-radius:14px; width:90%; max-width:520px; max-height:85vh; display:flex; flex-direction:column; overflow:hidden; box-shadow:0 15px 40px rgba(0,0,0,0.8);">
+        <div class="modal-header" style="padding:14px 18px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+            <div style="font-weight:bold; font-size:15px; color:var(--cyan); display:flex; align-items:center; gap:8px;">
+                <span>📁</span> Manajemen Profile & Preset Polya Studio
+            </div>
+            <span onclick="closePresetModal()" style="color:#aaa; cursor:pointer; font-size:22px; line-height:1;">&times;</span>
+        </div>
+        <div class="modal-body" style="padding:16px 18px; overflow-y:auto; flex:1;">
+            <!-- Profile Selector Row -->
+            <div style="margin-bottom:14px;">
+                <label style="display:block; font-size:11px; color:#a1a1aa; font-weight:600; margin-bottom:6px; text-transform:uppercase;">Pilih Profil:</label>
+                <div style="display:flex; gap:6px;">
+                    <select id="modalProfileSelect" onchange="onProfileSelectChange(this.value)" style="flex:1; background:#181820; border:1px solid var(--border); color:#fff; padding:7px 10px; border-radius:8px; font-size:12px;">
+                    </select>
+                    <button type="button" onclick="promptCreateProfile()" class="btn btn-secondary" style="padding:7px 10px; font-size:11px;" title="Tambah Profil Baru">➕</button>
+                    <button type="button" onclick="promptRenameProfile()" class="btn btn-secondary" style="padding:7px 10px; font-size:11px;" title="Ubah Nama">✏️</button>
+                    <button type="button" onclick="confirmDeleteProfile()" class="btn btn-secondary" style="padding:7px 10px; font-size:11px; color:#ff453a;" title="Hapus">🗑️</button>
+                </div>
+            </div>
+
+            <!-- Action Buttons -->
+            <div style="display:flex; gap:8px; margin-bottom:14px;">
+                <button type="button" onclick="promptSaveNewPreset()" class="modern-btn" style="flex:1; padding:8px 10px; font-size:11px; font-weight:bold; background:rgba(37,244,238,0.15); color:#25f4ee; border:1px solid #25f4ee; border-radius:8px; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px;">
+                    <span>💾</span> <span>Simpan Preset Baru</span>
+                </button>
+                <button type="button" id="btnModalOverwrite" onclick="confirmOverwriteActivePreset()" class="modern-btn" style="flex:1; padding:8px 10px; font-size:11px; font-weight:bold; background:rgba(245,158,11,0.15); color:#f59e0b; border:1px solid #f59e0b; border-radius:8px; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px;" title="Perbarui isi preset yang sedang aktif">
+                    <span>🔄</span> <span>Update Preset Aktif</span>
+                </button>
+            </div>
+
+            <!-- Preset List -->
+            <div>
+                <label style="display:block; font-size:11px; color:#a1a1aa; font-weight:600; margin-bottom:8px; text-transform:uppercase;">Daftar Preset Pada Profil Ini:</label>
+                <div id="modalPresetListContainer" style="display:flex; flex-direction:column; gap:8px;">
+                </div>
+            </div>
+        </div>
+        <div style="padding:10px 18px; border-top:1px solid var(--border); background:#0c0e14; display:flex; justify-content:flex-end;">
+            <button type="button" class="btn btn-secondary" onclick="closePresetModal()" style="font-size:12px; padding:5px 14px;">Tutup</button>
+        </div>
+    </div>
+</div>
+
 <div id="globalToast" class="toast"></div>
 
 </body>
@@ -6158,6 +8961,30 @@ let compositorConfig = {compositor_cfg_json};
                     </script>
                 </head>
                 <body>
+
+<!-- SVG Liquid Glass Turbulence Filter -->
+<svg class="hidden" style="position:fixed; top:-9999px; left:-9999px; width:0; height:0; pointer-events:none;" aria-hidden="true">
+  <defs>
+    <filter id="container-glass" x="0%" y="0%" width="100%" height="100%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.05 0.05" numOctaves="1" seed="1" result="turbulence" />
+      <feGaussianBlur in="turbulence" stdDeviation="2" result="blurredNoise" />
+      <feDisplacementMap in="SourceGraphic" in2="blurredNoise" scale="70" xChannelSelector="R" yChannelSelector="B" result="displaced" />
+      <feGaussianBlur in="displaced" stdDeviation="4" result="finalBlur" />
+      <feComposite in="finalBlur" in2="finalBlur" operator="over" />
+    </filter>
+  </defs>
+</svg>
+                    <svg class="hidden" style="position:fixed; top:-9999px; left:-9999px; width:0; height:0; pointer-events:none;" aria-hidden="true">
+                      <defs>
+                        <filter id="container-glass" x="0%" y="0%" width="100%" height="100%" color-interpolation-filters="sRGB">
+                          <feTurbulence type="fractalNoise" baseFrequency="0.05 0.05" numOctaves="1" seed="1" result="turbulence" />
+                          <feGaussianBlur in="turbulence" stdDeviation="2" result="blurredNoise" />
+                          <feDisplacementMap in="SourceGraphic" in2="blurredNoise" scale="70" xChannelSelector="R" yChannelSelector="B" result="displaced" />
+                          <feGaussianBlur in="displaced" stdDeviation="4" result="finalBlur" />
+                          <feComposite in="finalBlur" in2="finalBlur" operator="over" />
+                        </filter>
+                      </defs>
+                    </svg>
                     {gifts_rows}
                 </body>
             </html>
@@ -6180,23 +9007,77 @@ let compositorConfig = {compositor_cfg_json};
         elif parsed_url.path == '/delete-video':
             query = urllib.parse.parse_qs(parsed_url.query)
             filename = os.path.basename(query.get('name', [''])[0])
-            slot = query.get('slot', [''])[0]
+            slot_str = query.get('slot', [''])[0]
+            delete_slot = query.get('delete_slot', ['0'])[0] in ('1', 'true', 'yes')
+
+            slot_int = None
+            if slot_str:
+                try:
+                    slot_int = int(slot_str)
+                except ValueError:
+                    slot_int = None
+
+            # Safe streaming fallback if active playing slot is deleted
+            if slot_int and slot_int >= 2 and stream_metadata.get("currentSlot") == slot_int:
+                print(f"[DeleteSlot] Slot {slot_int} yang sedang diputar dihapus. Mengalihkan ke Slot 1 (Standby)...")
+                try:
+                    play_slot(1)
+                except Exception as e:
+                    print(f"[DeleteSlot] Fallback play_slot(1) error: {e}")
+
+            # Bersihkan antrean yang merujuk ke slot_int
+            if slot_int and slot_int >= 2:
+                with queue_lock:
+                    new_queue = collections.deque([item for item in gift_queue if item.get("slot") != slot_int])
+                    gift_queue.clear()
+                    gift_queue.extend(new_queue)
+
+            # 1. Hapus file video fisik
             if filename:
                 filepath = os.path.realpath(os.path.join(VIDEOS_DIR, filename))
                 real_videos_dir = os.path.realpath(VIDEOS_DIR)
                 if filepath.startswith(real_videos_dir) and os.path.exists(filepath):
-                    os.remove(filepath)
-            
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+            if slot_int:
+                for ext in (".webm", ".mp4"):
+                    fp = os.path.join(VIDEOS_DIR, f"video_{slot_int}{ext}")
+                    if os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception:
+                            pass
+
+            # 2. Hapus dari video_metadata.json
             meta = load_video_meta()
-            if slot and str(slot) in meta:
-                del meta[str(slot)]
+            if slot_int and str(slot_int) in meta:
+                del meta[str(slot_int)]
                 save_video_meta(meta)
-            else:
+            elif filename:
                 to_del = [s for s, v in meta.items() if v.get("filename") == filename]
                 for s in to_del:
                     del meta[s]
                 if to_del:
                     save_video_meta(meta)
+
+            # 3. Jika slot >= 2 dan delete_slot aktif, bersihkan juga dari gift_config & character_config
+            if slot_int and slot_int >= 2 and (delete_slot or not filename):
+                gift_cfg = load_gift_config()
+                if str(slot_int) in gift_cfg:
+                    del gift_cfg[str(slot_int)]
+                    save_gift_config(gift_cfg)
+
+                char_cfg = load_character_config()
+                if "mappings" in char_cfg:
+                    char_cfg["mappings"] = [m for m in char_cfg["mappings"] if m.get("slot") != slot_int]
+                    save_character_config(char_cfg)
+                    try:
+                        generate_guide_overlay(char_cfg)
+                        refresh_active_stream_overlay()
+                    except Exception as e:
+                        print(f"[DeleteSlot] Overlay update error: {e}")
 
             self.send_response(303)
             self.send_header('Location', '/')
@@ -6281,7 +9162,7 @@ let compositorConfig = {compositor_cfg_json};
                             break
                         try:
                             self.wfile.write(data)
-                        except (BrokenPipeError, ConnectionResetError):
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.error, OSError):
                             break
                         bytes_remaining -= len(data)
             else:
@@ -6298,27 +9179,33 @@ let compositorConfig = {compositor_cfg_json};
 
                 with open(filepath, 'rb') as f:
                     try:
-                        shutil.copyfileobj(f, self.wfile)
-                    except (BrokenPipeError, ConnectionResetError):
+                        shutil.copyfileobj(f, self.wfile, length=64 * 1024)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.error, OSError):
                         pass
             return
 
         elif parsed_url.path == '/api/dynamic-overlays':
             cfg = load_dynamic_overlay_config()
             slots_info = {}
-            for s in range(1, 11):
+            def slot_sort_key(k):
+                try:
+                    return (0, int(k))
+                except ValueError:
+                    return (1, str(k))
+            sorted_slot_keys = sorted(cfg.get("slots", {}).keys(), key=slot_sort_key)
+            for s in sorted_slot_keys:
                 slot_str = str(s)
                 s_cfg = cfg.get("slots", {}).get(slot_str, {})
                 file_name = None
                 size_mb = 0
                 for ext in (".webm", ".mp4"):
-                    cand = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{s}{ext}")
+                    cand = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{slot_str}{ext}")
                     if os.path.exists(cand):
-                        file_name = f"overlay_{s}{ext}"
+                        file_name = f"overlay_{slot_str}{ext}"
                         size_mb = round(os.path.getsize(cand) / (1024 * 1024), 2)
                         break
                 slots_info[slot_str] = {
-                    "name": s_cfg.get("name", f"Layer Animasi {s}"),
+                    "name": s_cfg.get("name", f"Layer Animasi {slot_str}"),
                     "file": file_name,
                     "size_mb": size_mb,
                     "enabled": s_cfg.get("enabled", True)
@@ -6341,8 +9228,9 @@ let compositorConfig = {compositor_cfg_json};
 
         elif parsed_url.path == '/delete-dynamic-overlay':
             query = urllib.parse.parse_qs(parsed_url.query)
-            slot = query.get('slot', [''])[0]
-            if slot and slot in [str(i) for i in range(1, 11)]:
+            slot = query.get('slot', [''])[0].strip()
+            cfg = load_dynamic_overlay_config()
+            if slot and "slots" in cfg and slot in cfg["slots"]:
                 for ext in (".webm", ".mp4"):
                     fp = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{slot}{ext}")
                     if os.path.exists(fp):
@@ -6350,10 +9238,50 @@ let compositorConfig = {compositor_cfg_json};
                             os.remove(fp)
                         except Exception as e:
                             print(f"[DynamicOverlay Delete Error] {e}")
-                cfg = load_dynamic_overlay_config()
-                if "slots" in cfg and slot in cfg["slots"]:
-                    cfg["slots"][slot]["file"] = None
-                    save_dynamic_overlay_config(cfg)
+                cfg["slots"][slot]["file"] = None
+                save_dynamic_overlay_config(cfg)
+            self.send_response(303)
+            self.send_header('Location', '/')
+            self.end_headers()
+            return
+
+        elif parsed_url.path == '/delete-dynamic-overlay-slot':
+            query = urllib.parse.parse_qs(parsed_url.query)
+            slot = query.get('slot', [''])[0].strip()
+            cfg = load_dynamic_overlay_config()
+            if slot and "slots" in cfg and slot in cfg["slots"]:
+                del cfg["slots"][slot]
+                save_dynamic_overlay_config(cfg)
+                for ext in (".webm", ".mp4"):
+                    fp = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{slot}{ext}")
+                    if os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception as e:
+                            print(f"[DynamicOverlay Slot Delete Error] {e}")
+            self.send_response(303)
+            self.send_header('Location', '/')
+            self.end_headers()
+            return
+
+        elif parsed_url.path == '/add-dynamic-overlay-slot':
+            query = urllib.parse.parse_qs(parsed_url.query)
+            name = query.get('name', [''])[0].strip()
+            cfg = load_dynamic_overlay_config()
+            if "slots" not in cfg:
+                cfg["slots"] = {}
+            num_keys = [int(k) for k in cfg["slots"].keys() if k.isdigit()]
+            next_num = max(num_keys) + 1 if num_keys else 1
+            new_slot = str(next_num)
+            while new_slot in cfg["slots"]:
+                next_num += 1
+                new_slot = str(next_num)
+            custom_name = name if name else f"Layer Animasi {new_slot}"
+            cfg["slots"][new_slot] = {
+                "name": custom_name,
+                "enabled": True
+            }
+            save_dynamic_overlay_config(cfg)
             self.send_response(303)
             self.send_header('Location', '/')
             self.end_headers()
@@ -6443,7 +9371,7 @@ let compositorConfig = {compositor_cfg_json};
                             break
                         try:
                             self.wfile.write(data)
-                        except (BrokenPipeError, ConnectionResetError):
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.error, OSError):
                             break
                         bytes_remaining -= len(data)
             else:
@@ -6460,8 +9388,8 @@ let compositorConfig = {compositor_cfg_json};
 
                 with open(filepath, 'rb') as f:
                     try:
-                        shutil.copyfileobj(f, self.wfile)
-                    except (BrokenPipeError, ConnectionResetError):
+                        shutil.copyfileobj(f, self.wfile, length=64 * 1024)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.error, OSError):
                         pass
             return
 
@@ -6662,6 +9590,24 @@ let compositorConfig = {compositor_cfg_json};
                 "session_valid": account_cfg.get("session_valid", False),
                 "cookies": cookies_data
             }).encode('utf-8'))
+        elif parsed_url.path == '/api/profiles':
+            self.send_json_response(load_profiles_meta())
+            return
+        elif parsed_url.path == '/api/presets/current':
+            meta = load_profiles_meta()
+            active_prof_id = meta.get("active_profile_id")
+            prof = meta.get("profiles", {}).get(active_prof_id, {})
+            active_preset_id = prof.get("active_preset_id")
+            preset = prof.get("presets", {}).get(active_preset_id, {})
+            self.send_json_response({
+                "success": True,
+                "profile_id": active_prof_id,
+                "profile_name": prof.get("name", active_prof_id),
+                "preset_id": active_preset_id,
+                "preset_name": preset.get("name", active_preset_id),
+                "preset": preset
+            })
+            return
         elif parsed_url.path in ('/simulate-gift', '/switch-slot'):
             return self.do_POST()
         else:
@@ -6769,7 +9715,183 @@ let compositorConfig = {compositor_cfg_json};
             self.wfile.write(b"Unauthorized")
             return
 
-        if parsed_url.path == '/validate-account':
+        if parsed_url.path == '/api/profiles/create':
+            body = self.read_json_body()
+            name = str(body.get("name", "")).strip() or "Profil Baru"
+            prof_id = "prof_" + uuid.uuid4().hex[:8]
+            now = int(time.time())
+            meta = load_profiles_meta()
+            if "profiles" not in meta:
+                meta["profiles"] = {}
+            meta["profiles"][prof_id] = {
+                "id": prof_id,
+                "name": name,
+                "created_at": now,
+                "updated_at": now,
+                "active_preset_id": "preset_default",
+                "presets": {}
+            }
+            save_profiles_meta(meta)
+            create_preset_snapshot(prof_id, "preset_default", "Preset Awal", "Snapshot awal profil", update_meta=True)
+            meta = load_profiles_meta()
+            self.send_json_response({"success": True, "profile_id": prof_id, "name": name, "profiles": meta["profiles"]})
+            return
+
+        elif parsed_url.path == '/api/profiles/rename':
+            body = self.read_json_body()
+            prof_id = body.get("profile_id")
+            new_name = str(body.get("name", "")).strip()
+            meta = load_profiles_meta()
+            if prof_id in meta.get("profiles", {}) and new_name:
+                meta["profiles"][prof_id]["name"] = new_name
+                meta["profiles"][prof_id]["updated_at"] = int(time.time())
+                save_profiles_meta(meta)
+                self.send_json_response({"success": True, "name": new_name})
+            else:
+                self.send_json_response({"success": False, "error": "Profil tidak ditemukan atau nama kosong"}, 400)
+            return
+
+        elif parsed_url.path == '/api/profiles/delete':
+            body = self.read_json_body()
+            prof_id = body.get("profile_id")
+            try:
+                meta = load_profiles_meta()
+                if len(meta.get("profiles", {})) <= 1:
+                    self.send_json_response({"success": False, "error": "Tidak dapat menghapus satu-satunya profil yang tersisa."}, 400)
+                    return
+                if prof_id in meta.get("profiles", {}):
+                    prof_dir = os.path.join(PROFILES_DIR, prof_id)
+                    if os.path.exists(prof_dir):
+                        shutil.rmtree(prof_dir, ignore_errors=True)
+                    del meta["profiles"][prof_id]
+                    if meta.get("active_profile_id") == prof_id:
+                        remaining_id = next(iter(meta["profiles"].keys()))
+                        meta["active_profile_id"] = remaining_id
+                        rem_preset = meta["profiles"][remaining_id].get("active_preset_id")
+                        if rem_preset:
+                            restore_preset_snapshot(remaining_id, rem_preset)
+                    save_profiles_meta(meta)
+                    self.send_json_response({"success": True, "profiles": meta["profiles"], "active_profile_id": meta.get("active_profile_id")})
+                else:
+                    self.send_json_response({"success": False, "error": "Profil tidak ditemukan"}, 404)
+            except Exception as e:
+                self.send_json_response({"success": False, "error": str(e)}, 500)
+            return
+
+        elif parsed_url.path == '/api/profiles/switch':
+            body = self.read_json_body()
+            prof_id = body.get("profile_id")
+            meta = load_profiles_meta()
+            if prof_id in meta.get("profiles", {}):
+                target_preset = meta["profiles"][prof_id].get("active_preset_id")
+                if not target_preset and meta["profiles"][prof_id].get("presets"):
+                    target_preset = next(iter(meta["profiles"][prof_id]["presets"].keys()))
+                if target_preset:
+                    res = restore_preset_snapshot(prof_id, target_preset)
+                    self.send_json_response(res)
+                else:
+                    meta["active_profile_id"] = prof_id
+                    save_profiles_meta(meta)
+                    self.send_json_response({"success": True, "profile_id": prof_id, "name": meta["profiles"][prof_id]["name"]})
+            else:
+                self.send_json_response({"success": False, "error": "Profil tidak ditemukan"}, 404)
+            return
+
+        elif parsed_url.path == '/api/presets/save':
+            body = self.read_json_body()
+            meta = load_profiles_meta()
+            prof_id = body.get("profile_id") or meta.get("active_profile_id", "profile_default")
+            name = str(body.get("name", "")).strip() or "Preset Baru"
+            desc = str(body.get("description", "")).strip()
+            preset_id = "preset_" + uuid.uuid4().hex[:8]
+            try:
+                snap = create_preset_snapshot(prof_id, preset_id, name, description=desc, update_meta=True)
+                self.send_json_response({"success": True, "preset_id": preset_id, "name": name, "preset": snap})
+            except Exception as e:
+                self.send_json_response({"success": False, "error": str(e)}, 500)
+            return
+
+        elif parsed_url.path == '/api/presets/overwrite':
+            body = self.read_json_body()
+            meta = load_profiles_meta()
+            prof_id = body.get("profile_id") or meta.get("active_profile_id", "profile_default")
+            prof = meta.get("profiles", {}).get(prof_id, {})
+            preset_id = body.get("preset_id") or prof.get("active_preset_id")
+            try:
+                res = overwrite_preset_snapshot(prof_id, preset_id)
+                self.send_json_response(res)
+            except Exception as e:
+                self.send_json_response({"success": False, "error": str(e)}, 400)
+            return
+
+        elif parsed_url.path == '/api/presets/load':
+            body = self.read_json_body()
+            meta = load_profiles_meta()
+            prof_id = body.get("profile_id") or meta.get("active_profile_id", "profile_default")
+            preset_id = body.get("preset_id")
+            try:
+                res = restore_preset_snapshot(prof_id, preset_id)
+                self.send_json_response(res)
+            except Exception as e:
+                self.send_json_response({"success": False, "error": str(e)}, 500)
+            return
+
+        elif parsed_url.path == '/api/presets/rename':
+            body = self.read_json_body()
+            meta = load_profiles_meta()
+            prof_id = body.get("profile_id") or meta.get("active_profile_id")
+            preset_id = body.get("preset_id")
+            new_name = str(body.get("name", "")).strip()
+            if not new_name:
+                self.send_json_response({"success": False, "error": "Nama preset tidak boleh kosong"}, 400)
+                return
+            if prof_id in meta.get("profiles", {}) and preset_id in meta["profiles"][prof_id].get("presets", {}):
+                meta["profiles"][prof_id]["presets"][preset_id]["name"] = new_name
+                meta["profiles"][prof_id]["presets"][preset_id]["updated_at"] = int(time.time())
+                save_profiles_meta(meta)
+                p_file = os.path.join(PROFILES_DIR, prof_id, preset_id, "snapshot_state.json")
+                if os.path.exists(p_file):
+                    try:
+                        with open(p_file, 'r', encoding='utf-8') as f:
+                            p_data = json.load(f)
+                        p_data["name"] = new_name
+                        safe_write_json(p_file, p_data)
+                    except Exception:
+                        pass
+                self.send_json_response({"success": True, "name": new_name})
+            else:
+                self.send_json_response({"success": False, "error": "Preset tidak ditemukan"}, 404)
+            return
+
+        elif parsed_url.path == '/api/presets/delete':
+            body = self.read_json_body()
+            meta = load_profiles_meta()
+            prof_id = body.get("profile_id") or meta.get("active_profile_id")
+            preset_id = body.get("preset_id")
+            try:
+                prof = meta.get("profiles", {}).get(prof_id, {})
+                presets = prof.get("presets", {})
+                if len(presets) <= 1:
+                    self.send_json_response({"success": False, "error": "Tidak dapat menghapus preset terakhir dalam profil ini."}, 400)
+                    return
+                if preset_id in presets:
+                    preset_dir = os.path.join(PROFILES_DIR, prof_id, preset_id)
+                    if os.path.exists(preset_dir):
+                        shutil.rmtree(preset_dir, ignore_errors=True)
+                    del presets[preset_id]
+                    if prof.get("active_preset_id") == preset_id:
+                        rem_id = next(iter(presets.keys()))
+                        prof["active_preset_id"] = rem_id
+                        restore_preset_snapshot(prof_id, rem_id)
+                    save_profiles_meta(meta)
+                    self.send_json_response({"success": True, "active_preset_id": prof.get("active_preset_id")})
+                else:
+                    self.send_json_response({"success": False, "error": "Preset tidak ditemukan"}, 404)
+            except Exception as e:
+                self.send_json_response({"success": False, "error": str(e)}, 500)
+            return
+
+        elif parsed_url.path == '/validate-account':
             try:
                 res = validate_tiktok_session()
                 self.send_response(200)
@@ -6808,7 +9930,8 @@ let compositorConfig = {compositor_cfg_json};
             try:
                 # 1. Simpan username & cookies
                 if username:
-                    save_account_config({"username": username})
+                    clean_u = f"@{username.lstrip('@')}"
+                    save_account_config({"username": clean_u})
                 num_cookies = 0
                 if cookies_raw:
                     parsed_json = json.loads(cookies_raw)
@@ -6818,11 +9941,15 @@ let compositorConfig = {compositor_cfg_json};
                         json.dump(parsed_json, f, indent=2)
 
                 # 2. Lakukan validasi session TikTok via Centralized Gateway WARP Proxy
+                # Jika cookies baru tidak dikirim, validate_tiktok_session tetap menggunakan cookies.json yang ada di server
                 val_res = validate_tiktok_session(username if username else None)
                 print(f"[SaveAccountConfig] Hasil validasi akun via {val_res.get('via')} ({val_res.get('egress_ip')}): {val_res.get('message')}")
                 
                 # Restart listener agar memuat sesi/username baru
                 ensure_live_listener(force_restart=True)
+
+                acc_cfg_latest = load_account_config()
+                saved_user = acc_cfg_latest.get("username", username or "")
 
                 if is_json_req or 'application/json' in self.headers.get('Accept', ''):
                     self.send_response(200)
@@ -6830,8 +9957,9 @@ let compositorConfig = {compositor_cfg_json};
                     self.end_headers()
                     resp_payload = {
                         "success": True,
-                        "message": val_res.get("message", "Cookies berhasil disimpan dan divalidasi"),
+                        "message": val_res.get("message", "Konfigurasi akun berhasil disimpan dan divalidasi"),
                         "entries_count": num_cookies,
+                        "username": saved_user,
                         "val_res": val_res
                     }
                     self.wfile.write(json.dumps(resp_payload).encode('utf-8'))
@@ -6852,85 +9980,383 @@ let compositorConfig = {compositor_cfg_json};
                     self.wfile.write(f"<html><body style='background:#0f0f11; color:#fff; text-align:center; padding-top:50px; font-family:sans-serif;'><h2 style='color:#ff3b30;'>Gagal Menyimpan / Memvalidasi Akun: {str(e)}</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>".encode('utf-8'))
             return
 
-        if parsed_url.path == '/upload-video':
+        if parsed_url.path == '/api/disconnect-account':
             try:
+                acc_cfg = load_account_config()
+                acc_cfg["username"] = ""
+                acc_cfg["user_id"] = ""
+                acc_cfg["screen_name"] = ""
+                acc_cfg["session_valid"] = False
+                acc_cfg["last_error"] = "Akun telah diputuskan secara manual oleh pengguna"
+                save_account_config(acc_cfg)
+
+                if os.path.exists(COOKIES_FILE):
+                    try:
+                        with open(COOKIES_FILE, 'w', encoding='utf-8') as f:
+                            json.dump([], f, indent=2)
+                    except Exception:
+                        pass
+
+                ensure_live_listener(force_restart=True)
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "message": "Akun TikTok berhasil diputuskan"}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "message": str(e)}).encode('utf-8'))
+            return
+
+        if parsed_url.path == '/api/upload-video-chunk':
+            try:
+                try:
+                    self.connection.settimeout(300)
+                except Exception:
+                    pass
+
+                query = urllib.parse.parse_qs(parsed_url.query)
+                upload_id = query.get('upload_id', [''])[0].strip()
+                slot = query.get('slot', ['1'])[0].strip()
+                chunk_idx_str = query.get('chunk_index', ['-1'])[0].strip()
+                total_chunks_str = query.get('total_chunks', ['1'])[0].strip()
+
+                if not upload_id or not upload_id.replace('_', '').isalnum():
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "Invalid upload_id"}).encode('utf-8'))
+                    return
+
+                try:
+                    slot_int = int(slot)
+                    if slot_int < 1:
+                        slot = "1"
+                    else:
+                        slot = str(slot_int)
+                except Exception:
+                    slot = "1"
+
+                chunk_index = int(chunk_idx_str)
+                total_chunks = int(total_chunks_str)
                 content_length = int(self.headers.get('Content-Length', 0))
-                if content_length > 100 * 1024 * 1024:
+
+                if content_length <= 0 or content_length > 25 * 1024 * 1024:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "Invalid chunk size"}).encode('utf-8'))
+                    return
+
+                chunk_dir = os.path.join(VIDEOS_DIR, f".chunks_{upload_id}")
+                os.makedirs(chunk_dir, exist_ok=True)
+                chunk_path = os.path.join(chunk_dir, f"part_{chunk_index:05d}")
+
+                bytes_left = content_length
+                with open(chunk_path, "wb") as f:
+                    while bytes_left > 0:
+                        buf = self.rfile.read(min(bytes_left, 64 * 1024))
+                        if not buf:
+                            break
+                        f.write(buf)
+                        bytes_left -= len(buf)
+
+                saved_size = os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 0
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "success": True,
+                    "upload_id": upload_id,
+                    "slot": slot,
+                    "chunk_index": chunk_index,
+                    "total_chunks": total_chunks,
+                    "saved_bytes": saved_size
+                }).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+            return
+
+        elif parsed_url.path == '/api/upload-video-finish':
+            try:
+                try:
+                    self.connection.settimeout(600)
+                except Exception:
+                    pass
+
+                content_length = int(self.headers.get('Content-Length', 0))
+                payload = json.loads(self.rfile.read(content_length).decode('utf-8')) if content_length > 0 else {}
+                upload_id = str(payload.get('upload_id', '')).strip()
+                slot = str(payload.get('slot', '1')).strip()
+                filename = str(payload.get('filename', '')).strip()
+                total_chunks = int(payload.get('total_chunks', 0))
+                initial_gift = str(payload.get('initial_gift', '')).strip()
+
+                try:
+                    slot_int = int(slot)
+                    if slot_int < 1:
+                        slot_int = 1
+                except Exception:
+                    slot_int = 1
+                slot = str(slot_int)
+
+                if not upload_id or slot_int < 1 or total_chunks <= 0:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "Parameter tidak valid"}).encode('utf-8'))
+                    return
+
+                chunk_dir = os.path.join(VIDEOS_DIR, f".chunks_{upload_id}")
+                if not os.path.exists(chunk_dir):
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "Folder potongan tidak ditemukan di server"}).encode('utf-8'))
+                    return
+
+                missing = []
+                for idx in range(total_chunks):
+                    p = os.path.join(chunk_dir, f"part_{idx:05d}")
+                    if not os.path.exists(p) or os.path.getsize(p) == 0:
+                        missing.append(idx)
+
+                if missing:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": f"Potongan belum lengkap ({len(missing)} hilang)"}).encode('utf-8'))
+                    return
+
+                temp_combined = os.path.join(VIDEOS_DIR, f".temp_combined_{slot}_{int(time.time())}_{os.getpid()}.tmp")
+                with open(temp_combined, "wb") as out_f:
+                    for idx in range(total_chunks):
+                        p = os.path.join(chunk_dir, f"part_{idx:05d}")
+                        with open(p, "rb") as in_f:
+                            shutil.copyfileobj(in_f, out_f, length=128 * 1024)
+
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+
+                saved_filename = f"video_{slot}.mp4"
+                filepath = os.path.join(VIDEOS_DIR, saved_filename)
+                temp_remux = os.path.join(VIDEOS_DIR, f".temp_remux_{slot}_{int(time.time())}_{os.getpid()}.mp4")
+
+                bypass_info = remux_slot_video_faststart(temp_combined, temp_remux)
+                if os.path.exists(temp_remux) and os.path.getsize(temp_remux) > 0:
+                    target_src = temp_remux
+                else:
+                    target_src = temp_combined
+
+                for old_ext in (".webm", ".mp4"):
+                    old_p = os.path.join(VIDEOS_DIR, f"video_{slot}{old_ext}")
+                    if os.path.exists(old_p) and os.path.realpath(old_p) != os.path.realpath(target_src):
+                        try:
+                            os.remove(old_p)
+                        except Exception:
+                            pass
+
+                os.replace(target_src, filepath)
+
+                if os.path.exists(temp_combined):
+                    try:
+                        os.remove(temp_combined)
+                    except Exception:
+                        pass
+                if os.path.exists(temp_remux):
+                    try:
+                        os.remove(temp_remux)
+                    except Exception:
+                        pass
+
+                final_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+                specs = probe_video_specs(filepath) or {}
+                v = specs.get("video") or {}
+                a = specs.get("audio") or {}
+                clean_orig_name = os.path.basename(filename).strip() if filename else saved_filename
+                meta = load_video_meta()
+                meta[str(slot)] = {
+                    "filename": saved_filename,
+                    "original_name": clean_orig_name or saved_filename,
+                    "uploaded_at": int(time.time()),
+                    "size_bytes": final_size,
+                    "bypass_mode": bypass_info.get("mode", "DIRECT_COPY_FASTSTART"),
+                    "resolution": f"{v.get('width', 720)}x{v.get('height', 1280)}",
+                    "codec": v.get("codec_name", "h264"),
+                    "fps": str(v.get("r_frame_rate", "24/1")),
+                    "audio": f"{a.get('codec_name', 'aac').upper()} {a.get('sample_rate', 44100)}Hz" if a else "None",
+                    "cpu_saved": bypass_info.get("cpu_saved", "100%")
+                }
+                save_video_meta(meta)
+
+                # Requirement 1: Integrasi initial gift & character mapping saat upload slot baru
+                if slot_int >= 2:
+                    gift_cfg = load_gift_config()
+                    if initial_gift:
+                        gift_cfg[str(slot_int)] = initial_gift
+                        save_gift_config(gift_cfg)
+                    elif str(slot_int) not in gift_cfg:
+                        gift_cfg[str(slot_int)] = "rose"
+                        save_gift_config(gift_cfg)
+
+                    char_cfg = load_character_config()
+                    mappings = char_cfg.get("mappings", [])
+                    if not any(m.get("slot") == slot_int for m in mappings):
+                        mappings.append({
+                            "slot": slot_int,
+                            "gift_id": gift_cfg.get(str(slot_int), "rose"),
+                            "character_ids": ["1"]
+                        })
+                        char_cfg["mappings"] = mappings
+                        save_character_config(char_cfg)
+                        try:
+                            generate_guide_overlay(char_cfg)
+                            refresh_active_stream_overlay()
+                        except Exception as e:
+                            print(f"[UploadFinish] Overlay update error: {e}")
+
+                print(f"[ChunkedUpload Finished] Slot {slot} assembled and remuxed: {saved_filename} ({final_size / (1024*1024):.2f} MB, mode: {bypass_info.get('mode')})")
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "success": True,
+                    "slot": slot,
+                    "filename": saved_filename,
+                    "size_bytes": final_size,
+                    "size_mb": round(final_size / (1024 * 1024), 2),
+                    "mode": bypass_info.get("mode")
+                }).encode('utf-8'))
+            except Exception as e:
+                print(f"[ChunkedUpload Finish Error] {e}")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+            return
+
+        elif parsed_url.path == '/upload-video':
+            temp_input_path = None
+            temp_output_path = None
+            try:
+                try:
+                    self.connection.settimeout(1800)
+                except Exception:
+                    pass
+
+                content_length = int(self.headers.get('Content-Length', 0))
+                # 2.5 GB max upload limit (2500 MB >= 2048 MB requirement)
+                MAX_VIDEO_SIZE = 2500 * 1024 * 1024
+                if content_length > MAX_VIDEO_SIZE:
                     self.send_response(413)
                     self.send_header("Content-type", "text/html; charset=utf-8")
                     self.end_headers()
-                    self.wfile.write(b"<html><body style='background:#0f0f11; color:#ff3b30; text-align:center; padding-top:50px;'><h2>File terlalu besar! Maksimum 100 MB.</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>")
+                    self.wfile.write(b"<html><body style='background:#0f0f11; color:#ff3b30; text-align:center; padding-top:50px;'><h2>File terlalu besar! Maksimum 2048 MB (2 GB).</h2><br/><a href='/' style='color:#25f4ee;'>Kembali</a></body></html>")
                     return
 
+                query = urllib.parse.parse_qs(parsed_url.query)
+                default_slot = query.get('slot', ['1'])[0]
+                try:
+                    slot_int = int(default_slot)
+                    if slot_int < 1:
+                        default_slot = "1"
+                    else:
+                        default_slot = str(slot_int)
+                except Exception:
+                    default_slot = "1"
+
                 content_type = self.headers.get('Content-Type', '')
-                body = self.rfile.read(content_length)
-                
-                headers = f"Content-Type: {content_type}\n\n".encode('utf-8')
-                msg = email.parser.BytesParser().parsebytes(headers + body)
-                
-                slot = "1"
-                file_data = None
-                orig_filename = ""
-                
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        cd = part.get("Content-Disposition", "")
-                        if 'name="slot"' in cd:
-                            payload = part.get_payload(decode=True)
-                            if isinstance(payload, bytes):
-                                slot = payload.decode('utf-8', errors='ignore').strip()
-                        elif 'name="videofile"' in cd:
-                            fn_param = part.get_filename()
-                            if fn_param:
-                                orig_filename = fn_param
-                            payload = part.get_payload(decode=True)
-                            if isinstance(payload, bytes):
-                                file_data = payload
-                
-                if slot not in ("1", "2", "3", "4", "5", "6"):
-                    slot = "1"
+                boundary = None
+                for part in content_type.split(';'):
+                    part = part.strip()
+                    if part.lower().startswith('boundary='):
+                        boundary = part[9:].strip('"\'')
+                        break
 
-                if file_data:
+                temp_input_path = os.path.join(VIDEOS_DIR, f".temp_upload_{int(time.time())}_{os.getpid()}.tmp")
+
+                if boundary:
+                    res_upload = stream_multipart_video_upload(
+                        self.rfile, content_length, boundary, temp_input_path, default_slot=default_slot
+                    )
+                    slot = res_upload.get("slot", default_slot)
+                    orig_filename = res_upload.get("filename", "")
+                    file_saved = res_upload.get("file_saved", False)
+                else:
+                    file_saved = False
+                    slot = default_slot
+                    orig_filename = f"video_{slot}.mp4"
+
+                try:
+                    slot_int = int(slot)
+                    if slot_int < 1:
+                        slot = default_slot
+                    else:
+                        slot = str(slot_int)
+                except Exception:
+                    slot = default_slot
+
+                if file_saved and os.path.exists(temp_input_path) and os.path.getsize(temp_input_path) > 0:
                     clean_orig_name = os.path.basename(orig_filename).strip() if orig_filename else ""
-                    temp_input_path = os.path.join(VIDEOS_DIR, f".temp_upload_{slot}_{int(time.time())}.tmp")
-                    with open(temp_input_path, 'wb') as f:
-                        f.write(file_data)
-
                     saved_filename = f"video_{slot}.mp4"
                     filepath = os.path.join(VIDEOS_DIR, saved_filename)
-                    
+                    temp_output_path = os.path.join(VIDEOS_DIR, f".temp_remux_{slot}_{int(time.time())}_{os.getpid()}.mp4")
+
+                    bypass_info = remux_slot_video_faststart(temp_input_path, temp_output_path)
+
+                    if os.path.exists(temp_output_path) and os.path.getsize(temp_output_path) > 0:
+                        target_src = temp_output_path
+                    else:
+                        target_src = temp_input_path
+
                     for old_ext in (".webm", ".mp4"):
                         old_p = os.path.join(VIDEOS_DIR, f"video_{slot}{old_ext}")
-                        if os.path.exists(old_p) and os.path.realpath(old_p) != os.path.realpath(temp_input_path):
+                        if os.path.exists(old_p) and os.path.realpath(old_p) != os.path.realpath(target_src):
                             try:
                                 os.remove(old_p)
                             except Exception:
                                 pass
 
-                    bypass_info = normalize_slot_video(temp_input_path, filepath)
-                    if os.path.exists(temp_input_path):
-                        try:
-                            os.remove(temp_input_path)
-                        except Exception:
-                            pass
+                    os.replace(target_src, filepath)
 
-                    final_size = os.path.getsize(filepath) if os.path.exists(filepath) else len(file_data)
+                    final_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+                    specs = probe_video_specs(filepath) or {}
+                    v = specs.get("video") or {}
+                    a = specs.get("audio") or {}
                     meta = load_video_meta()
                     meta[str(slot)] = {
                         "filename": saved_filename,
                         "original_name": clean_orig_name or saved_filename,
                         "uploaded_at": int(time.time()),
                         "size_bytes": final_size,
-                        "bypass_mode": bypass_info.get("mode", "DIRECT_COPY_BYPASS"),
-                        "resolution": f"{bypass_info.get('width', 720)}x{bypass_info.get('height', 1280)}",
-                        "codec": bypass_info.get("codec", "h264"),
-                        "fps": str(bypass_info.get("fps", "24/1")),
-                        "audio": bypass_info.get("audio", "AAC"),
+                        "bypass_mode": bypass_info.get("mode", "DIRECT_COPY_FASTSTART"),
+                        "resolution": f"{v.get('width', 720)}x{v.get('height', 1280)}",
+                        "codec": v.get("codec_name", "h264"),
+                        "fps": str(v.get("r_frame_rate", "24/1")),
+                        "audio": f"{a.get('codec_name', 'aac').upper()} {a.get('sample_rate', 44100)}Hz" if a else "None",
                         "cpu_saved": bypass_info.get("cpu_saved", "100%")
                     }
                     save_video_meta(meta)
+                    print(f"[Upload Video] Slot {slot} updated successfully: {saved_filename} ({final_size / (1024*1024):.2f} MB, mode: {bypass_info.get('mode')})")
             except Exception as e:
                 print(f"[Upload Error] {e}")
+            finally:
+                if temp_input_path and os.path.exists(temp_input_path):
+                    try:
+                        os.remove(temp_input_path)
+                    except Exception:
+                        pass
+                if temp_output_path and os.path.exists(temp_output_path):
+                    try:
+                        os.remove(temp_output_path)
+                    except Exception:
+                        pass
 
             self.send_response(303)
             self.send_header('Location', '/')
@@ -6970,8 +10396,11 @@ let compositorConfig = {compositor_cfg_json};
                             if isinstance(payload, bytes):
                                 file_data = payload
                 
-                if slot not in [str(i) for i in range(1, 11)]:
-                    slot = "1"
+                cfg = load_dynamic_overlay_config()
+                if "slots" not in cfg:
+                    cfg["slots"] = {}
+                if slot not in cfg["slots"]:
+                    cfg["slots"][slot] = {"name": f"Layer Animasi {slot}", "enabled": True}
 
                 if file_data:
                     ext = ".webm"
@@ -6992,11 +10421,6 @@ let compositorConfig = {compositor_cfg_json};
                     with open(filepath, 'wb') as f:
                         f.write(file_data)
 
-                    cfg = load_dynamic_overlay_config()
-                    if "slots" not in cfg:
-                        cfg["slots"] = {}
-                    if slot not in cfg["slots"]:
-                        cfg["slots"][slot] = {}
                     cfg["slots"][slot]["file"] = saved_filename
                     save_dynamic_overlay_config(cfg)
             except Exception as e:
@@ -7022,11 +10446,11 @@ let compositorConfig = {compositor_cfg_json};
                     cfg["scheduler"]["enabled"] = bool(val)
                 elif key == "slot_enabled":
                     slot = str(data.get("slot", "")).strip()
-                    if slot in [str(i) for i in range(1, 11)]:
-                        if "slots" not in cfg:
-                            cfg["slots"] = {}
+                    if "slots" not in cfg:
+                        cfg["slots"] = {}
+                    if slot:
                         if slot not in cfg["slots"]:
-                            cfg["slots"][slot] = {}
+                            cfg["slots"][slot] = {"name": f"Layer Animasi {slot}", "enabled": True}
                         cfg["slots"][slot]["enabled"] = bool(val)
                 elif key == "min_interval":
                     try:
@@ -7058,16 +10482,99 @@ let compositorConfig = {compositor_cfg_json};
                 data = json.loads(body)
                 slot = str(data.get("slot", "")).strip()
                 name = str(data.get("name", "")).strip()
-                if slot and slot in [str(i) for i in range(1, 11)]:
+                if slot:
                     cfg = load_dynamic_overlay_config()
                     if "slots" not in cfg:
                         cfg["slots"] = {}
                     if slot not in cfg["slots"]:
-                        cfg["slots"][slot] = {}
+                        cfg["slots"][slot] = {"name": f"Layer Animasi {slot}", "enabled": True}
                     cfg["slots"][slot]["name"] = name or f"Layer Animasi {slot}"
                     save_dynamic_overlay_config(cfg)
                 self.send_response(200)
                 self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+                return
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                return
+
+        elif parsed_url.path == '/add-dynamic-overlay-slot':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else "{}"
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = {}
+                name = str(data.get("name", "")).strip()
+                cfg = load_dynamic_overlay_config()
+                if "slots" not in cfg:
+                    cfg["slots"] = {}
+                num_keys = [int(k) for k in cfg["slots"].keys() if k.isdigit()]
+                next_num = max(num_keys) + 1 if num_keys else 1
+                new_slot = str(next_num)
+                while new_slot in cfg["slots"]:
+                    next_num += 1
+                    new_slot = str(next_num)
+                custom_name = name if name else f"Layer Animasi {new_slot}"
+                cfg["slots"][new_slot] = {
+                    "name": custom_name,
+                    "enabled": True
+                }
+                save_dynamic_overlay_config(cfg)
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "slot": new_slot, "name": custom_name, "config": cfg}).encode('utf-8'))
+                return
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                return
+
+        elif parsed_url.path == '/delete-dynamic-overlay-slot':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else "{}"
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = {}
+                slot = str(data.get("slot", "")).strip()
+                cfg = load_dynamic_overlay_config()
+                if slot and "slots" in cfg and slot in cfg["slots"]:
+                    del cfg["slots"][slot]
+                    save_dynamic_overlay_config(cfg)
+                    for ext in (".webm", ".mp4"):
+                        fp = os.path.join(DYNAMIC_OVERLAYS_DIR, f"overlay_{slot}{ext}")
+                        if os.path.exists(fp):
+                            try:
+                                os.remove(fp)
+                            except Exception:
+                                pass
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "slot": slot, "config": cfg}).encode('utf-8'))
+                    return
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": f"Slot {slot} tidak ditemukan"}).encode('utf-8'))
+                    return
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                return
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
                 return
@@ -7174,8 +10681,13 @@ let compositorConfig = {compositor_cfg_json};
                 cfg['position'] = {'x': pos_x, 'y': pos_y}
                 
                 mappings = []
-                for r in range(5):
-                    slot_num = r + 2
+                reaction_slots = [s for s in get_active_video_slots() if s >= 2]
+                for r, default_slot in enumerate(reaction_slots):
+                    slot_str = parsed.get(f'slot_order_{r}', [str(default_slot)])[0]
+                    try:
+                        slot_num = int(slot_str)
+                    except Exception:
+                        slot_num = default_slot
                     gift_id = parsed.get(f'row_{r}_gift', ['rose'])[0]
                     char_ids = []
                     for cid in ["1", "2", "3", "4"]:
@@ -7490,7 +11002,7 @@ let compositorConfig = {compositor_cfg_json};
             except Exception:
                 target_slot = 2
 
-            if target_slot < 2 or target_slot > 6:
+            if target_slot < 2:
                 target_slot = 2
 
             gift_cfg = load_gift_config()
